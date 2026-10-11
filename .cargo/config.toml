@@ -1,0 +1,35 @@
+# Para qué CPU se compila.
+#
+# Esto NO es un ajuste fino: es la diferencia entre un motor usable y uno que
+# no sirve. Medido con el mismo código y el mismo modelo (Qwen2.5-0.5B Q4_K_M):
+#
+#   genérico (por defecto)   4428 ms por respuesta   1,8 tokens/s
+#   x86-64-v3 (AVX2+FMA)     1094 ms                 6,1 tokens/s   ← 4x
+#   native                   1066 ms                 6,3 tokens/s
+#
+# Rust compila por defecto para el x86-64 básico de 2003, igual que hacía Zig
+# antes de pasarle `-mcpu`. Es la misma trampa, en el otro lenguaje: las
+# multiplicaciones de matrices de candle no usan AVX2 si no se les dice.
+#
+# Se elige `x86-64-v3` y NO `native` a propósito. `native` mira la CPU que
+# compila y ata el binario a ella: el que salga de un servidor con AVX-512 se
+# cae con instrucción ilegal en una máquina sin él. `x86-64-v3` es AVX2 + FMA,
+# que es lo que tiene cualquier CPU de 2015 en adelante, y da el 97% del
+# rendimiento de `native`.
+#
+# El coste de esta decisión, dicho claro: el binario NO arranca en un x86
+# anterior a 2015. Para esos hace falta una compilación aparte sin esta línea,
+# que funcionará 4 veces más lenta. Los kernels de `src/kernels/` sí eligen en
+# tiempo de ejecución, pero el interior de candle no, y reescribirlo no está
+# sobre la mesa.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# En ARM no hace falta equivalente: NEON es obligatorio en aarch64, así que el
+# target base ya lo incluye.

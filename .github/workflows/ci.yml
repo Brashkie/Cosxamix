@@ -1,0 +1,181 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Un push que llega mientras todavia corre el anterior cancela al viejo: lo
+# unico que importa saber es si el ultimo commit esta bien.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # OJO: aca NO va `RUSTFLAGS`.
+  #
+  # La variable de entorno RUSTFLAGS **reemplaza** a los `rustflags` de
+  # `[target.*]` de `.cargo/config.toml`, no se suma a ellos. Poner aqui algo
+  # tan inocente como `RUSTFLAGS: -D warnings` borraria el
+  # `target-cpu=x86-64-v3`, que son 4x de rendimiento medidos, y nada en la
+  # salida de CI lo diria: compila, pasa los tests, y el binario sale cuatro
+  # veces mas lento.
+  #
+  # Los avisos se deniegan pasandoselos a clippy como argumento suyo
+  # (`-- -D warnings`), que no toca la configuracion de cargo.
+
+jobs:
+  # ── Lo que tiene que andar en las tres plataformas ───────────────────────
+  comprobar:
+    name: ${{ matrix.os }} · ${{ matrix.features == '' && 'sin features' || matrix.features }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Sin features: solo la capa HTTP, 6 crates. Con `candle`: el motor de
+        # verdad, 155 crates. Se prueban las dos porque la capa HTTP tiene que
+        # seguir compilando sola — es lo que permite tocarla sin pagar el
+        # minuto y medio del motor.
+        features: ['', 'candle']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache de cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ matrix.features }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ matrix.features }}-
+
+      - name: Versiones
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      # Solo en una plataforma y una combinacion: el formato no depende del
+      # sistema y correrlo seis veces no agrega informacion.
+      - name: Formato
+        if: matrix.os == 'ubuntu-latest' && matrix.features == ''
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        shell: bash
+        run: |
+          set -eu
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo clippy --all-targets -- -D warnings
+          else
+            cargo clippy --features "${{ matrix.features }}" --all-targets -- -D warnings
+          fi
+
+      # Ningun test carga un modelo: los 22 son unitarios y los que necesitan
+      # un GGUF son ejemplos, no tests. Por eso CI no baja 1,6 GB.
+      - name: Tests
+        shell: bash
+        run: |
+          set -eu
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test
+          else
+            cargo test --features "${{ matrix.features }}"
+          fi
+
+  # ── Los kernels de Zig ───────────────────────────────────────────────────
+  zig:
+    name: kernels de Zig
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache de cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-zig-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-zig-
+
+      - uses: ./.github/actions/instalar-zig
+
+      - name: Clippy
+        run: cargo clippy --features zig,candle --all-targets -- -D warnings
+
+      # Entre los 22 hay seis que comparan cada backend contra la referencia
+      # escalar con la misma entrada. Son los que demuestran que el kernel de
+      # Zig calcula lo mismo que el de Rust, que es lo unico que justifica
+      # tenerlo.
+      - name: Tests
+        run: cargo test --features zig,candle
+
+      - name: Que el kernel compilado sea x86-64
+        run: python3 scripts/check_kernel_arch.py "" x86_64
+
+  # ── Que el camino de ARM exista de verdad ────────────────────────────────
+  #
+  # Este job no esta por completitud. DECISIONES.md §3 dice que Zig se queda
+  # PORQUE es la unica ruta vectorizada en ARM y Android — en x86-64 pierde
+  # entre 3% y 8% contra el AVX2 de Rust, y por velocidad sola la regla 3 lo
+  # borraria. Si cruzar dejara de funcionar, esa afirmacion seria falsa y los
+  # binarios de ARM saldrian con kernels escalares sin que nada avisara.
+  #
+  # Ya atrapo un fallo real: `build.rs` pasaba `-target=X` en un argumento y
+  # Zig lo quiere en dos, al reves que `-femit-bin=`.
+  cruzar:
+    name: cruzar a aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/instalar-zig
+
+      # Solo `gcc-`, no `g++-`: Cosxamix es Rust y Zig, sin una linea de C++, y
+      # el .a que produce Zig no llama ni a libc. Si alguna vez entra una
+      # dependencia de C++ hay que cambiarlo por `g++-aarch64-linux-gnu`, y el
+      # sintoma sera un `cannot find -lstdc++` al final de compilar los 155
+      # crates, un error que no menciona que falte un paquete.
+      - name: Linker de ARM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Compilar
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --features zig,candle --target aarch64-unknown-linux-gnu
+
+      # Que compile no prueba que el kernel sea de ARM: con el bug del
+      # `-target`, Zig producia un .a de x86-64 igual de valido para el
+      # archivador y con los simbolos correctos. Hay que mirar la cabecera ELF.
+      - name: Que el kernel sea AArch64 de verdad
+        run: python3 scripts/check_kernel_arch.py aarch64-unknown-linux-gnu aarch64
+
+      - name: Que el binario sea AArch64
+        run: |
+          file target/aarch64-unknown-linux-gnu/release/cosxamix
+          file target/aarch64-unknown-linux-gnu/release/cosxamix | grep -q 'ARM aarch64'
+
+  # ── Documentacion ────────────────────────────────────────────────────────
+  #
+  # Los tres fallos que aparecieron de verdad —tabla con una fila de distinto
+  # ancho, enlace relativo a un archivo renombrado, y un nombre viejo del
+  # proyecto sobreviviendo a un renombrado— no los ve el compilador.
+  docs:
+    name: documentacion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check_docs.py

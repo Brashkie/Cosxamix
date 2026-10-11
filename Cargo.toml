@@ -1,0 +1,120 @@
+[package]
+name = "cosxamix"
+version = "0.1.0"
+edition = "2021"
+description = "Runtime de IA que sirve modelos de lenguaje por HTTP, compatible con el dialecto de Ollama"
+license     = "MIT"
+repository  = "https://github.com/Brashkie/Cosxamix"
+readme      = "README.md"
+keywords    = ["llm", "inference", "gguf", "quantization", "ollama"]
+categories  = ["science", "command-line-utilities"]
+build       = "build.rs"
+
+[dependencies]
+# Mismas versiones que la Session API de WinsiBot: los dos proyectos se van a
+# tocar, y tener axum 0.7 de un lado y 0.8 del otro solo traería trabajo.
+axum               = "0.7"
+tokio              = { version = "1", features = ["full"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── Motor de inferencia (opcional) ───────────────────────────────────────────
+candle-core         = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+
+# Directa porque `src/model/qwen2.rs` la usa. Antes llegaba de rebote a traves
+# de candle-transformers, que no cuenta: una dependencia que se usa en el
+# codigo propio se declara, o el dia que transformers deje de traerla el build
+# se rompe por un motivo que no se parece a la causa.
+candle-nn           = { version = "0.9", optional = true }
+
+# Ya venian de rebote por candle; se declaran porque el codigo propio las usa.
+# El pool de rayon se configura a mano al arrancar y num_cpus es lo unico que
+# distingue nucleos fisicos de logicos — available_parallelism() devuelve 12
+# en un i5-10400 que tiene 6.
+rayon               = { version = "1", optional = true }
+num_cpus            = { version = "1", optional = true }
+
+# `default-features = false` NO es cosmetico: por defecto `tokenizers` trae el
+# feature `onig`, que es Oniguruma — una libreria de C — y rompe la compilacion
+# cruzada a Android con "failed to run custom build command for onig_sys".
+# Comprobado: con esta linea, toda la pila cruza a aarch64-linux-android; sin
+# ella, no. El camino alternativo usa fancy-regex, que es Rust puro.
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["unstable_wasm"] }
+
+[profile.release]
+lto           = true
+codegen-units = 1
+strip         = true
+
+[features]
+# Los kernels en Zig NO entran por defecto: sin esto, Cosxamix compila y funciona
+# con la referencia en Rust y con AVX2, y no hace falta tener Zig instalado.
+#
+#   cargo build --release --features zig
+zig = []
+
+# Motor de inferencia real. Fuera del set por defecto porque son 155 crates y
+# ~85 s de compilacion: quien solo quiera tocar la capa HTTP no deberia pagar
+# eso.
+#
+#   cargo run --release --features candle
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:rayon", "dep:num_cpus"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name    = "kernels"
+harness = false
+
+[[example]]
+name = "check_engine"
+# Sin esto, `cargo test` a secas intenta compilar el ejemplo —compila todos— y
+# falla con "could not find motor_candle in cosxamix", porque el modulo esta detras
+# de la feature. El error no menciona los tests, asi que parece que estuvieran
+# rotos ellos.
+required-features = ["candle"]
+
+[[example]]
+name = "check_cache"
+required-features = ["candle"]
+
+[[example]]
+name = "compare_logits"
+required-features = ["candle"]
+
+[[example]]
+name = "measure_interleaved"
+required-features = ["candle"]
+
+[[example]]
+name = "measure_memory"
+required-features = ["candle"]
+
+[[example]]
+name = "check_sessions"
+required-features = ["candle"]
+
+[[example]]
+name = "measure_weights"
+required-features = ["candle"]
+
+[[example]]
+name = "check_embeddings"
+required-features = ["candle"]
+
+[[example]]
+name = "measure_threads"
+required-features = ["candle"]
+
+[[example]]
+name = "compare_models"
+required-features = ["candle"]
+
+[[example]]
+name = "measure_projection"
+required-features = ["candle"]
+

@@ -1,0 +1,256 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      etiqueta:
+        description: Etiqueta a publicar (para reintentar un release que fallo)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Igual que en ci.yml: aqui NO va RUSTFLAGS, porque reemplazaria a los
+  # `rustflags` de `.cargo/config.toml` y se perderia el `target-cpu=x86-64-v3`
+  # — 4x medidos, y sin un solo aviso en la salida.
+
+jobs:
+  compilar:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Sin fail-fast a proposito. En WinsiBot tres targets fallaron en el
+      # mismo release por tres causas distintas, y con fail-fast se habria
+      # visto solo la primera, arreglado, y descubierto la segunda al dia
+      # siguiente.
+      fail-fast: false
+      matrix:
+        include:
+          # ── x86-64: sin Zig ─────────────────────────────────────────────
+          #
+          # No es olvido. En x86-64 el kernel de Zig pierde entre 3% y 8%
+          # contra el camino de Rust con intrinsecos AVX2 (medido con
+          # Criterion, ver DECISIONES.md §3), asi que meterlo aqui seria
+          # publicar la version mas lenta. Lo que elige el backend en tiempo
+          # de ejecucion preferiria Zig si estuviera compilado.
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: candle
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: candle
+          # El runner de macOS es ARM; para Intel se cruza desde ahi, que el
+          # SDK de Apple trae las dos arquitecturas. No hace falta un runner
+          # Intel, que es justo el que GitHub fue retirando.
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            features: candle
+
+          # ── ARM: con Zig ────────────────────────────────────────────────
+          #
+          # Aqui si, y es la razon por la que Zig esta en el proyecto: el
+          # camino de Rust usa `core::arch::x86_64`, que en ARM no existe, asi
+          # que sin Zig estos binarios caerian a la referencia escalar, 19
+          # veces mas lenta.
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            features: zig,candle
+            zig: true
+            apt: gcc-aarch64-linux-gnu
+          # Android va aparte de aarch64-unknown-linux-gnu y no es lo mismo:
+          # su triple es aarch64-linux-android, usa Bionic en vez de glibc, y
+          # un binario del otro baja bien y falla al ejecutarse. Es lo que
+          # hace falta para Termux.
+          - runner: ubuntu-latest
+            target: aarch64-linux-android
+            features: zig,candle
+            zig: true
+            ndk: true
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            features: zig,candle
+            zig: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache de cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ matrix.target }}-
+
+      - name: Instalar Zig
+        if: matrix.zig
+        uses: ./.github/actions/instalar-zig
+
+      - name: Linker cruzado
+        if: matrix.apt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      # El NDK ya viene en el runner de Ubuntu. Se elige el wrapper de clang
+      # con el API level MAS BAJO disponible, no el mas alto: el numero del
+      # nombre es el minimo de Android con el que el binario corre, asi que el
+      # mas bajo es el que llega a mas dispositivos. Se busca con un glob en
+      # vez de escribir `android21-clang` porque cada version del NDK retira
+      # niveles viejos, y un nombre fijo se rompe en silencio con el proximo
+      # cambio de imagen del runner.
+      - name: Linker de Android
+        if: matrix.ndk
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$ndk" ] || [ ! -d "$ndk" ]; then
+            echo "no encontre el NDK: ANDROID_NDK_LATEST_HOME=$ndk"
+            exit 1
+          fi
+          bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          linker=$(ls "$bin"/aarch64-linux-android*-clang 2>/dev/null | sort -V | head -1)
+          if [ -z "$linker" ]; then
+            echo "no encontre un clang de aarch64-linux-android en $bin"
+            ls "$bin" | head -40
+            exit 1
+          fi
+          echo "usando $linker"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$linker" >> "$GITHUB_ENV"
+
+      - name: Linker de ARM (glibc)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - run: rustup target add ${{ matrix.target }}
+
+      - name: Compilar
+        run: cargo build --release --features ${{ matrix.features }} --target ${{ matrix.target }}
+
+      # Que compile no prueba que el kernel sea de la arquitectura pedida: con
+      # un `-target` mal pasado, Zig produce un .a del host con los simbolos
+      # correctos y el enlazado funciona igual.
+      - name: Que el kernel sea de la arquitectura del target
+        if: matrix.zig
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            aarch64-*) esperada=aarch64 ;;
+            x86_64-*)  esperada=x86_64 ;;
+          esac
+          python3 scripts/check_kernel_arch.py "${{ matrix.target }}" "$esperada"
+
+      - name: Empaquetar
+        id: paquete
+        shell: bash
+        run: |
+          set -euo pipefail
+          etiqueta="${{ github.event.inputs.etiqueta || github.ref_name }}"
+          # La etiqueta es v0.1.0 y la version es 0.1.0: la `v` sirve para que
+          # el disparador `tags: v*` no se confunda con otras etiquetas, pero
+          # en el nombre de un archivo descargado sobra.
+          version="${etiqueta#v}"
+          dir=target/${{ matrix.target }}/release
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            origen="$dir/cosxamix.exe"
+            nombre="cosxamix-${version}-${{ matrix.target }}.exe"
+          else
+            origen="$dir/cosxamix"
+            nombre="cosxamix-${version}-${{ matrix.target }}"
+          fi
+
+          mkdir -p dist
+          cp "$origen" "dist/$nombre"
+
+          # Ninguna de las dos herramientas de sha256 esta en los tres
+          # sistemas: `sha256sum` esta en Linux y en el Git Bash de Windows
+          # pero no en macOS, y `shasum` esta en macOS y Linux pero no en
+          # Windows. Dar por buena una sola es lo que rompio un release de
+          # WinsiBot, con un "shasum: command not found" despues de haber
+          # compilado bien.
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$nombre" > "$nombre.sha256"
+          elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$nombre" > "$nombre.sha256"
+          else
+            echo "no encontre ni sha256sum ni shasum"
+            exit 1
+          fi
+          cat "$nombre.sha256"
+
+          # El tamano se informa porque es parte de la premisa del proyecto:
+          # un solo archivo, sin .dll ni .so al lado.
+          ls -la "$nombre" | awk '{printf "  %s  %.1f MB\n", $NF, $5/1048576}'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cosxamix-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publicar:
+    name: publicar el release
+    needs: compilar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Lo que se va a publicar
+        run: ls -la dist
+
+      # Se usa el `gh` que ya viene en el runner y el GITHUB_TOKEN del propio
+      # workflow, en vez de una action de terceros: publicar es la operacion
+      # con mas permisos de todo el repositorio.
+      - name: Crear el release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          etiqueta="${{ github.event.inputs.etiqueta || github.ref_name }}"
+          version="${etiqueta#v}"
+
+          cat > notas.md <<'FIN'
+          Un archivo por plataforma, sin dependencias al lado: ni DLL, ni .so,
+          ni runtime que instalar. Cada binario trae su `.sha256`.
+
+          | plataforma | archivo | kernels |
+          |---|---|---|
+          | Linux x86-64 | `*-x86_64-unknown-linux-gnu` | AVX2 (Rust) |
+          | Linux ARM64 | `*-aarch64-unknown-linux-gnu` | NEON (Zig) |
+          | Android ARM64 (Termux) | `*-aarch64-linux-android` | NEON (Zig) |
+          | Windows x86-64 | `*-x86_64-pc-windows-msvc.exe` | AVX2 (Rust) |
+          | macOS Apple Silicon | `*-aarch64-apple-darwin` | NEON (Zig) |
+          | macOS Intel | `*-x86_64-apple-darwin` | AVX2 (Rust) |
+
+          En x86-64 **no** van los kernels de Zig a proposito: ahi pierden
+          entre 3% y 8% contra el camino de Rust con intrinsecos AVX2. En ARM
+          si, porque es la unica ruta vectorizada que existe — sin ellos el
+          binario caeria a la referencia escalar.
+
+          Los binarios de x86-64 estan compilados para `x86-64-v3` (AVX2 +
+          FMA, cualquier CPU de 2015 en adelante). **No arrancan en un x86
+          anterior**; para esos hay que compilar desde fuente sin esa linea de
+          `.cargo/config.toml`, y correra 4 veces mas lento.
+
+          Los modelos no van aqui: se bajan aparte o se apuntan con
+          `COSXAMIX_MODELOS`.
+          FIN
+
+          gh release create "$etiqueta" \
+            --title "Cosxamix $version" \
+            --notes-file notas.md \
+            --verify-tag \
+            dist/*
