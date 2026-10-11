@@ -11,6 +11,10 @@
 
 use cosxamix::engine_candle::MotorCandle;
 
+// Sin este `cfg` las dos versiones quedan definidas a la vez fuera de Windows y
+// el ejemplo no compila. En Windows el error NO aparece, porque alli la que
+// queda fuera es la otra: compilar en una sola plataforma no puede encontrarlo.
+#[cfg(windows)]
 fn memoria_mb() -> f64 {
     // Se lee con `tasklist` en vez de sumar una dependencia nativa: esto es un
     // ejemplo de diagnóstico, no código de producción.

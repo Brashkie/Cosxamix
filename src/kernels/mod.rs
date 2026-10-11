@@ -64,6 +64,11 @@ impl fmt::Display for Backend {
 
 /// Los backends que esta compilación trae Y esta CPU puede ejecutar.
 pub fn disponibles() -> Vec<Backend> {
+    // El `mut` hace falta en x86-64 y con la feature `zig`, y en ningun otro
+    // caso: en un ARM sin `zig` no se empuja nada y el compilador avisa. No se
+    // puede poner el `mut` tras un `cfg` porque la mutabilidad no es un
+    // atributo, asi que se silencia aqui, acotado a esta funcion.
+    #[allow(unused_mut)]
     let mut v = vec![Backend::Escalar];
 
     #[cfg(target_arch = "x86_64")]

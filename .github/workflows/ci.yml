@@ -152,6 +152,23 @@ jobs:
 
       - run: rustup target add aarch64-unknown-linux-gnu
 
+      # Clippy para un target que no es x86 ni Windows, que es donde se ven los
+      # fallos escondidos tras un `cfg`. Compilar para una sola plataforma no
+      # puede encontrarlos por definicion: el codigo que rompe es justo el que
+      # alli no se compila.
+      #
+      # Ya encontro dos reales en el primer push: `examples/measure_memory.rs`
+      # tenia dos `memoria_mb` y a la de Windows le faltaba su `#[cfg(windows)]`,
+      # asi que fuera de Windows quedaban las dos definidas (E0428); y el `mut`
+      # de `kernels::disponibles()` no hace falta en un ARM sin la feature `zig`,
+      # porque alli no se empuja nada.
+      #
+      # Esta antes de compilar a proposito: tarda menos y el mensaje es mejor.
+      - name: Clippy para ARM
+        run: |
+          cargo clippy --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+          cargo clippy --features zig,candle --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+
       - name: Compilar
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc

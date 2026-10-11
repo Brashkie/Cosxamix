@@ -197,6 +197,21 @@ agrega una sección a uno y se olvida del otro, CI falla.
   `flamegraph.svg`, `*.log`). Queda escrito en el propio archivo por qué
   `Cargo.lock` **sí** va al repositorio.
 
+- **Dos fallos que solo existen fuera de Windows**, encontrados por el primer CI
+  y que ninguna compilación local podía haber encontrado, porque el código que
+  rompe es justo el que en el host no se compila:
+  1. `examples/measure_memory.rs` define `memoria_mb` dos veces, una por
+     plataforma, y a la de Windows **le faltaba su `#[cfg(windows)]`**. En
+     Windows compila —allí la que queda fuera es la otra— y en Linux y macOS
+     quedan las dos definidas: error `E0428`, no un aviso.
+  2. El `mut` de `kernels::disponibles()` no hace falta en un ARM sin la feature
+     `zig`, porque ahí no se empuja ningún backend. Con `-D warnings` eso es un
+     fallo, y es lo que tiró los dos jobs de macOS, que corren en Apple Silicon.
+
+  De los dos salió una comprobación nueva en CI: el job del cruce ahora corre
+  **clippy para `aarch64`** antes de compilar, en las dos combinaciones de
+  features. Es más rápido que esperar al runner de macOS y el mensaje es mejor.
+
 ### Eliminado
 
 - **Decodificación especulativa** (`src/motor_especulativo.rs`) — borrador 0,5B
