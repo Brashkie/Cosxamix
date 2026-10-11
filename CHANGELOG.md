@@ -212,6 +212,24 @@ agrega una sección a uno y se olvida del otro, CI falla.
   **clippy para `aarch64`** antes de compilar, en las dos combinaciones de
   features. Es más rápido que esperar al runner de macOS y el mensaje es mejor.
 
+- **`check_kernel_arch.py` no entendia Mach-O**, y tiro el primer intento de
+  release: de los 6 targets compilaron 5 —Android ARM64 incluido— y
+  `aarch64-apple-darwin` cayo en el paso de verificacion con "arquitectura
+  encontrada None". El kernel estaba bien; el script solo leia ELF y COFF, y
+  macOS usa un tercer formato.
+
+  Reproducido en local cruzando con el mismo Zig: el `.a` de macOS es un
+  archivador con objetos Mach-O de 64 bits, `cputype 0x0100000C` para ARM64 y
+  `0x01000007` para x86-64.
+
+  De paso se corrigio algo peor que el fallo: la deteccion de COFF **escaneaba**
+  el archivo aceptando el primer valor plausible, y eso puede encontrarlo por
+  casualidad dentro de los datos y reportar con total confianza una
+  arquitectura equivocada. Ahora se parsea el archivador `ar` —incluidos los
+  nombres largos al estilo BSD que usa macOS— y se lee la cabecera del primer
+  miembro real. Probado contra los cuatro artefactos de verdad: COFF de
+  Windows, ELF de ARM, y Mach-O de ARM y de x86-64.
+
 ### Eliminado
 
 - **Decodificación especulativa** (`src/motor_especulativo.rs`) — borrador 0,5B
