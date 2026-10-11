@@ -151,6 +151,30 @@ impl MotorCandle {
         Ok(())
     }
 
+    /// Saca el modelo de la RAM.
+    ///
+    /// Se lleva por delante los caches de sesion de ese modelo, y tiene que
+    /// ser asi: un cache de atencion son estados internos de unos pesos
+    /// concretos que ya no estan. La siguiente peticion reprocesa el prompt,
+    /// que es el precio de haber desalojado.
+    pub fn descargar(&self) {
+        *self.estado.lock().expect("mutex envenenado") = None;
+    }
+
+    /// Cuantos bytes ocupa el cache de atencion activo. Solo diagnostico.
+    pub fn bytes_de_cache(&self) -> usize {
+        let mut g = self.estado.lock().expect("mutex envenenado");
+        match g.as_mut() {
+            Some(c) => {
+                let cache = c.pesos.tomar_cache();
+                let n = cache.bytes();
+                c.pesos.poner_cache(cache);
+                n
+            }
+            None => 0,
+        }
+    }
+
     pub fn esta_caliente(&self) -> bool {
         self.estado.lock().expect("mutex envenenado").is_some()
     }
@@ -494,6 +518,14 @@ impl Motor for MotorCandle {
     }
 
     fn generar(&self, p: &Peticion) -> Result<Respuesta, ErrorMotor> {
+        self.generar_en_partes(p, &mut |_| true)
+    }
+
+    fn generar_en_partes(
+        &self,
+        p: &Peticion,
+        emitir: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<Respuesta, ErrorMotor> {
         if !p.modelo.is_empty() && p.modelo != self.nombre {
             return Err(ErrorMotor::ModeloDesconocido(p.modelo.clone()));
         }
@@ -618,6 +650,9 @@ impl Motor for MotorCandle {
         // ── Generación, token a token ────────────────────────────────────────
         let fin = c.tokenizer.token_to_id("<|im_end|>");
         let mut salida: Vec<u32> = Vec::new();
+        // Lo ya emitido, para poder mandar solo la diferencia.
+        let mut emitido = String::new();
+        let mut cortado = false;
         // `pos` es la posición absoluta en la secuencia, que es lo que el
         // modelo necesita para ubicar el token en su caché de atención — no
         // un contador del bucle. Por eso arranca en el largo del prompt.
@@ -641,6 +676,31 @@ impl Motor for MotorCandle {
                 break;
             }
             salida.push(siguiente);
+
+            // Un token NO es un trozo de texto: puede ser media palabra o
+            // medio caracter UTF-8. Lo unico seguro es decodificar todo lo
+            // generado y emitir lo que crecio desde la vez anterior.
+            //
+            // Cuesta O(n^2) en el largo de la respuesta, y no importa:
+            // decodificar 200 tokens son microsegundos al lado de los ~100 ms
+            // que cuesta el forward que produce cada uno.
+            if let Ok(completo) = c.tokenizer.decode(&salida, true) {
+                // Si el decodificado nuevo no empieza por el anterior, el
+                // tokenizador reescribio algo que ya habia salido. Es raro,
+                // pero emitir un trozo mal cortado partiria un caracter, asi
+                // que en ese caso se espera al token siguiente.
+                if let Some(nuevo) = completo.strip_prefix(emitido.as_str()) {
+                    if !nuevo.is_empty() {
+                        if !emitir(nuevo) {
+                            cortado = true;
+                        }
+                        emitido = completo.clone();
+                    }
+                }
+            }
+            if cortado {
+                break;
+            }
 
             let t = Tensor::new(&[siguiente], &self.device)
                 .and_then(|t| t.unsqueeze(0))

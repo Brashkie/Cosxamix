@@ -8,8 +8,9 @@ it.
 
 > **Status: real inference running, and WinsiBot already answers through it.**
 > It serves a GGUF model over HTTP in Ollama's dialect, pre-warmed at startup,
-> with a per-conversation attention cache that reuses the common prefix. Still
-> missing: the multi-model manager and *streaming* responses.
+> with a per-conversation attention cache that reuses the common prefix,
+> *streaming* responses, several models at once with use-based eviction, and
+> LoRA fine-tuning.
 
 ## The documents
 
@@ -52,9 +53,21 @@ it's where the decisions that actually change perceived latency live: that the
 model isn't unloaded, that the prompt isn't recomputed in full, that one
 request doesn't wait behind another.
 
-**Training a model from scratch is out of scope.** A billion-parameter model is
-thousands of GPU-hours and hundreds of GB of text. What is in scope, later, is
-fine-tuning a small one on a corpus of our own.
+**Creating models is in scope; creating a large one is not.** A
+billion-parameter model is thousands of GPU-hours and hundreds of GB of text,
+and that doesn't come out of a machine without a GPU. A **small, specialized**
+one does, and it fits the rest of the project: if the goal is running on a
+phone, an 8-million-parameter model trained for one task beats a 3-billion one
+that doesn't fit.
+
+One detail decides the order of that work, and it's arithmetic, not opinion.
+With Qwen's vocabulary — 151,936 entries — a model 256 wide and 6 layers deep
+would be **87% embedding table**: 38.9 M out of 44.6 M. It wouldn't be a model,
+it would be a lookup table with a transformer attached. With a custom 8,192
+vocabulary, the same shape is 7.8 M with the embedding at 27%.
+
+So **creating a model starts with creating a tokenizer**. It's in the
+[ROADMAP](ROADMAP.md) §8 with the figures.
 
 ---
 
@@ -98,15 +111,45 @@ curl -X POST http://127.0.0.1:11435/v1/chat/completions \
   -d '{"model":"cosxamix-demo","messages":[{"role":"user","content":"hello"}]}'
 ```
 
+With `"stream": true` the response comes over SSE in OpenAI's dialect, one
+`data:` per chunk and a `data: [DONE]` at the end. Measured on the 3B: the
+first chunk at **2.14 s** and the last at 5.82 — **3.68 s of text appearing**
+instead of a blank screen. And if the client hangs up, generation stops:
+verified by closing at 1.87 s on a 120-token request, where the server stopped
+at 5.
+
+```bash
+curl -N -X POST http://127.0.0.1:11435/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"stream":true,"messages":[{"role":"user","content":"hello"}]}'
+```
+
 Environment variables:
 
 | | default | |
 |---|---|---|
 | `COSXAMIX_PORT` | `11435` | One off from Ollama's 11434, so both can coexist |
 | `COSXAMIX_MODELOS` | `./modelos` | Where to look for model files |
-| `COSXAMIX_GGUF` | `qwen2.5-3b-instruct-q3_k_m.gguf` | Which model to load |
-| `COSXAMIX_TOKENIZER` | `tokenizer-3b.json` | Its tokenizer |
+| `COSXAMIX_GGUF` | `qwen2.5-3b-instruct-q3_k_m.gguf` | Which one gets pre-warmed at startup |
+| `COSXAMIX_RAM_MB` | `4096` | Memory budget for loaded models |
 | `RAYON_NUM_THREADS` | physical cores | Threads for the matrix math |
+
+**Every `.gguf` in the directory is registered**, not only the one in
+`COSXAMIX_GGUF`: that variable says which one is pre-warmed, not which one
+exists. Asking for another by `model` loads it, evicting the least recently
+used one if it doesn't fit the budget.
+
+The budget is in **bytes, not in number of models**, because they don't weigh
+the same: in a normal directory they run from 468 to 2007 MB, and a cap of
+"three models" would let in 1.4 GB or 6 GB depending on which. It is measured
+by file size, which is a good approximation now that embeddings are no longer
+dequantized: the RAM/disk ratio came down to x1.02-x1.08.
+
+There is no `COSXAMIX_TOKENIZER` any more: one variable cannot serve five
+models. Each GGUF is paired automatically, looking first for
+`<model>.tokenizer.json`, then `tokenizer-<size>.json`, and finally
+`tokenizer.json`. The pairing **is logged at startup**, because a wrong
+tokenizer doesn't raise an error: it produces nonsense.
 
 ---
 
@@ -617,9 +660,21 @@ independent. A client that doesn't send it works the same, it just reprocesses
 the whole prompt.
 
 Capped at 16 sessions with least-recently-used eviction, and 4096 tokens per
-conversation. The cache is ~24 KB per token, so 16 sessions of 1000 tokens are
-~380 MB: expensive, but next to the 931 MB of **each** model instance it's a
-bargain.
+conversation. What it costs **depends on the model**, and measuring it
+corrected a figure this document had wrong:
+
+| | KB per token | 16 sessions of 1000 tokens |
+|---|---:|---:|
+| 0.5B | 24.0 | 0.4 GB |
+| **3B Q3** (the default) | **72.0** | **1.1 GB** |
+
+36 layers against 24, and 128 head dimensions against 64: three times more per
+token. This README said "~24 KB per token, 16 sessions are ~380 MB" without
+saying which model, and with the default one that underestimates memory by
+**three times**. Measured with `examples/measure_cache_disk.rs`.
+
+Even so the trade still holds next to the 931 MB that **each** model instance
+costs, which is the alternative that was ruled out.
 
 #### The cost of keeping the model in this repository
 
@@ -639,10 +694,20 @@ cargo run --release --features candle --example measure_memory       # the 931 M
 
 ## Several languages, one single boundary
 
-Cosxamix isn't written in Rust alone. Rust is the main one, and there's room for
-Zig, C, assembly and whatever else is needed. The risk in that isn't the
-languages: it's having **N different places** where each one gets in. That's why
-there is a single boundary, in `src/kernels/`, and three rules governing it.
+Cosxamix isn't written in Rust alone. Rust is the main one, and the boundary is
+open to whichever language wins the measurement:
+
+| | what it brings | what's missing |
+|---|---|---|
+| **Zig** | one source covering x86-64, ARM64 and Android | nothing: it's already in |
+| **Assembly** | full control where the compiler emits something redundant | a specific loop flagged by profiling, or an instruction candle doesn't use |
+| **Fortran** | arrays without aliasing, which is why BLAS and LAPACK are still Fortran | a compiler on every platform, and Android is exactly the problem |
+| **Ada / SPARK** | proving a kernel cannot overflow, instead of testing that it doesn't | a kernel critical enough to justify the toolchain |
+| **C** | the common denominator, and what candle already uses underneath | nothing the others don't cover |
+
+The risk in that isn't the languages: it's having **N different places** where
+each one gets in. That's why there is a single boundary, in `src/kernels/`, and
+three rules governing it.
 
 1. **Every kernel has a portable reference implementation in Rust.** It defines
    which result is correct and it runs when the CPU has nothing better. It is
@@ -692,6 +757,12 @@ the same `kernels/dot.zig`, without touching a line, compiles for
 path is `core::arch::x86_64`: **x86 only**. On a phone, today, it falls back to
 the scalar reference, which is 19 times slower.
 
+That shouldn't be read as more than it says: what falls back to scalar on ARM
+are **these** kernels, `dot` and `rmsnorm`. The quantized matrix multiply,
+where 99% of the work is, is covered by candle's own hand-written `neon.rs`.
+The engine on a phone is not scalar; these two standalone kernels would be,
+without Zig.
+
 So what Zig contributes here isn't speed: it's **coverage**. A portable kernel
 that performs nearly as well as the specific one beats a specific kernel that
 doesn't exist on half the fleet. That's the reason it stays — and it's written
@@ -729,6 +800,32 @@ against it **is not vectorization alone**: part of it is the precision
 difference. The clean language-to-language comparison is the last two columns,
 which do accumulate the same way.
 
+### Third kernel: `silu`, and the first time Zig wins on speed
+
+`silu` is the MLP activation — `x * sigmoid(x)` — and the MLP is 79% of the
+weights, so it runs over 11008 elements per layer per token.
+
+It has **two** implementations, not three, and that's the interesting part:
+
+| n | scalar | Zig | |
+|---:|---:|---:|---|
+| 4,864 | 21.23 µs | **16.88 µs** | 1.26x |
+| 11,008 | 47.96 µs | **38.76 µs** | 1.24x |
+
+There is no AVX2 path because **Rust cannot vectorize an exponential without
+hand-writing it**: `f32::exp` is scalar, and applying it to an `__m256` forces
+a polynomial approximation with range reduction — forty delicate lines where a
+wrong coefficient breaks nothing, it just gives slightly worse answers. Zig's
+`@exp` takes a vector and lowers to the LLVM intrinsic.
+
+It's the first time Zig's advantage here isn't "it runs on ARM" but **the
+language brings the tool**.
+
+That said, 1.25x is not 8x. If `@exp` truly vectorized across all eight lanes
+we'd see far more, so most likely LLVM expands it into eight scalar calls and
+only saves the loop. It's a kernel worth re-measuring when the Zig version
+changes.
+
 ### A trap that cost a measurement
 
 The first comparison had Zig losing between 3% and **26%**. The reason wasn't
@@ -737,6 +834,51 @@ compiled for the basic x86-64 of 2003 and its `@Vector(8, f32)` was split into
 128-bit operations. With `-mcpu=x86_64_v3` — which is exactly AVX2+FMA, the same
 thing Rust's `#[target_feature]` enables — the gap dropped to 8%. Comparing
 without matching the target is comparing two targets, not two languages.
+
+---
+
+## Training without a GPU
+
+Cosxamix no longer only runs inference. With the `training` feature it
+fine-tunes a model using **LoRA**: it trains 0.1% of the parameters instead of
+100%.
+
+```bash
+cargo run --release --features training --example train_lora -- corpus.txt 1000
+```
+
+The output is an `adaptador.safetensors` of **2.1 MB**. The base model is never
+touched, so the adapter ships on its own.
+
+Measured on an i5-10400 with no GPU, Qwen2.5-0.5B, 256-token sequences:
+
+| | |
+|---|---:|
+| trainable parameters | 540,672 out of 494 million |
+| full step | ~5.2 s |
+| 1000 steps | ~1.4 h |
+| resulting adapter | 2.1 MB |
+
+**The base is held in f32, not quantized**, and that bounds the scope. candle's
+`QMatMul` does not implement `bwd`: gradients cannot flow through a quantized
+matmul, because the backward needs `dL/dy · W` — multiplying by `W`
+untransposed — and candle only knows how to do `x · Wt`. The 0.5B in f32 is
+~2 GB and fits; the 3B would be ~12 GB and does not. Training the 3B needs a
+kernel that doesn't exist yet, and it's in the [ROADMAP](ROADMAP.md) §7.
+
+The training model is an f32 reimplementation of the inference one, and that
+they are the same **is checked**, because a mistake there — RoPE order, how KV
+heads are repeated, the attention scale — would still make the loss go down,
+optimizing against a model that isn't the one later served:
+
+```bash
+cargo run --release --features training --example check_training_model
+```
+
+It compares the logits of both paths on a real prompt. It doesn't demand
+equality — one dequantizes to f32 and the other multiplies in integers — but
+that they **pick the same token**. Measured: 3.2% of the range as the largest
+difference, same token.
 
 ---
 

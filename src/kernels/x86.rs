@@ -61,7 +61,39 @@ pub unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
         i += 32;
     }
 
+    let mut acc = [0f32; 32];
+    _mm256_storeu_ps(acc.as_mut_ptr(), s0);
+    _mm256_storeu_ps(acc.as_mut_ptr().add(8), s1);
+    _mm256_storeu_ps(acc.as_mut_ptr().add(16), s2);
+    _mm256_storeu_ps(acc.as_mut_ptr().add(24), s3);
+
+    reducir_y_cola(a, b, &acc, i)
+}
+
+/// La cola y la suma horizontal, compartidas con la versión en ensamblador.
+///
+/// Está factorizado para que las dos implementaciones usen **el mismo** código
+/// aquí y la única diferencia entre ellas sea el bucle caliente. Comparar dos
+/// kernels que además reducen distinto no diría cuál bucle es mejor, diría que
+/// dan números distintos.
+///
+/// `desde` es cuántos elementos consumió ya el bucle de 32.
+///
+/// # Safety
+///
+/// Pide AVX2 y FMA, y que `acc` traiga los cuatro acumuladores de 8.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn reducir_y_cola(a: &[f32], b: &[f32], acc: &[f32; 32], desde: usize) -> f32 {
+    let n = a.len();
+    let (pa, pb) = (a.as_ptr(), b.as_ptr());
+
+    let mut s0 = _mm256_loadu_ps(acc.as_ptr());
+    let s1 = _mm256_loadu_ps(acc.as_ptr().add(8));
+    let s2 = _mm256_loadu_ps(acc.as_ptr().add(16));
+    let s3 = _mm256_loadu_ps(acc.as_ptr().add(24));
+
     // Lo que no llegó a 32 pero sí a 8.
+    let mut i = desde;
     while i + 8 <= n {
         s0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), s0);
         i += 8;

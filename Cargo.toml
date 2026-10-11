@@ -15,6 +15,10 @@ build       = "build.rs"
 # tocar, y tener axum 0.7 de un lado y 0.8 del otro solo traería trabajo.
 axum               = "0.7"
 tokio              = { version = "1", features = ["full"] }
+# Solo por `ReceiverStream`, que convierte el canal del generador en el flujo
+# que pide la respuesta SSE. Se declara aunque sea una linea: viene del equipo
+# de tokio, pero es una dependencia que usa el codigo propio.
+tokio-stream       = "0.1"
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 tracing            = "0.1"
@@ -62,6 +66,12 @@ zig = []
 #
 #   cargo run --release --features candle
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:rayon", "dep:num_cpus"]
+
+# Entrenamiento LoRA. Implica `candle` porque no puede existir sin el, y va
+# aparte porque quien solo quiera servir no tiene por que compilarlo.
+#
+#   cargo run --release --features training --example train_lora
+training = ["candle"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -117,4 +127,24 @@ required-features = ["candle"]
 [[example]]
 name = "measure_projection"
 required-features = ["candle"]
+
+[[example]]
+name = "measure_matmul"
+required-features = ["candle"]
+
+[[example]]
+name = "measure_cache_disk"
+required-features = ["candle"]
+
+[[example]]
+name = "measure_lora"
+required-features = ["candle"]
+
+[[example]]
+name = "check_training_model"
+required-features = ["training"]
+
+[[example]]
+name = "train_lora"
+required-features = ["training"]
 

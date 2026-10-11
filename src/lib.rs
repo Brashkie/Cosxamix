@@ -14,3 +14,9 @@ pub mod model;
 
 #[cfg(feature = "candle")]
 pub mod engine_candle;
+
+#[cfg(feature = "candle")]
+pub mod engine_manager;
+
+#[cfg(feature = "training")]
+pub mod training;

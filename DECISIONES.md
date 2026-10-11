@@ -17,7 +17,7 @@ lo que había, o por habilitar una plataforma donde no había nada.
 | 2 | candle como motor, no llama.cpp | adoptado |
 | 3 | Frontera de kernels con Zig | adoptado, por cobertura |
 | 4 | D en el camino crítico | descartado |
-| 5 | ASM en el bucle interno | no justificado todavía |
+| 5 | ASM, Fortran y Ada en la frontera | qué falta para que entren |
 | 6 | Embeddings sin descuantizar | adoptado, −431 MB |
 | 7 | Caché de atención por sesión | adoptado, −76% al intercalar |
 | 8 | Qwen2.5-3B en vez de 0,5B o 1,5B | adoptado |
@@ -110,17 +110,102 @@ Súmese que Zig cruza a Termux sin cadena de herramientas y D no.
 
 ---
 
-## 5. ASM: el método es bueno, el momento no
+## 5. Los lenguajes que todavía no entraron, y qué los haría entrar
 
-El flujo propuesto es correcto — escribir la referencia, mirar el ensamblador
-generado, reemplazar solo el bucle interno si hay redundancia demostrada.
+La frontera de `src/kernels/` no es "Rust y Zig": es Rust y **el lenguaje que
+gane la medición**. Zig está porque cubre ARM, no porque sea el único
+candidato. Lo que sigue es qué aporta cada uno y qué falta para que entre,
+escrito para que la pregunta no haya que rehacerla.
 
-Pero el bucle interno de la multiplicación cuantizada **ya es AVX2 escrito a
-mano** (ver punto 11), y la pérdida medida no está ahí sino en el reparto entre
-hilos, que ASM no toca.
+### Ensamblador: escrito y medido
 
-Se reconsidera cuando haya evidencia de que el compilador emite código
-redundante en un bucle concreto.
+Hasta la 0.2.0 este punto decía "el método es bueno, el momento no" y se
+apoyaba en un razonamiento: que el bucle que importa ya está escrito a mano en
+candle. Razonar no es medir. Así que se escribió.
+
+El kernel vive en **dos archivos de ensamblador sueltos**,
+`kernels/dot_avx2_win64.s` y `kernels/dot_avx2_sysv.s`, no en `asm!` metido
+entre Rust. Son dos y no uno porque el ensamblador es **el único lenguaje de
+esta frontera que tiene que saber la convención de llamada**: Rust, Zig y
+Fortran reciben sus argumentos donde el compilador decida, acá hay que escribir
+en qué registro llega cada uno, y Windows usa `rcx rdx r8 r9` donde System V
+usa `rdi rsi rdx rcx`.
+
+Se ensamblan con LLVM por `global_asm!`, así que no hace falta ningún
+ensamblador externo. Cuatro acumuladores, `vfmadd231ps` con el segundo operando
+en memoria, 32 elementos por vuelta, y solo registros volátiles —`ymm0` a
+`ymm5`— para no tener que salvar `xmm6`-`xmm15`, que en Windows x64 son no
+volátiles. La cola y la suma horizontal son
+**el mismo código** que la versión de intrínsecos, factorizado en
+`x86::reducir_y_cola`, para que lo único que separe a las dos sea el bucle. El
+resultado sale **bit a bit idéntico**, comprobado en largos de 0 a 4097.
+
+Criterion, mediana:
+
+| n | AVX2 (intrínsecos) | ensamblador | |
+|---:|---:|---:|---|
+| 1.024 | **49,4 ns** | 50,3 ns | +1,9% |
+| 4.096 | **216,0 ns** | 217,1 ns | +0,5% |
+| 65.536 | 7,96 µs | **7,79 µs** | −2,1% |
+| 1.000.003 | **146,5 µs** | 183,4 µs | **+25%** |
+
+**No gana.** Empata en los tamaños chicos, gana un 2% en uno, y pierde un 25%
+en el más grande — donde LLVM claramente hace algo que el bucle a mano no:
+prefetch, o un desenrollado distinto para datos que no entran en caché.
+
+El kernel se deja en el árbol y en el banco, pero **fuera del despachador**:
+no es un backend, es una medición que se puede repetir. Importa porque el
+resultado **depende de la microarquitectura**, y hay un caso donde podría dar
+vuelta: candle no usa **AVX-512** —`avx.rs` es de 256 bits— ni **SVE**
+—`neon.rs` es de 128—, y esta máquina es un i5-10400, que no tiene AVX-512.
+En una que lo tenga, duplicar el ancho del vector es algo que el compilador no
+va a hacer solo mientras candle no se lo pida.
+
+Lo que quedó claro, y vale más que el kernel: **contra un bucle que LLVM ya
+vectoriza bien, escribirlo a mano no compra nada.** El sitio del ensamblador
+es donde el compilador no tiene permiso para ir, no donde ya está.
+
+### Fortran
+
+El argumento es real y no es nostalgia: **BLAS y LAPACK son Fortran**, y no por
+inercia. Sus arreglos no admiten aliasing por defecto, y eso le deja al
+compilador vectorizar sin las comprobaciones que un `*mut f32` de C obliga a
+hacer. `gfortran` y `flang` generan código numérico excelente.
+
+**Se intentó medirlo y está bloqueado por el toolchain, no por el argumento.**
+El `gfortran` de esta máquina es MinGW de 32 bits —`-dumpmachine` dice
+`mingw32` y el objeto que produce es COFF i386— mientras que Rust compila para
+`x86_64-pc-windows-msvc`. Los objetos no enlazan, así que no hay comparación
+posible acá.
+
+Lo desbloquea un gfortran de 64 bits —el de MSYS2 `mingw-w64`— o `flang`.
+Hasta entonces el argumento queda sin comprobar, que no es lo mismo que
+descartado.
+
+Y después queda la plataforma: haría falta un compilador de Fortran en cada
+objetivo, y para `aarch64-linux-android` eso es exactamente el requisito que el
+proyecto se quitó de encima al elegir candle sobre llama.cpp.
+
+### Ada y SPARK
+
+Lo que aporta no es velocidad: GNAT usa el mismo backend que los demás. Es
+**verificación**. SPARK puede demostrar la ausencia de desbordamientos y de
+accesos fuera de rango en un kernel, no comprobarla con tests.
+
+Eso vale justo donde este proyecto es más frágil: los kernels corren con
+`-OReleaseFast` y sin comprobaciones de desbordamiento, y lo único que hoy los
+protege son los tests contra la referencia. Un kernel probado formalmente sería
+más fuerte que uno probado con casos.
+
+**No hay compilador instalado en esta máquina** —ni `gnat` ni `gnatmake`—, así
+que tampoco se pudo probar. Es lo primero que haría falta para pasar de la idea
+al dato.
+
+### La regla sigue siendo la misma
+
+Ninguno entra por ser mejor en abstracto. Entra el que **le gane a la
+referencia midiendo**, o el que habilite una plataforma donde no había
+aceleración — que es por lo que está Zig, que en x86-64 pierde un 3-8%.
 
 ---
 
@@ -294,9 +379,81 @@ Medido sobre el 3B:
 tokens de vocabulario— pero resultó ser el **15%** del modelo, y el 15% no
 explica 3,74x.
 
-Lo que sí lo explica: si estuviera limitada por leer la RAM, 5 posiciones
-costarían ~1x. Que cuesten 3,74x significa que está limitada por **cálculo**. Y
-la especulativa solo rinde cuando el cuello es la memoria.
+> **Revisado dos veces en la 0.2.0.** La primera revision concluyo que el motor
+> esta limitado por memoria y que la culpa era del orden de los bucles de
+> candle. El experimento la desmintio. Queda lo que la evidencia sostiene, y
+> queda escrito el error porque costo medio dia.
+
+Hay **dos regimenes distintos**, y confundirlos fue el error:
+
+**Con una sola fila —el decode, que es el caso dominante— manda la memoria.**
+Medido matriz por matriz a 6 hilos, el escalado depende de si la matriz entra
+en los 12 MB de L3:
+
+| matriz | pesos | 6 hilos |
+|---|---:|---:|
+| attn q · 2048→2048 | ~1,8 MB | **7,03x** |
+| FFN gate · 2048→11008 | ~9,6 MB | 2,82x |
+| FFN down · 11008→2048 | ~9,6 MB | 1,76x |
+| salida · 2048→151936 | ~133 MB | 2,25x |
+
+Eso explica el escalado de hilos del forward completo: ponderando cada matriz
+por su participacion da **2,47x** contra los **2,60x** medidos.
+
+**Con mas de una fila manda el calculo**, y es lo que hace cierta la conclusion
+original. El bucle de filas de candle es el externo y relee la matriz entera
+por fila, lo que parecia la causa:
+
+```rust
+for row_idx in 0..m {                    // en serie
+    dst_row.into_par_iter().for_each(|col_idx, dst| { ... })
+```
+
+Se escribio el kernel con los bucles al reves —columnas afuera, filas adentro,
+reusando la columna ya leida— y **no gano nada**: entre 0,91x y 1,17x segun la
+corrida, dentro del ruido.
+
+El motivo es que intercambiar los bucles ahorra releer **bytes**, pero
+`vec_dot` rehace el desempaquetado del k-quant por cada par (fila, columna) de
+todas formas. Para comprobarlo se escribio una segunda variante que descuantiza
+cada columna una sola vez y despues hace `m` productos punto en f32 — o sea que
+elimina ese trabajo repetido por completo. Salio **entre 5 y 25 veces mas
+lenta**:
+
+| filas | candle | bucles al reves | descuantizar una vez |
+|---:|---:|---:|---:|
+| 1 | 0,292 ms | 1,05x | **0,04x** |
+| 2 | 0,445 ms | 0,91x | 0,06x |
+| 5 | 1,287 ms | 1,17x | 0,16x |
+| 8 | 1,743 ms | 1,10x | 0,20x |
+
+Porque `vec_dot_q3k_q8k` desempaqueta **dentro de los registros**, fundido con
+el producto, sin materializar nunca los f32. Separarlo cuesta 8 KB de escritura
+y lectura por columna y pierde el AVX2 escrito a mano. Es lo mismo que ya decia
+el punto 11 de este documento, aprendido otra vez.
+
+Los dos kernels se borraron por la regla 3.
+
+**Conclusion que queda:** procesar K posiciones cuesta ~K de verdad, y la causa
+es el trabajo aritmetico de descuantizar, que ningun orden de bucles evita. La
+especulativa no puede ganar aca, y no por el hardware ni por un detalle de
+candle: por lo que cuesta un k-quant.
+
+**Vuelve a tener sentido** con un formato de pesos cuyo desempaquetado sea
+barato o inexistente, o si el modelo pasara a f16 — ahi los pesos se leen una
+vez y el lote si amortiza.
+
+### Una advertencia sobre estas mediciones
+
+Los milisegundos absolutos de esta seccion **no son estables entre corridas
+distintas**. El FFN gate pesa 9,7 MB contra 12 MB de L3, asi que su tiempo
+depende de que mas haya residente: la misma multiplicacion dio 1,10 ms en un
+proceso con 150 MB de tensores cargados y 0,24 ms en uno con un solo tensor.
+Verificado que no eran ni los pesos reales contra sinteticos ni la entrada en
+cero contra datos: los dos pares dan lo mismo.
+
+Lo comparable son **las relaciones dentro de una misma corrida**, no las cifras
+entre secciones.
 
 A eso se suma que el 0,5B coincide con el 3B en el **28-50%** de los tokens.
 
@@ -468,7 +625,9 @@ equivocado, y las cuatro lo hicieron un rato.
 | 6,1 tok/s de generación | ~25 tok/s | se dividían tokens por el tiempo **total**, con respuestas de 1-2 tokens donde el prefill domina |
 | al 30% del techo de memoria | el 3B está al **51%** | el 30% era del 0,5B |
 | el 1,5B es el punto dulce | no lo es | la prueba de 6 preguntas no tenía resolución |
-| la capa de salida explica la especulativa lenta | es el 15% | la causa es que el motor es compute-bound |
+| la capa de salida explica la especulativa lenta | es el 15% | la causa es el coste de descuantizar cada k-quant, que se paga por fila |
+| el motor está limitado por cálculo | **sigue siendo cierto**, y se confirmó midiendo | la "corrección" que lo negaba duró medio día: dos kernels la desmintieron (§10) |
+| el escalado de hilos no tiene explicación | sí la tiene, para el decode | las matrices que no entran en L3 no escalan, y son el 89% de los pesos (§10) |
 | candle comparte los pesos entre instancias | **931 MB cada una** | el parseo de `tasklist` estaba roto y daba 0,0 MB |
 
 ---

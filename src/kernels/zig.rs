@@ -65,6 +65,22 @@ pub fn rmsnorm(salida: &mut [f32], entrada: &[f32], peso: &[f32], eps: f32) {
 }
 
 unsafe extern "C" {
+    fn cosxamix_silu_f32(salida: *mut f32, entrada: *const f32, n: usize);
+}
+
+/// SiLU vectorizada.
+///
+/// Es el unico kernel de la frontera donde Zig aporta algo que no es cobertura
+/// de plataforma: su `@exp` funciona **sobre un vector**, asi que ocho
+/// exponenciales salen de una instruccion. Rust no tiene equivalente —
+/// `f32::exp` es escalar— y vectorizarlo pide escribir a mano una
+/// aproximacion polinomica con su reduccion de rango.
+pub fn silu(salida: &mut [f32], entrada: &[f32]) {
+    debug_assert_eq!(salida.len(), entrada.len());
+    unsafe { cosxamix_silu_f32(salida.as_mut_ptr(), entrada.as_ptr(), entrada.len()) }
+}
+
+unsafe extern "C" {
     fn cosxamix_noop(x: f32) -> f32;
 }
 

@@ -39,7 +39,7 @@ jobs:
         # verdad, 155 crates. Se prueban las dos porque la capa HTTP tiene que
         # seguir compilando sola — es lo que permite tocarla sin pagar el
         # minuto y medio del motor.
-        features: ['', 'candle']
+        features: ['', 'candle', 'training']
     steps:
       - uses: actions/checkout@v4
 

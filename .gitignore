@@ -25,6 +25,11 @@ modelos/
 # Entorno
 .env
 
+# Artefactos de entrenamiento: el corpus lo pone quien entrena y el adaptador
+# sale de entrenar. Ninguno de los dos es contenido del repositorio.
+corpus.txt
+*.safetensors
+
 # Salidas de medicion. Los numeros que valen estan escritos en los .md con su
 # contexto; un archivo suelto de perf no dice de que corrida es.
 *.log
@@ -32,6 +37,11 @@ perf.data
 perf.data.old
 flamegraph.svg
 *.pdb
+
+# Python de los scripts de comprobacion. Son dos archivos sueltos, no un
+# paquete, pero al importarlos para testearlos Python deja su cache al lado.
+__pycache__/
+*.pyc
 
 # Editores y sistema
 .idea/

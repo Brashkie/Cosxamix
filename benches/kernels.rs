@@ -42,6 +42,16 @@ fn dot(c: &mut Criterion) {
             });
         }
 
+        // El mismo bucle escrito a mano en ensamblador. La cola y la
+        // reduccion son codigo compartido con la version de arriba, asi que
+        // lo unico que separa a las dos barras es el bucle caliente.
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            g.bench_with_input(BenchmarkId::new("asm", n), &n, |t, _| {
+                t.iter(|| unsafe { kernels::x86_asm::dot_asm(black_box(&a), black_box(&b)) })
+            });
+        }
+
         #[cfg(feature = "zig")]
         g.bench_with_input(BenchmarkId::new("zig", n), &n, |t, _| {
             t.iter(|| kernels::zig::dot(black_box(&a), black_box(&b)))
@@ -130,5 +140,32 @@ fn ffi(c: &mut Criterion) {
 #[cfg(not(feature = "zig"))]
 fn ffi(_: &mut Criterion) {}
 
-criterion_group!(benches, dot, rmsnorm, ffi);
+/// SiLU: la activacion del MLP, sobre los tamanos reales de `intermedio`.
+///
+/// Solo dos barras y no tres: no hay camino AVX2 porque vectorizar una
+/// exponencial en Rust con intrinsecos pide escribir a mano una aproximacion
+/// polinomica. Lo que se mide aca es cuanto vale el `@exp` vectorial de Zig
+/// contra el `exp` escalar de la referencia.
+fn silu(c: &mut Criterion) {
+    let mut g = c.benchmark_group("silu");
+
+    for n in [4_864usize, 11_008] {
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin() * 4.0).collect();
+        let mut salida = vec![0f32; n];
+        g.throughput(Throughput::Elements(n as u64));
+
+        g.bench_with_input(BenchmarkId::new("escalar", n), &n, |t, _| {
+            t.iter(|| kernels::scalar::silu(black_box(&mut salida), black_box(&x)))
+        });
+
+        #[cfg(feature = "zig")]
+        g.bench_with_input(BenchmarkId::new("zig", n), &n, |t, _| {
+            t.iter(|| kernels::zig::silu(black_box(&mut salida), black_box(&x)))
+        });
+    }
+
+    g.finish();
+}
+
+criterion_group!(benches, dot, rmsnorm, silu, ffi);
 criterion_main!(benches);

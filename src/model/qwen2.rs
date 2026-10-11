@@ -547,6 +547,23 @@ pub struct CacheAtencion {
 }
 
 impl CacheAtencion {
+    /// COSXAMIX: cuántos bytes ocupa este caché.
+    ///
+    /// Hace falta para decidir con datos cuántas sesiones caben y si vale la
+    /// pena persistirlas. La cuenta de servilleta se equivoca facil: depende
+    /// de las capas, de las cabezas KV y de la dimension por cabeza, que
+    /// cambian con el modelo.
+    pub fn bytes(&self) -> usize {
+        self.capas
+            .iter()
+            .flatten()
+            .map(|(k, v)| {
+                k.elem_count() * k.dtype().size_in_bytes()
+                    + v.elem_count() * v.dtype().size_in_bytes()
+            })
+            .sum()
+    }
+
     /// Un caché vacío: el estado de una conversación que todavía no empezó.
     pub fn vacio(capas: usize) -> Self {
         Self {

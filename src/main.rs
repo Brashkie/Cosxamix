@@ -93,7 +93,8 @@ struct PeticionChat {
     temperature: f32,
     #[serde(default = "max_tokens_por_defecto")]
     max_tokens: u32,
-    /// Se acepta y se ignora: todavía no hay streaming. Se declara para que un
+    /// Si es `true`, la respuesta va por SSE en el dialecto de OpenAI. Se
+    /// declara para que un
     /// cliente que lo mande reciba una respuesta válida en vez de un 422 por
     /// un campo que no esperábamos.
     #[serde(default)]
@@ -164,7 +165,7 @@ struct Extra {
 async fn chat(
     State(e): State<Estado>,
     Json(req): Json<PeticionChat>,
-) -> Result<Json<RespuestaChat>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     if req.messages.is_empty() {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -197,6 +198,10 @@ async fn chat(
         sesion: req.sesion.clone(),
     };
 
+    if req.stream {
+        return Ok(transmitir(e.motor.clone(), peticion, modelo));
+    }
+
     // La inferencia satura un hilo haciendo cuentas, no esperando E/S: correrla
     // en el ejecutor de tokio dejaría al servidor sin atender nada mientras
     // genera.
@@ -222,29 +227,100 @@ async fn chat(
         tokens = r.tokens_generados, cacheados = r.tokens_cacheados, "generado"
     );
 
-    Ok(Json(RespuestaChat {
-        id: format!("cosxamix-{}", t0.elapsed().as_nanos()),
-        object: "chat.completion".into(),
-        model: modelo,
-        usage: Uso {
-            prompt_tokens: r.tokens_prompt,
-            completion_tokens: r.tokens_generados,
-            total_tokens: r.tokens_prompt + r.tokens_generados,
-        },
-        choices: vec![Eleccion {
-            index: 0,
-            message: MensajeSalida {
-                role: "assistant".into(),
-                content: r.texto,
+    Ok(axum::response::IntoResponse::into_response(Json(
+        RespuestaChat {
+            id: format!("cosxamix-{}", t0.elapsed().as_nanos()),
+            object: "chat.completion".into(),
+            model: modelo,
+            usage: Uso {
+                prompt_tokens: r.tokens_prompt,
+                completion_tokens: r.tokens_generados,
+                total_tokens: r.tokens_prompt + r.tokens_generados,
             },
-            finish_reason: "stop".into(),
-        }],
-        extra: Extra {
-            ms,
-            estaba_caliente: r.estaba_caliente,
-            tokens_cacheados: r.tokens_cacheados,
+            choices: vec![Eleccion {
+                index: 0,
+                message: MensajeSalida {
+                    role: "assistant".into(),
+                    content: r.texto,
+                },
+                finish_reason: "stop".into(),
+            }],
+            extra: Extra {
+                ms,
+                estaba_caliente: r.estaba_caliente,
+                tokens_cacheados: r.tokens_cacheados,
+            },
         },
-    }))
+    )))
+}
+
+/// La misma generación, pero mandando cada trozo apenas sale.
+///
+/// Con respuestas de varios segundos esto no es un adorno: el primer token
+/// llega en el tiempo del prefill y el resto va apareciendo, en vez de
+/// esperar a que termine todo. Para quien lee, la diferencia entre 5 segundos
+/// de nada y 5 segundos de texto que avanza es casi todo.
+///
+/// El formato es el de OpenAI: un `data:` por trozo con `choices[0].delta`, y
+/// un `data: [DONE]` al final.
+fn transmitir(
+    motor: std::sync::Arc<dyn Motor>,
+    peticion: Peticion,
+    modelo: String,
+) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio_stream::StreamExt;
+
+    // 64 trozos de holgura: si el cliente lee más lento que el modelo genera,
+    // el generador espera en vez de acumular sin límite.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Option<String>>(64);
+    let t0 = Instant::now();
+    let modelo_log = modelo.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let mut emitir = |trozo: &str| -> bool {
+            // `blocking_send` falla cuando el receptor ya no está, que es
+            // exactamente el caso de un cliente que cerró la conexión.
+            // Devolver `false` corta la generación: seguir calculando cinco
+            // segundos para nadie es trabajo tirado y un hilo ocupado.
+            tx.blocking_send(Some(trozo.to_string())).is_ok()
+        };
+        match motor.generar_en_partes(&peticion, &mut emitir) {
+            Ok(r) => tracing::info!(
+                modelo = %modelo_log, ms = t0.elapsed().as_millis(),
+                caliente = r.estaba_caliente, tokens = r.tokens_generados,
+                cacheados = r.tokens_cacheados, "generado (transmitido)"
+            ),
+            Err(err) => tracing::warn!(modelo = %modelo_log, error = %err, "fallo al transmitir"),
+        }
+        // `None` marca el final para que el flujo cierre con `[DONE]`.
+        let _ = tx.blocking_send(None);
+    });
+
+    let flujo = tokio_stream::wrappers::ReceiverStream::new(rx).map(move |trozo| {
+        let cuerpo = match trozo {
+            Some(texto) => serde_json::json!({
+                "object": "chat.completion.chunk",
+                "model": modelo,
+                "choices": [{ "index": 0, "delta": { "content": texto }, "finish_reason": null }],
+            })
+            .to_string(),
+            None => serde_json::json!({
+                "object": "chat.completion.chunk",
+                "model": modelo,
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            })
+            .to_string(),
+        };
+        Ok::<_, std::convert::Infallible>(Event::default().data(cuerpo))
+    });
+
+    // El `[DONE]` del dialecto de OpenAI va después del último trozo. Los
+    // clientes lo usan para saber que terminó sin tener que mirar dentro del
+    // JSON.
+    let flujo = flujo.chain(tokio_stream::iter([Ok(Event::default().data("[DONE]"))]));
+
+    axum::response::IntoResponse::into_response(Sse::new(flujo).keep_alive(KeepAlive::default()))
 }
 
 fn error(c: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -261,7 +337,7 @@ async fn salud() -> impl IntoResponse {
 /// Decide con qué motor arrancar.
 #[cfg(feature = "candle")]
 fn elegir_motor() -> (Arc<dyn Motor>, bool) {
-    use cosxamix::engine_candle::MotorCandle;
+    use cosxamix::engine_manager::{GestorModelos, PRESUPUESTO_MB_POR_DEFECTO};
     use std::path::PathBuf;
 
     let dir = PathBuf::from(env("COSXAMIX_MODELOS", "./modelos"));
@@ -291,24 +367,45 @@ fn elegir_motor() -> (Arc<dyn Motor>, bool) {
     // Los formatos IQ (IQ3_M, IQ2_XXS) habrían sido mejores por bit, pero
     // candle no los soporta: su enumeración llega hasta los k-quants.
     let gguf = env("COSXAMIX_GGUF", "qwen2.5-3b-instruct-q3_k_m.gguf");
-    let tok = env("COSXAMIX_TOKENIZER", "tokenizer-3b.json");
     let nombre = gguf.trim_end_matches(".gguf").to_string();
+    let presupuesto = env("COSXAMIX_RAM_MB", "")
+        .parse::<u64>()
+        .unwrap_or(PRESUPUESTO_MB_POR_DEFECTO);
 
-    match MotorCandle::nuevo(&nombre, &dir.join(&gguf), &dir.join(&tok)) {
-        Ok(m) => {
+    // El gestor registra TODOS los .gguf del directorio, no solo el de
+    // `COSXAMIX_GGUF`: esa variable pasa a decir cuál se precalienta, no cuál
+    // es el único que existe. Pedir otro por `model` ahora lo carga en vez de
+    // devolver `ModeloDesconocido` con el archivo ahí al lado.
+    match GestorModelos::descubrir(&dir, presupuesto) {
+        Ok(g) => {
+            tracing::info!(
+                modelos = g.modelos().len(),
+                presupuesto_mb = presupuesto,
+                "catalogo listo"
+            );
             // Precalentar al arrancar es la razón de ser de Cosxamix: el usuario
             // no debe pagar los ~2 s de carga en su primera pregunta.
             // Medido: frío 3024 ms contra caliente 1088 ms.
-            tracing::info!("cargando {nombre}...");
+            //
+            // Se precalienta uno solo: cargar los cinco del directorio serían
+            // 6,5 GB y varios minutos de arranque, para servir el primero.
+            let elegido = if g.modelos().iter().any(|m| m.nombre == nombre) {
+                nombre
+            } else {
+                let otro = g.por_defecto().unwrap_or_default().to_string();
+                tracing::warn!(pedido = %nombre, uso = %otro, "COSXAMIX_GGUF no está en el catálogo");
+                otro
+            };
+            tracing::info!("cargando {elegido}...");
             let t0 = std::time::Instant::now();
-            match m.precalentar() {
+            match g.precalentar(&elegido) {
                 Ok(()) => tracing::info!(ms = t0.elapsed().as_millis(), "modelo caliente"),
                 Err(e) => tracing::warn!("no pude precalentar: {e}"),
             }
-            (Arc::new(m), false)
+            (Arc::new(g), false)
         }
         Err(e) => {
-            tracing::warn!("sin modelo ({e}) — arranco con el motor de prueba");
+            tracing::warn!("sin modelos ({e}) — arranco con el motor de prueba");
             (Arc::new(MotorDemo::nuevo("cosxamix-demo")), true)
         }
     }

@@ -37,6 +37,14 @@ pub mod scalar;
 #[cfg(target_arch = "x86_64")]
 pub mod x86;
 
+/// El mismo `dot`, con el bucle caliente escrito a mano en ensamblador.
+///
+/// Existe para contestar midiendo una pregunta que el proyecto venia
+/// razonando: si los intrinsecos dejan algo sobre la mesa. No esta enchufado
+/// al despachador hasta que gane, que es lo que pide la regla 3.
+#[cfg(target_arch = "x86_64")]
+pub mod x86_asm;
+
 #[cfg(feature = "zig")]
 pub mod zig;
 
@@ -161,6 +169,34 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// # Pánico
 ///
 /// Si los tres vectores no miden lo mismo.
+/// SiLU: `x * sigmoid(x)`, la activacion del MLP.
+///
+/// **No hay camino AVX2 aca, y es el dato interesante del kernel.** Los otros
+/// dos de la frontera tienen tres implementaciones; este tiene dos, porque
+/// vectorizar una exponencial en Rust con intrinsecos obliga a escribir a mano
+/// una aproximacion polinomica con reduccion de rango, mientras que el `@exp`
+/// de Zig acepta un vector y baja al intrinseco de LLVM.
+///
+/// Asi que en x86-64 esto elige **Zig si esta compilado, y la referencia si
+/// no**, que es al reves de lo que pasa con `dot` y `rmsnorm`. Es la primera
+/// vez que la ventaja de Zig en este proyecto no es "corre en ARM" sino "el
+/// lenguaje trae la herramienta".
+pub fn silu(salida: &mut [f32], entrada: &[f32]) {
+    assert_eq!(
+        salida.len(),
+        entrada.len(),
+        "silu: salida y entrada miden distinto"
+    );
+
+    #[cfg(feature = "zig")]
+    {
+        if elegido() == Backend::Zig {
+            return zig::silu(salida, entrada);
+        }
+    }
+    scalar::silu(salida, entrada)
+}
+
 pub fn rmsnorm(salida: &mut [f32], entrada: &[f32], peso: &[f32], eps: f32) {
     assert_eq!(
         salida.len(),
@@ -190,6 +226,37 @@ pub fn rmsnorm(salida: &mut [f32], entrada: &[f32], peso: &[f32], eps: f32) {
 
 #[cfg(test)]
 mod tests {
+
+    /// La SiLU de Zig contra la referencia.
+    ///
+    /// Con tolerancia y no igualdad exacta, a proposito: `@exp` de Zig baja al
+    /// intrinseco vectorial de LLVM y la referencia usa el `exp` escalar de
+    /// la libreria matematica. No son la misma funcion, son la misma
+    /// operacion por dos caminos, asi que los ultimos bits difieren.
+    ///
+    /// La tolerancia es relativa porque SiLU crece sin limite: un error
+    /// absoluto de 1e-5 no significa lo mismo en x=0,1 que en x=80.
+    #[cfg(feature = "zig")]
+    #[test]
+    fn silu_de_zig_coincide_con_la_referencia() {
+        for n in [0usize, 1, 7, 8, 31, 1024, 4097] {
+            // Rango ancho a proposito: la exponencial se desborda rapido y es
+            // donde una aproximacion mala se delata.
+            let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin() * 40.0).collect();
+            let mut esperado = vec![0f32; n];
+            let mut obtenido = vec![0f32; n];
+            scalar::silu(&mut esperado, &x);
+            zig::silu(&mut obtenido, &x);
+            for (k, (e, o)) in esperado.iter().zip(&obtenido).enumerate() {
+                let tol = 1e-5 * e.abs().max(1.0);
+                assert!(
+                    (e - o).abs() <= tol,
+                    "n={n} i={k} x={}: referencia {e} contra zig {o}",
+                    x[k]
+                );
+            }
+        }
+    }
     use super::*;
 
     /// Datos con decimales y signos mezclados: con enteros chicos, una suma mal

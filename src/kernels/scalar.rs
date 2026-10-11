@@ -53,6 +53,19 @@ pub fn rmsnorm(salida: &mut [f32], entrada: &[f32], peso: &[f32], eps: f32) {
     }
 }
 
+/// SiLU de referencia: `x * sigmoid(x)`, o sea `x / (1 + exp(-x))`.
+///
+/// Es la activacion del MLP de Qwen2, y corre sobre `intermedio` elementos
+/// —11008 en el 3B— por capa y por token.
+///
+/// Sin trucos a proposito: esta implementacion define que resultado es el
+/// correcto, y para eso vale mas ser evidente que ser rapida.
+pub fn silu(salida: &mut [f32], entrada: &[f32]) {
+    for (s, &x) in salida.iter_mut().zip(entrada) {
+        *s = x / (1.0 + (-x).exp());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

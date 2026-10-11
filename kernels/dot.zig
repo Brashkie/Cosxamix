@@ -132,3 +132,42 @@ export fn cosxamix_rmsnorm_f32(
 export fn cosxamix_noop(x: f32) f32 {
     return x;
 }
+
+/// SiLU (o Swish): `x * sigmoid(x)`, que es `x / (1 + exp(-x))`.
+///
+/// Es la activacion del MLP de Qwen2, y el MLP es el 79% de los pesos del
+/// modelo, asi que esto corre sobre 11008 elementos por capa y por token.
+///
+/// ## Por que este kernel esta en Zig y no en Rust con intrinsecos
+///
+/// Aca Zig aporta algo que no es cobertura de plataforma: **`@exp` funciona
+/// sobre un vector**. `@exp(@Vector(8, f32))` baja al intrinseco vectorial de
+/// LLVM y se vectoriza solo.
+///
+/// Rust no tiene eso. `f32::exp` es escalar y no hay forma de aplicarlo a un
+/// `__m256` sin escribir a mano una aproximacion polinomica con su reduccion
+/// de rango — unas cuarenta lineas delicadas donde un coeficiente mal puesto
+/// no rompe nada, solo da respuestas un poco peores.
+///
+/// O sea que para esta operacion Zig da gratis lo que en Rust hay que ganarse.
+/// Es la primera vez en este proyecto que la ventaja de Zig no es "corre en
+/// ARM" sino "el lenguaje trae la herramienta".
+export fn cosxamix_silu_f32(salida: [*]f32, entrada: [*]const f32, n: usize) void {
+    const uno: V = @splat(1.0);
+    var i: usize = 0;
+
+    while (i + ANCHO <= n) : (i += ANCHO) {
+        const x = cargar(entrada, i);
+        // `@exp` sobre el vector entero: ocho exponenciales de una vez.
+        const y = x / (uno + @exp(-x));
+        const p: *align(@alignOf(f32)) V = @ptrCast(salida + i);
+        p.* = y;
+    }
+
+    // La cola, de a uno. Olvidarse de esto es el error clasico de un kernel
+    // vectorizado: con n multiplo de 8 todos los tests pasan.
+    while (i < n) : (i += 1) {
+        const x = entrada[i];
+        salida[i] = x / (1.0 + @exp(-x));
+    }
+}

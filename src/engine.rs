@@ -106,6 +106,26 @@ pub trait Motor: Send + Sync {
     /// serviría para bloquear el ejecutor de tokio. Quien llame lo mete en un
     /// `spawn_blocking`.
     fn generar(&self, p: &Peticion) -> Result<Respuesta, ErrorMotor>;
+
+    /// Genera emitiendo cada trozo de texto a medida que sale.
+    ///
+    /// `emitir` recibe el texto **nuevo** desde la llamada anterior, no el
+    /// acumulado, y devuelve si hay que seguir. Devolver `false` corta la
+    /// generación: con respuestas de varios segundos, que un cliente se
+    /// desconecte y el servidor siga calculando para nadie no es un detalle.
+    ///
+    /// La implementación por defecto genera todo y emite una sola vez, para
+    /// que un motor que no sepa transmitir siga cumpliendo el contrato. No
+    /// transmite de verdad, pero responde.
+    fn generar_en_partes(
+        &self,
+        p: &Peticion,
+        emitir: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<Respuesta, ErrorMotor> {
+        let r = self.generar(p)?;
+        emitir(&r.texto);
+        Ok(r)
+    }
 }
 
 // ─── Motor de prueba ─────────────────────────────────────────────────────────

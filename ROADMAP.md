@@ -33,27 +33,35 @@ de cómputo para cobrarlo.
 
 ## Corto plazo
 
-### 1. Explicar el escalado de hilos
+### 1. El escalado de hilos: cerrado, y sin nada que hacer
 
-El bloqueante real. De 1 a 6 núcleos se obtienen **2,6x**, no 6x:
+Era el bloqueante declarado. Ya está explicado, y la respuesta es que **no se
+arregla con código**.
 
-| hilos | decode | núcleos efectivos | CPU consumida |
-|---:|---:|---:|---:|
-| 1 | 9,86 tok/s | 0,98 | 32,9 s |
-| 6 | 25,58 | 4,06 | 53,2 s |
-| 12 | 26,08 | 6,23 | 81,8 s |
+Medido matriz por matriz a 6 hilos, lo que entra en los 12 MB de L3 escala
+**7,03x** —superlineal— y lo que no entra se queda entre 1,76x y 2,82x. El FFN
+y la capa de salida son el **89% de los pesos**, así que el forward hereda su
+techo: ponderando por participación da **2,47x** contra los **2,60x** medidos.
 
-Se encontró un factor y **no alcanza**: el `with_min_len(128)` del reparto de
-candle impide partir las proyecciones K y V, de 256 columnas, en más de 2 trozos
-— pero K+V son ~1,4% de los parámetros, o sea ~3% del tiempo.
+Es el muro de memoria, no sincronización. Más hilos no lo mueven; lo único que
+lo mueve es **leer menos bytes**, y eso es el punto 2.
 
-Lo que falta es un perfilador de verdad (`perf`, VTune o `cargo flamegraph`) para
-saber si la pérdida está en sincronización por capa, en fallos de caché L2/L3, o
-en que las barreras de rayon se pagan 36 veces por token. **No tengo la
-explicación todavía**, y adivinar acá sale caro.
+**Lo que se probó y se borró por la regla 3**, para que no se reintente:
 
-Es lo primero porque si la brecha se cierra, el motor pasa a estar limitado por
-memoria — y eso reabre de golpe los puntos 4 y 5.
+| intento | resultado |
+|---|---|
+| bucles de la multiplicación al revés, reusando la columna de pesos | 0,91x–1,17x — dentro del ruido |
+| descuantizar cada columna una vez y hacer `m` productos en f32 | **0,04x–0,20x**, de 5 a 25 veces peor |
+
+El segundo explica al primero: `vec_dot_q3k_q8k` desempaqueta el k-quant dentro
+de los registros, fundido con el producto, sin materializar nunca los f32.
+Ningún orden de bucles evita ese trabajo, y separarlo es mucho peor. El detalle
+está en [DECISIONES](DECISIONES.md) §10.
+
+De paso quedó una advertencia de método: los milisegundos absolutos de estas
+mediciones **no son estables entre corridas**, porque el FFN gate pesa 9,7 MB
+contra 12 MB de L3 y su tiempo depende de qué más haya residente. Solo son
+comparables las relaciones dentro de una misma corrida.
 
 ### 2. Comprimir la matriz de salida
 
@@ -96,12 +104,26 @@ una expectativa, no un dato, y este proyecto no acepta expectativas:
 
 Trabajo sin misterio, pendiente:
 
-- Carga de más de un modelo a la vez, con expulsión por LRU igual que las
-  sesiones. Hoy es uno.
-- Respuestas en *streaming* (`stream: true`), que el dialecto de Ollama define y
-  Cosxamix todavía no implementa.
-- Persistir el caché de sesión en disco, para que reiniciar no obligue a
-  reprocesar el *system prompt* de cada conversación.
+- ~~Respuestas en *streaming*~~ **hecho en la 0.2.0**: SSE en el dialecto de
+  OpenAI, primer trozo a los 2,14 s contra 5,82 de la respuesta completa, y la
+  generación se corta si el cliente cierra.
+- ~~Carga de más de un modelo a la vez~~ **hecho en la 0.2.0**: registra todos
+  los `.gguf` del directorio, carga bajo demanda y desaloja el menos usado
+  cuando no entra en `COSXAMIX_RAM_MB`.
+- ~~Persistir el caché de sesión en disco~~ **medido y descartado**. Lo que
+  ahorra es el prefill del *system prompt* en el primer mensaje de cada
+  conversación tras reiniciar: medido contra WinsiBot, **~1 s** (4905 ms a
+  3891 ms). Lo que cuesta un reinicio es **cargar el modelo: 45-48 s**. Es
+  optimizar un segundo de cada cincuenta.
+
+  Y el precio no es cero: 16 sesiones de 1000 tokens del 3B son **1,1 GB** que
+  escribir al apagar, más un formato en disco que mantener y un riesgo que no
+  avisa — restaurar un caché contra otros pesos no da error, da basura, así que
+  haría falta una huella del modelo y la disciplina de comprobarla.
+
+  **Vuelve a tener sentido** si alguna vez reiniciar deja de costar 45 s —por
+  ejemplo con carga por `mmap`—, porque ahí el segundo del prefill pasaría a
+  ser una parte grande del total. Antes, no.
 
 ---
 
@@ -131,16 +153,92 @@ también recorta aritmética.
 
 ### 7. Entrenamiento y ajuste fino en hardware débil
 
-Es la mitad del objetivo del proyecto y hoy **no hay nada**: Cosxamix solo infiere.
-El orden razonable es LoRA / QLoRA sobre el modelo cuantizado antes que
-cualquier entrenamiento desde cero, y candle tiene autograd, así que la pieza
-base existe.
+Es la mitad del objetivo del proyecto y hoy no existe nada: Cosxamix solo
+infiere. Ya está medido que **es viable**, y con qué límites.
 
-No se empieza antes que el punto 1 porque entrenar con el reparto entre hilos
-rindiendo al 43% sería arrastrar el mismo problema a un trabajo diez veces más
-caro.
+| | |
+|---|---:|
+| paso de LoRA r=8, 0,5B, 256 tokens | ~3,3 s |
+| 1000 pasos | ~55 min |
+| parámetros entrenables | 540.672, el 0,1% del modelo |
 
----
+El límite es la memoria, y define el alcance: la base hay que tenerla en f32
+porque **`QMatMul` no implementa `bwd`** y el gradiente no atraviesa una
+multiplicación cuantizada. El 0,5B en f32 son ~2 GB y entra; el 3B serían
+~12 GB y no.
+
+~~1. **El entrenador**~~ y ~~2. **Guardar y cargar adaptadores**~~ están
+hechos en la 0.2.0: `src/training/`, feature `training`. Entrena de verdad —la
+pérdida baja— y el adaptador sale de 2,1 MB. El paso real son **~5,2 s**, no
+los 3,3 s proyectados: aquella cifra era un piso declarado y se quedó en el
+63% de la realidad, porque dejaba fuera la atención, RoPE, las normalizaciones
+y la capa de salida sobre 151.936 palabras.
+
+Lo que falta:
+
+3. **Quitar el gradiente que sobra.** `backprop.rs` calcula `dL/dW` de las
+   capas congeladas aunque nadie lo use: 23,1 ms de los 135 por capa, un
+   **17%** del paso. Se arregla con un `CustomOp1` que guarde la matriz dentro
+   de la operación en vez de como nodo del grafo, de modo que su `bwd` solo
+   devuelva `dL/dx`.
+4. **El backward cuantizado**, que es lo que haría entrenable el 3B sin pagar
+   los 12 GB. Es el kernel que hoy no existe: `dL/dy · W` sobre una matriz
+   guardada como `(n, k)` cuantizada. Va último porque es lo más caro y porque
+   los puntos 1 a 3 sirven igual sin él.
+
+### 8. Crear modelos, no solo servirlos
+
+Hoy Cosxamix sirve modelos ajenos y ajusta uno con LoRA. Crear modelos propios
+es un objetivo declarado, **chicos y grandes**.
+
+Lo que no sale de una máquina sin GPU es **preentrenar** uno grande desde cero:
+son miles de horas de GPU y cientos de GB de texto, y eso es aritmética, no
+pesimismo. Pero preentrenar desde cero no es la única forma de crear un modelo
+grande, ni la más usada:
+
+| camino | qué cuesta | ¿acá? |
+|---|---|---|
+| **Fusionar** dos o más modelos (SLERP, TIES, DARE) | cero entrenamiento: leer, combinar pesos, escribir | **sí, hoy** |
+| **Crecer en profundidad**: apilar capas de uno existente y seguir entrenando | entrenamiento, pero partiendo de pesos que ya saben | sí para el 0,5B |
+| **Convertirlo en MoE**: clonar los FFN y entrenar el enrutador | cirugía más entrenamiento del enrutador | probablemente |
+| **Preentrenamiento continuado** sobre un corpus propio | entrenamiento completo sobre un modelo grande | no para el 3B en f32 |
+| **Destilar** de un modelo grande a uno chico | hace falta correr el grande muchas veces | lento, pero posible |
+| **Preentrenar desde cero** un modelo grande | miles de horas de GPU | no |
+
+Fusionar es el que se puede hacer **ya**: no necesita gradientes, solo leer
+GGUF, combinar y escribir. Y produce un modelo que no existía.
+
+Para los que sí entrenan, el límite medido es la memoria: la base tiene que
+estar en f32 porque `QMatMul` no implementa `bwd`, y el 3B en f32 son ~12 GB
+contra 7,3 libres. Eso lo levanta el backward cuantizado del §7, no más RAM.
+
+Lo que decide el orden del trabajo es esta cuenta, que es aritmética y no
+opinión. Parámetros de un modelo según su vocabulario:
+
+| forma | vocab 151.936 | vocab propio 8.192 |
+|---|---:|---:|
+| h=256, 6 capas | 44,6 M — **87% embedding** | 7,8 M — 27% embedding |
+| h=512, 8 capas | 108,2 M — 72% embedding | 34,6 M — 12% embedding |
+| h=768, 12 capas | — | 108,9 M — 6% embedding |
+
+Con el vocabulario de Qwen, un modelo chico es **casi todo tabla de
+búsqueda**: el transformer sería el 13% de los parámetros. Así que el orden es:
+
+1. **Un tokenizador propio.** Es lo primero, no un accesorio: sin él no hay
+   modelo chico que valga la pena. El crate `tokenizers` ya está en el árbol y
+   sabe entrenar un BPE.
+2. **Inicialización aleatoria** en vez de cargar pesos. Es un delta pequeño
+   sobre `src/training/model.rs`, que hoy construye la misma estructura leyendo
+   un GGUF — hay que hacer `Var` todos los parámetros en vez de solo los
+   adaptadores.
+3. **Medir un paso** con todos los parámetros entrenables, que es otro régimen:
+   el LoRA entrena el 0,1% y acá se entrena el 100%, así que el optimizador
+   deja de ser gratis y la memoria del backward crece mucho.
+4. **Exportar a GGUF**, para que lo creado lo pueda servir el mismo motor y
+   correr en un teléfono. Sin esto el modelo entrenado no sale del entrenador.
+
+Va después del punto 7 porque reusa todo lo de ahí, y lo que falta medir —el
+punto 3— no se puede estimar desde el LoRA.
 
 ## Decidido y cerrado
 
