@@ -125,11 +125,28 @@ candle. Razonar no es medir. Así que se escribió.
 
 El kernel vive en **dos archivos de ensamblador sueltos**,
 `kernels/dot_avx2_win64.s` y `kernels/dot_avx2_sysv.s`, no en `asm!` metido
-entre Rust. Son dos y no uno porque el ensamblador es **el único lenguaje de
-esta frontera que tiene que saber la convención de llamada**: Rust, Zig y
-Fortran reciben sus argumentos donde el compilador decida, acá hay que escribir
-en qué registro llega cada uno, y Windows usa `rcx rdx r8 r9` donde System V
-usa `rdi rsi rdx rcx`.
+entre Rust.
+
+**El ensamblador es el único lenguaje de esta frontera que tiene que saber de
+la plataforma, y resultó depender de tres cosas y no de una.** Rust, Zig y
+Fortran no se enteran de ninguna:
+
+| | |
+|---|---|
+| **convención de llamada** | Windows pasa en `rcx rdx r8 r9`, System V en `rdi rsi rdx rcx` |
+| **formato de objeto** | `.type sym, @function` es de ELF; el de Mach-O lo rechaza con *unknown directive* |
+| **decoración de símbolos** | en Mach-O una función de C se llama `_foo` para el enlazador, en ELF `foo` |
+
+Las dos últimas se aprendieron rompiendo el build de macOS en CI, después de
+compilar 155 crates. El archivo de System V sirve ahora para Linux y macOS
+porque no lleva la directiva de ELF y define el símbolo con y sin guion bajo.
+
+Y una trampa de método que costó una afirmación falsa: **`cargo check` no
+sirve para comprobar esto**. No genera código, así que nunca ensambla el
+`global_asm!` y pasa aunque el archivo esté roto. Hace falta
+`cargo build --lib`, que sí compila y no necesita SDK porque no enlaza.
+Comprobado reintroduciendo el bug a propósito: con `check` pasa, con
+`build --lib` da el mismo *unknown directive* que CI.
 
 Se ensamblan con LLVM por `global_asm!`, así que no hace falta ningún
 ensamblador externo. Cuatro acumuladores, `vfmadd231ps` con el segundo operando

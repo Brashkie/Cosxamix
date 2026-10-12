@@ -185,6 +185,32 @@ jobs:
           file target/aarch64-unknown-linux-gnu/release/cosxamix
           file target/aarch64-unknown-linux-gnu/release/cosxamix | grep -q 'ARM aarch64'
 
+  # -- Que el ensamblador ensamble en los tres formatos de objeto ----------
+  #
+  # El kernel de `kernels/*.s` depende de TRES cosas de la plataforma, no de
+  # una: la convencion de llamada, el formato de objeto y como se decoran los
+  # simbolos. Un `.type sym, @function` es valido en ELF y el ensamblador de
+  # Mach-O lo rechaza con "unknown directive" -- y eso tiro un release despues
+  # de compilar 155 crates.
+  #
+  # Este job lo caza en segundos. Es `cargo build --lib` y NO `cargo check`:
+  # `check` no genera codigo, asi que nunca ensambla el `global_asm!` y pasa
+  # aunque el archivo este roto. Comprobado reintroduciendo el bug a proposito.
+  #
+  # Y es `--lib` para que no haga falta ningun SDK: compilar a rlib no enlaza.
+  ensamblador:
+    name: ensamblador en los tres formatos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-unknown-linux-gnu x86_64-apple-darwin
+      - name: ELF
+        run: cargo build --lib --target x86_64-unknown-linux-gnu
+      - name: Mach-O
+        run: cargo build --lib --target x86_64-apple-darwin
+      # COFF lo cubre la matriz de Windows, que compila el binario entero.
+
+
   # ── Documentacion ────────────────────────────────────────────────────────
   #
   # Los tres fallos que aparecieron de verdad —tabla con una fila de distinto

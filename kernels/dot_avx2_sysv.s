@@ -26,11 +26,25 @@
 // archivo con GNU `as` por fuera de cargo hacen falta `-msyntax=intel` y
 // `-mnaked-reg`, porque el suyo por defecto es AT&T.
 
+// Un solo archivo para Linux y macOS, que comparten la convencion de llamada
+// pero NO el formato de objeto. De ahi las dos rarezas de aca abajo, las dos
+// aprendidas rompiendo el build de macOS en CI:
+//
+//   1. No lleva `.type sym, @function`. Esa directiva es de ELF y el
+//      ensamblador de Mach-O la rechaza con "unknown directive". No hace
+//      falta para enlazar, solo marca el simbolo como funcion.
+//
+//   2. El simbolo se define DOS veces, con y sin guion bajo. En Mach-O una
+//      funcion de C se llama `_foo` a nivel de enlazador y en ELF `foo`, asi
+//      que definir los dos nombres evita partir el archivo en dos por una
+//      letra. El que sobra es una entrada mas en la tabla de simbolos.
+
     .text
     .globl cosxamix_dot_bloques
-    .type  cosxamix_dot_bloques, @function
+    .globl _cosxamix_dot_bloques
 
 cosxamix_dot_bloques:
+_cosxamix_dot_bloques:
     // Cuatro cadenas independientes: un FMA tarda varios ciclos y con un
     // solo acumulador cada vuelta espera a la anterior.
     vxorps  ymm0, ymm0, ymm0

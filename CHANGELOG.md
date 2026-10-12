@@ -157,10 +157,24 @@ entrenable, y que el viaje al disco y de vuelta conserve la salida exacta.
 **Ensamblador en archivos propios**: `kernels/dot_avx2_win64.s` y
 `kernels/dot_avx2_sysv.s`, incluidos con `global_asm!`. Son **dos** porque el
 ensamblador es el único lenguaje de la frontera que tiene que saber la
-convención de llamada — Windows pasa en `rcx rdx r8 r9` y System V en
-`rdi rsi rdx rcx`. Usan solo registros volátiles, así que no necesitan prólogo
-ni epílogo. Los dos se comprueban: el de Windows con los tests, el de System V
-con `cargo check --target x86_64-unknown-linux-gnu`.
+convención de llamada. Usan solo registros volátiles, así que no necesitan
+prólogo ni epílogo.
+
+Resultó depender de **tres** cosas de la plataforma y no de una, y las dos
+últimas se aprendieron rompiendo el build de macOS en CI:
+
+| | |
+|---|---|
+| convención de llamada | Windows `rcx rdx r8 r9`, System V `rdi rsi rdx rcx` |
+| formato de objeto | `.type sym, @function` es de ELF y Mach-O lo rechaza |
+| decoración de símbolos | Mach-O llama `_foo` a lo que ELF llama `foo` |
+
+Nuevo job de CI que ensambla para ELF y Mach-O en segundos, en vez de
+descubrirlo tras compilar 155 crates. Es `cargo build --lib` y **no**
+`cargo check`: `check` no genera código, así que nunca ensambla el
+`global_asm!` y pasa aunque el archivo esté roto — comprobado reintroduciendo
+el bug a propósito. `--lib` evita necesitar un SDK, porque compilar a rlib no
+enlaza.
 
 **Tercer kernel en la frontera: `silu`**, la activación del MLP, que corre
 sobre 11008 elementos por capa y por token.
