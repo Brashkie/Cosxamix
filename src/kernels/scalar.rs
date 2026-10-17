@@ -66,6 +66,48 @@ pub fn silu(salida: &mut [f32], entrada: &[f32]) {
     }
 }
 
+/// Producto punto de dos vectores de `i8`, acumulando en `i32`.
+///
+/// Es la operacion que de verdad hace una multiplicacion cuantizada: los pesos
+/// y la activacion se guardan como enteros chicos y una escala aparte, y el
+/// producto se hace en enteros. Un `i32` no desborda ni cerca -- el peor caso
+/// con 2048 elementos de 127 es 33 millones contra los 2147 millones que
+/// aguanta.
+///
+/// Define que resultado es el correcto. Al ser enteros, "correcto" aca es
+/// exacto: las otras implementaciones tienen que dar el MISMO numero, no uno
+/// parecido.
+pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| *x as i32 * *y as i32).sum()
+}
+
+/// Producto punto de dos vectores cuantizados por bloques.
+///
+/// Cada bloque de 32 trae su propia escala en los dos lados, asi que el
+/// resultado es `suma_b escala_a[b] * escala_b[b] * dot_i8(bloque_b)`.
+///
+/// Existe como una sola operacion y no como `dot_i8` llamado en un bucle por
+/// una razon medida: `dot_i8` termina con una suma horizontal, que es barata
+/// sobre un vector largo y carisima repetida una vez por bloque. Componer el
+/// kernel equivocado costo que la version en enteros saliera **2x mas lenta**
+/// que la de f32, pese a que el kernel entero es 4x mas rapido.
+pub fn dot_i8_escalado(a: &[i8], b: &[i8], esc_a: &[f32], esc_b: &[f32], bloque: usize) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut total = 0f32;
+    for (i, (ea, eb)) in esc_a.iter().zip(esc_b).enumerate() {
+        let r = i * bloque;
+        let hasta = (r + bloque).min(a.len());
+        let parcial: i32 = a[r..hasta]
+            .iter()
+            .zip(&b[r..hasta])
+            .map(|(x, y)| *x as i32 * *y as i32)
+            .sum();
+        total += ea * eb * parcial as f32;
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

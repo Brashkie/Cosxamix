@@ -119,7 +119,7 @@ escrito para que la pregunta no haya que rehacerla.
 
 ### Ensamblador: escrito y medido
 
-Hasta la 0.2.0 este punto decía "el método es bueno, el momento no" y se
+Hasta la 0.3.0 este punto decía "el método es bueno, el momento no" y se
 apoyaba en un razonamiento: que el bucle que importa ya está escrito a mano en
 candle. Razonar no es medir. Así que se escribió.
 
@@ -181,6 +181,59 @@ va a hacer solo mientras candle no se lo pida.
 Lo que quedó claro, y vale más que el kernel: **contra un bucle que LLVM ya
 vectoriza bien, escribirlo a mano no compra nada.** El sitio del ensamblador
 es donde el compilador no tiene permiso para ir, no donde ya está.
+
+### Cuándo entra el ensamblador, con un criterio comprobable
+
+La pregunta vuelve, así que acá queda contestada con una medición y no con
+"cuando el perfilado lo diga".
+
+**El ensamblador gana donde el compilador se queda sin registros.** Es el
+motivo por el que los microkernels de BLIS y OpenBLAS son ensamblador: cuando
+hay que mantener doce o dieciséis acumuladores vivos a la vez, el asignador de
+registros empieza a volcar a memoria, y volcar dentro del bucle caliente cuesta
+más que cualquier cosa que el compilador gane reordenando.
+
+Así que el criterio es inspeccionable, no opinable: **mirar el ensamblador
+generado y contar volcados dentro del bucle**. Medido hoy sobre nuestros
+kernels:
+
+| kernel | líneas | registros `ymm` usados | volcados en el bucle |
+|---|---:|---:|---:|
+| `dot_i8_escalado_avx2` | 63 | 6 de 16 | **0** |
+| `dot_i8_avx2` | 224 | 6 de 16 | **0** |
+| `dot_avx2` | 84 | 8 de 16 | **0** |
+
+Los cuatro `vmovaps [rsp...]` que aparecen en `dot_avx2` son el prólogo
+guardando `xmm6` y `xmm7`, que en Windows x64 son no volátiles. No son
+volcados de presión.
+
+**Con 6 registros de 16 ocupados no hay nada que un humano pueda recuperar**, y
+eso explica sin misterio por qué el `dot` en ensamblador salió bit a bit
+idéntico y perdió un 25% en el tamaño grande.
+
+#### Lo que sí abriría la puerta
+
+Un **microkernel con bloqueo de registros**: calcular un bloque de salidas de
+una vez —por ejemplo 4 columnas por 2 filas— manteniendo ocho acumuladores
+vivos más los operandos. Eso sube la presión a propósito, y es además la
+optimización que hace falta, porque reutiliza cada vector de pesos cargado para
+varias filas en vez de releerlo.
+
+El criterio queda así, y es falsable:
+
+1. escribir el microkernel bloqueado con intrínsecos;
+2. medirlo y **mirar si LLVM vuelca dentro del bucle**;
+3. si vuelca, ahí va el ensamblador, y se compara contra la versión con
+   intrínsecos — no contra código genérico.
+
+Si no vuelca, no entra. Como hasta ahora.
+
+#### Un detalle chico a favor del escrito a mano
+
+LLVM usó `ymm6` y `ymm7` en `dot_avx2` y pagó por eso un prólogo y un epílogo
+en Windows. El `.s` escrito a mano se limita a `ymm0`-`ymm5`, que son volátiles,
+y no necesita ninguno de los dos. Es poco, pero es una decisión que el
+compilador no tomó y un humano sí.
 
 ### Fortran
 
@@ -396,7 +449,7 @@ Medido sobre el 3B:
 tokens de vocabulario— pero resultó ser el **15%** del modelo, y el 15% no
 explica 3,74x.
 
-> **Revisado dos veces en la 0.2.0.** La primera revision concluyo que el motor
+> **Revisado dos veces en la 0.3.0.** La primera revision concluyo que el motor
 > esta limitado por memoria y que la culpa era del orden de los bucles de
 > candle. El experimento la desmintio. Queda lo que la evidencia sostiene, y
 > queda escrito el error porque costo medio dia.
@@ -432,22 +485,39 @@ corrida, dentro del ruido.
 
 El motivo es que intercambiar los bucles ahorra releer **bytes**, pero
 `vec_dot` rehace el desempaquetado del k-quant por cada par (fila, columna) de
-todas formas. Para comprobarlo se escribio una segunda variante que descuantiza
-cada columna una sola vez y despues hace `m` productos punto en f32 — o sea que
-elimina ese trabajo repetido por completo. Salio **entre 5 y 25 veces mas
-lenta**:
+todas formas. Para comprobarlo se escribió una segunda variante que descuantiza
+cada columna una sola vez y después hace `m` productos punto en f32 — o sea que
+elimina ese trabajo repetido por completo. Salió entre 5 y 25 veces más lenta:
 
-| filas | candle | bucles al reves | descuantizar una vez |
+| filas | candle | bucles al revés | descuantizar una vez |
 |---:|---:|---:|---:|
 | 1 | 0,292 ms | 1,05x | **0,04x** |
-| 2 | 0,445 ms | 0,91x | 0,06x |
-| 5 | 1,287 ms | 1,17x | 0,16x |
 | 8 | 1,743 ms | 1,10x | 0,20x |
 
-Porque `vec_dot_q3k_q8k` desempaqueta **dentro de los registros**, fundido con
-el producto, sin materializar nunca los f32. Separarlo cuesta 8 KB de escritura
-y lectura por columna y pierde el AVX2 escrito a mano. Es lo mismo que ya decia
-el punto 11 de este documento, aprendido otra vez.
+> **Corregido en la 0.3.0, y el error era mío.** Esa segunda variante reservaba
+> el buffer de la columna **dentro** del bucle de columnas: once mil
+> asignaciones por multiplicación. No medía el coste de descuantizar, medía el
+> del asignador.
+>
+> Rehecha con un buffer por tramo, sobre los pesos reales del `ffn_gate` del
+> 3B, **sí amortiza**:
+>
+> | filas | candle por fila | nuestra por fila |
+> |---:|---:|---:|
+> | 1 | 0,637 ms | 6,728 ms |
+> | 2 | 0,636 | 3,010 |
+> | 5 | 0,762 | 1,319 |
+> | 8 | 0,773 | **1,072** |
+>
+> El coste por fila cae **6,3 veces** mientras el de candle se queda plano. La
+> conclusión que se sostiene no es "separar el desempaquetado es inviable",
+> sino otra: **separarlo amortiza, y lo que queda caro es el producto en f32**.
+> A ocho filas la nuestra ya está cerca del techo aritmético de f32 en esta
+> máquina, mientras candle multiplica en enteros sobre pesos de 3 bits.
+>
+> O sea que el camino no es volver a `vec_dot` por par, ni materializar f32:
+> es **desempaquetar a registros una vez y hacer los `m` productos en enteros
+> mientras el bloque sigue ahí**. Está en el [ROADMAP](ROADMAP.md) §9.
 
 Los dos kernels se borraron por la regla 3.
 
@@ -632,10 +702,143 @@ Chevron), **Axiora** (≈ Axora), **Numetra** (≈ Numetric) y **Nuvrex**
 
 ---
 
+## 15. La comprobación de límites costaba más que todos los kernels juntos
+
+Es la medición más incómoda del proyecto, porque dice que semanas de trabajo
+sobre kernels vectoriales y ensamblador a mano estaban buscando donde no había
+nada, mientras un factor de entre 4 y 12 esperaba en una línea de Rust
+ordinario.
+
+### Cómo apareció
+
+La matmul propia le ganaba a candle en lote **sobre Q4_K**. Al probar el mismo
+código sobre **Q3_K**, que es el formato dominante del 3B que el bot usa por
+defecto, perdía en las cuatro filas medidas — y perdía sobre una matriz **más
+chica**, 9,2 MB contra 12,1. Un código que va más lento sobre menos datos no
+tiene un problema de ancho de banda.
+
+Había dos sospechosos y adivinar cuál habría sido el error de siempre, así que
+se escribió `examples/profile_i8.rs`, que mide el desempaquetado y el kernel
+por separado sobre los dos formatos con el mismo número de valores:
+
+| formato | sub-bloque | MB | desempaquetado | kernel |
+|---|---:|---:|---:|---:|
+| Q4_K | 32 | 12,1 | 10,733 ms | 1,517 ms |
+| Q3_K | 16 | 9,2 | **31,616 ms** | 1,068 ms |
+
+Las dos hipótesis eran que Q3_K desempaqueta bits más retorcidos, o que el
+camino de sub-bloque 16 del kernel es más caro porque arma su vector de escalas
+con un `setr_ps` de valores sueltos.
+
+**La segunda era falsa, y por el lado contrario:** el kernel con sub-bloques de
+16 resultó *más rápido* que con 32, 1,07 contra 1,52 ms. Queda anotado como
+conjetura desmentida.
+
+El desempaquetado era el **94% del trabajo de un hilo** — 31,6 ms contra 1,1.
+
+### Lo que estaba pasando
+
+Los bucles escribían por índice calculado:
+
+```rust
+for j in 0..32 {
+    let b = qs[base + j];
+    q[i * 256 + par * 64 + j] = (b & 0xF) as i8;
+    q[i * 256 + par * 64 + 32 + j] = (b >> 4) as i8;
+}
+```
+
+`q` es un `&mut [i8]` y el índice se calcula en tiempo de ejecución, así que
+cada escritura lleva su comprobación de límites. Y una comprobación de límites
+dentro del bucle **le prohíbe vectorizar**: LLVM no puede reordenar escrituras
+que pueden entrar en pánico a mitad de camino.
+
+Costaba 0,43 ns por valor en Q4_K, unos 1,3 ciclos a 3 GHz. Eso es un bucle
+escalar, byte a byte, en el camino más caliente del motor.
+
+El arreglo es pedir la ventana **una vez**, con su longitud fija, y recorrerla:
+
+```rust
+let desde = i * 256 + par * 64;
+let (bajos, altos) = q[desde..desde + 64].split_at_mut(32);
+for ((b, lo), hi) in qs[base..base + 32].iter().zip(bajos).zip(altos) {
+    *lo = (b & 0xF) as i8;
+    *hi = (b >> 4) as i8;
+}
+```
+
+Un solo chequeo al cortar la ventana, y adentro un par de iteradores de
+longitud conocida: nada que comprobar y nada que impida vectorizar.
+
+Antes de eso hubo un segundo arreglo, más chico y del mismo tipo: en Q2_K y
+Q3_K el bucle interno iba de 16 en 16 porque el formato tiene sub-bloques de
+16, pero los dos sub-bloques seguidos comparten corrimiento y máscara y son
+contiguos en el origen y en el destino. Partirlos dejaba el bucle a **medio
+registro** de AVX2 sin ningún motivo. Fusionarlos a 32 dio la primera mejora.
+
+### Lo medido
+
+Desempaquetado a `i8`, un hilo, los 11008×2048 valores del `ffn_gate`:
+
+| formato | antes | fusionando a 32 | sin comprobación de límites | total |
+|---|---:|---:|---:|---:|
+| Q4_K | 10,733 ms | 9,798 | **2,364** | **4,5x** |
+| Q3_K | 31,616 | 17,054 | **2,623** | **12,1x** |
+| Q2_K | 18,114 | 17,387 | **4,192** | **4,3x** |
+
+Los mismos diez bucles existían en el camino de `f32`, que es el que usan
+`matmul` y el rodeo, y se arreglaron igual. Sobre Q3_K con una fila, la matmul
+en `f32` pasó de **5,827 a 1,126 ms**.
+
+Y el total de `matmul_i8_directo` con una fila sobre Q3_K, con hilos, de
+**5,989 a 0,880 ms**.
+
+### Que siga siendo exacto es el punto
+
+Un arreglo de rendimiento en un descuantizador no vale nada si cambia un bit.
+`cargo run --features candle --example check_quant` compara valor por valor
+contra candle sobre los modelos reales: **21 tensores, 8 formatos, cero
+diferencias**, con el Q6_K de 311.164.928 valores de `output.weight` incluido.
+
+### Lo que esto le hace al criterio del ensamblador
+
+En §5 quedó escrito que el ensamblador entra cuando LLVM se queda sin
+registros, y que medido no se quedaba: 6 de 16 registros ymm y cero volcados en
+el bucle. Era cierto y sigue siéndolo, pero le faltaba un paso **anterior**:
+
+> Antes de preguntar si una persona puede mejorar el código vectorizado que
+> generó el compilador, hay que comprobar que el compilador vectorizó algo.
+
+La cuenta de ns por valor lo dice en un renglón y no hace falta leer
+ensamblador: si un bucle que procesa bytes anda a más de ~0,2 ns por byte, no
+está usando vectores, y ahí no hay nada que afinar hasta que los use.
+
+### Sobre medir en esta máquina
+
+De paso se encontró un defecto en el banco mismo. `measure_own_matmul` fijaba
+20 repeticiones por muestra, así que una llamada de 0,2 ms daba una muestra de
+4 ms y el ruido del reloj y del planificador se la comía. Dos pasadas seguidas
+del **mismo binario**, sin tocar una línea, dieron para candle con una fila
+**0,205 y 0,361 ms** — un 76% de diferencia. Lo nuestro, que tardaba diez veces
+más, variaba un 4%.
+
+O sea que el banco estaba sesgado **a favor de quien fuera más rápido**, y una
+medición que depende de a quién mide no decide nada. Ahora el número de
+repeticiones se calibra para juntar 60 ms por muestra, con cinco muestras y
+mediana: la celda de una fila pasó de ±76% a ±3%.
+
+Queda una variación que no es del banco: en trabajo que recorre memoria, esta
+máquina da hasta **1,8x de diferencia entre pasadas** del mismo binario — el
+desempaquetado de Q2_K midió 4,19 y 7,54 ms. Por eso de acá en adelante solo se
+comparan cifras tomadas **en el mismo proceso**, y las comparaciones entre
+ejecuciones distintas no se usan para decidir.
+
+---
+
 ## Cifras que hubo que corregir
 
 Se listan porque una cifra mal medida dirige el trabajo hacia el lado
-equivocado, y las cuatro lo hicieron un rato.
+equivocado, y todas estas lo hicieron un rato.
 
 | se dijo | era | por qué |
 |---|---|---|
@@ -646,6 +849,9 @@ equivocado, y las cuatro lo hicieron un rato.
 | el motor está limitado por cálculo | **sigue siendo cierto**, y se confirmó midiendo | la "corrección" que lo negaba duró medio día: dos kernels la desmintieron (§10) |
 | el escalado de hilos no tiene explicación | sí la tiene, para el decode | las matrices que no entran en L3 no escalan, y son el 89% de los pesos (§10) |
 | candle comparte los pesos entre instancias | **931 MB cada una** | el parseo de `tasklist` estaba roto y daba 0,0 MB |
+| la matmul propia le gana 2,10x a candle a 8 filas | **1,19x a 1,30x** sobre Q4_K, 1,05x a 1,12x sobre Q3_K | la cifra salió de una pasada cuya columna de candle marcó 7,717 ms donde el mismo código sin tocar marca hoy 2,5 a 4,3; no es reproducible y la causa no quedó establecida (§15) |
+| el camino de enteros le gana siempre al de `f32` | **depende del formato**: en Q3_K gana el de enteros, en Q4_K gana `f32` desde 2 filas | quitar la comprobación de límites le aprovechó más al de `f32` (§15) |
+| el sub-bloque de 16 encarece el kernel | lo **abarata**: 1,07 contra 1,52 ms | era una conjetura sobre el coste de `setr_ps`, nunca medida (§15) |
 
 ---
 

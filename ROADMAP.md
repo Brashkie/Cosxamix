@@ -104,10 +104,10 @@ una expectativa, no un dato, y este proyecto no acepta expectativas:
 
 Trabajo sin misterio, pendiente:
 
-- ~~Respuestas en *streaming*~~ **hecho en la 0.2.0**: SSE en el dialecto de
+- ~~Respuestas en *streaming*~~ **hecho en la 0.3.0**: SSE en el dialecto de
   OpenAI, primer trozo a los 2,14 s contra 5,82 de la respuesta completa, y la
   generación se corta si el cliente cierra.
-- ~~Carga de más de un modelo a la vez~~ **hecho en la 0.2.0**: registra todos
+- ~~Carga de más de un modelo a la vez~~ **hecho en la 0.3.0**: registra todos
   los `.gguf` del directorio, carga bajo demanda y desaloja el menos usado
   cuando no entra en `COSXAMIX_RAM_MB`.
 - ~~Persistir el caché de sesión en disco~~ **medido y descartado**. Lo que
@@ -168,7 +168,7 @@ multiplicación cuantizada. El 0,5B en f32 son ~2 GB y entra; el 3B serían
 ~12 GB y no.
 
 ~~1. **El entrenador**~~ y ~~2. **Guardar y cargar adaptadores**~~ están
-hechos en la 0.2.0: `src/training/`, feature `training`. Entrena de verdad —la
+hechos en la 0.3.0: `src/training/`, feature `training`. Entrena de verdad —la
 pérdida baja— y el adaptador sale de 2,1 MB. El paso real son **~5,2 s**, no
 los 3,3 s proyectados: aquella cifra era un piso declarado y se quedó en el
 63% de la realidad, porque dejaba fuera la atención, RoPE, las normalizaciones
@@ -239,6 +239,77 @@ búsqueda**: el transformer sería el 13% de los parámetros. Así que el orden 
 
 Va después del punto 7 porque reusa todo lo de ahí, y lo que falta medir —el
 punto 3— no se puede estimar desde el LoRA.
+
+### 9. El motor propio, reemplazando candle pieza por pieza
+
+Es el cambio de rumbo de la 0.3.0: dejar de apoyarse en candle, por lo medido
+—los cinco techos que están en el README— y porque la superficie que de verdad
+se usa es estrecha.
+
+| fase | qué | estado |
+|---|---|---|
+| **1** | lector de GGUF propio | **hecho**: coincide con candle en los 5 modelos, incluidos bytes crudos y offsets |
+| 1b | descuantización de los k-quants y de Q5_0/Q8_0 | **hecho**: los 8 formatos, **valor por valor idénticos** a candle en 21 tensores de los 5 modelos. El desempaquetado directo a `i8` cubre los 7 cuantizados, con sub-bloque de 16 y de 32 |
+| **2** | las operaciones: matmul cuantizada, RoPE, softmax | **la matmul le gana a candle en lote**: 1,19x a 8 filas sobre Q4_K y 1,05x sobre Q3_K. Con una fila candle sigue adelante, 1,8x y 2,7x |
+| 3 | el forward de Qwen2 sobre la pila propia | |
+| 4 | el backward cuantizado | es lo que candle no tiene y lo que desbloquea entrenar el 3B |
+
+**La matmul propia ya le gana a candle en lote.** Medida sobre el `ffn_gate`
+del 3B, dos pasadas por formato y todo dentro del mismo proceso — las cifras de
+procesos distintos no se comparan, por lo medido en
+[DECISIONES](DECISIONES.md) §15:
+
+| filas | candle Q4_K | nuestra | | candle Q3_K | nuestra | |
+|---:|---:|---:|---|---:|---:|---|
+| 1 | 0,494 ms | 0,895 ms | 0,55x | 0,319 ms | 1,023 ms | 0,31x |
+| 2 | 1,080 | 1,205 | 0,90x | 0,574 | 1,046 | 0,55x |
+| 5 | 2,128 | 2,462 | 0,86x | 1,723 | 1,633 | **1,06x** |
+| 8 | 3,776 | **3,170** | **1,19x** | 2,551 | **2,433** | **1,05x** |
+
+El coste por fila cae de 0,90 a 0,40 ms en Q4_K y de 1,02 a 0,30 en Q3_K
+mientras el de candle se queda plano, y eso es lo que necesita el prefill.
+
+Dos cosas lo consiguieron, y ninguna fue afinar un kernel:
+
+- **quitar un rodeo**: la primera versión descuantizaba la columna a `f32` y la
+  volvía a cuantizar a `i8`. Ahora se desempaqueta directo del formato, porque
+  los pesos **ya eran enteros con una escala**. De 10,3 a 2,65 ms con una fila,
+  4x sin tocar una instrucción vectorial;
+- **quitar la comprobación de límites** de los diez bucles de desempaquetado,
+  que les impedía vectorizar: entre 4,3x y 12,1x según el formato, y el 94% del
+  trabajo de un hilo estaba ahí. El detalle, en §15.
+
+Y es además más precisa que candle: 0,25% de diferencia, a nuestro favor,
+porque candle usa una escala cada 256 valores y nosotros una cada 32.
+
+**Lo que falta:**
+
+1. **El caso de una fila**, donde candle sigue adelante — 1,8x sobre Q4_K y
+   2,7x sobre Q3_K. Ya no es un misterio: candle a una fila mueve los 9,2 MB en
+   0,32 ms, que son 28 GB/s y lo pone contra el muro de memoria de esta
+   máquina, mientras lo nuestro hace 2,4 ms de desempaquetado más 1,0 de kernel
+   en **dos pasadas separadas**, con la ida y vuelta a L1 entre una y otra.
+   El arreglo es fusionarlas: desempaquetar un bloque de 256 y multiplicarlo
+   sin que salga de los registros, que es lo que hace `vec_dot_q3k_q8k` de
+   candle ([DECISIONES](DECISIONES.md) §11). Pide AVX2 a mano por formato, así
+   que es trabajo de días y no de horas — y es la primera tarea donde el
+   ensamblador y Zig tienen algo real que hacer.
+2. **Elegir el camino según el formato.** En Q3_K gana el de enteros y en Q4_K
+   gana el de `f32` desde 2 filas, porque el arreglo de los límites le
+   aprovechó más. Hoy hay que elegir a mano; debería elegirlo el motor, y para
+   eso hace falta medirlo en los cinco modelos y no en uno.
+3. El microkernel con bloqueo de registros, que es donde el ensamblador tendría
+   su primera oportunidad real — ver [DECISIONES](DECISIONES.md) §5, con el
+   paso previo que le faltaba al criterio en §15.
+
+**La regla del reemplazo**: nada sale de candle hasta que la pieza propia dé lo
+mismo sobre los modelos reales. Candle se queda como dependencia de **test**
+aunque salga del binario — tener motor propio no es razón para tirar la forma
+más barata de saber si está bien.
+
+Y es donde el ensamblador deja de competir contra un bucle que LLVM ya
+vectoriza: en la matmul cuantizada propia el bucle caliente es **nuestro**, y
+ahí sí se puede probar AVX-512, que candle no usa.
 
 ## Decidido y cerrado
 

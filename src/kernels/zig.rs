@@ -81,6 +81,41 @@ pub fn silu(salida: &mut [f32], entrada: &[f32]) {
 }
 
 unsafe extern "C" {
+    fn cosxamix_dot_i8_escalado_f32(
+        a: *const i8,
+        b: *const i8,
+        esc_a: *const f32,
+        esc_b: *const f32,
+        n: usize,
+        bloque: usize,
+    ) -> f32;
+}
+
+/// Producto punto cuantizado por bloques.
+///
+/// Tiene una ventaja sobre el camino de AVX2 que no es de velocidad: **acepta
+/// todo el rango de `i8`, incluido -128**. El de AVX2 usa `vpmaddubsw`, que
+/// obliga a mover el signo con `vpsignb`, y -128 no tiene opuesto en i8 — el
+/// producto sale con el signo cambiado. Zig ensancha a `i32` y multiplica
+/// directo, asi que no hay precondicion que recordar.
+///
+/// Y es el unico camino vectorizado de esta operacion en ARM, donde el de
+/// Rust usa `core::arch::x86_64` y no existe.
+pub fn dot_i8_escalado(a: &[i8], b: &[i8], esc_a: &[f32], esc_b: &[f32], bloque: usize) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe {
+        cosxamix_dot_i8_escalado_f32(
+            a.as_ptr(),
+            b.as_ptr(),
+            esc_a.as_ptr(),
+            esc_b.as_ptr(),
+            a.len(),
+            bloque,
+        )
+    }
+}
+
+unsafe extern "C" {
     fn cosxamix_noop(x: f32) -> f32;
 }
 

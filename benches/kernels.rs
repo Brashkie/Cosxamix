@@ -167,5 +167,59 @@ fn silu(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, dot, rmsnorm, silu, ffi);
+/// El producto punto en enteros contra el de f32, sobre el mismo largo.
+///
+/// Es la comparacion que decide el camino de la multiplicacion cuantizada:
+/// AVX2 hace 32 int8 por instruccion contra 8 f32, asi que si la diferencia
+/// medida no se acerca a eso, el cuello esta en otro lado.
+fn dot_enteros(c: &mut Criterion) {
+    let mut g = c.benchmark_group("dot_i8");
+
+    for n in [2_048usize, 11_008] {
+        let a: Vec<i8> = (0..n)
+            .map(|i| ((i * 37) % 251) as i32 as i8)
+            .map(|v| v.max(-127))
+            .collect();
+        let b: Vec<i8> = (0..n)
+            .map(|i| ((i * 53) % 251) as i32 as i8)
+            .map(|v| v.max(-127))
+            .collect();
+        let af: Vec<f32> = a.iter().map(|v| *v as f32).collect();
+        let bf: Vec<f32> = b.iter().map(|v| *v as f32).collect();
+        g.throughput(Throughput::Elements(n as u64));
+
+        g.bench_with_input(BenchmarkId::new("f32_avx2", n), &n, |t, _| {
+            t.iter(|| kernels::dot(black_box(&af), black_box(&bf)))
+        });
+        g.bench_with_input(BenchmarkId::new("i8_escalar", n), &n, |t, _| {
+            t.iter(|| kernels::scalar::dot_i8(black_box(&a), black_box(&b)))
+        });
+        g.bench_with_input(BenchmarkId::new("i8_avx2", n), &n, |t, _| {
+            t.iter(|| kernels::dot_i8(black_box(&a), black_box(&b)))
+        });
+
+        // El kernel por bloques, que es el que usa la multiplicacion: AVX2
+        // con el rodeo del signo contra Zig ensanchando a i32.
+        let nb = n / 32;
+        let ea: Vec<f32> = (0..nb).map(|i| 0.01 + i as f32 * 0.0001).collect();
+        let eb: Vec<f32> = (0..nb).map(|i| 0.02 - i as f32 * 0.00005).collect();
+        g.bench_with_input(BenchmarkId::new("escalado_escalar", n), &n, |t, _| {
+            t.iter(|| kernels::scalar::dot_i8_escalado(black_box(&a), black_box(&b), &ea, &eb, 32))
+        });
+        #[cfg(target_arch = "x86_64")]
+        g.bench_with_input(BenchmarkId::new("escalado_avx2", n), &n, |t, _| {
+            t.iter(|| unsafe {
+                kernels::x86::dot_i8_escalado_avx2(black_box(&a), black_box(&b), &ea, &eb, 32)
+            })
+        });
+        #[cfg(feature = "zig")]
+        g.bench_with_input(BenchmarkId::new("escalado_zig", n), &n, |t, _| {
+            t.iter(|| kernels::zig::dot_i8_escalado(black_box(&a), black_box(&b), &ea, &eb, 32))
+        });
+    }
+
+    g.finish();
+}
+
+criterion_group!(benches, dot, rmsnorm, silu, dot_enteros, ffi);
 criterion_main!(benches);

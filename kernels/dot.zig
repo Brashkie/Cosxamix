@@ -171,3 +171,61 @@ export fn cosxamix_silu_f32(salida: [*]f32, entrada: [*]const f32, n: usize) voi
         salida[i] = x / (1.0 + @exp(-x));
     }
 }
+
+/// Producto punto cuantizado por bloques, con una escala por bloque de cada
+/// lado: `suma_b esc_a[b] * esc_b[b] * dot(bloque_b)`.
+///
+/// ## Por que esto en Zig y no solo en AVX2
+///
+/// En el camino de Rust este kernel usa `vpmaddubsw`, que multiplica un
+/// operando SIN signo por uno con signo, asi que hace falta el rodeo de mover
+/// el signo con `vpsignb`. Ese rodeo trae una precondicion incomoda: **con
+/// -128 da el resultado con el signo cambiado**, porque en i8 ese valor no
+/// tiene opuesto.
+///
+/// Aca no hace falta ningun rodeo. `@Vector` permite **ensanchar** i8 a i32 y
+/// multiplicar directo, asi que el kernel es correcto en todo el rango de i8
+/// sin precondiciones. Y como es portable, es ademas el unico camino
+/// vectorizado de esta operacion en ARM, donde el de Rust ni existe.
+///
+/// ## La estructura, que es lo que importa
+///
+/// El acumulador de i32 se vacia **una vez por bloque** hacia un acumulador de
+/// f32 vectorial, y la suma horizontal va al final de todo. Reducir por bloque
+/// es lo que hizo que la primera version de esto saliera mas lenta que el
+/// camino de f32 pese a usar instrucciones mas rapidas.
+export fn cosxamix_dot_i8_escalado_f32(
+    a: [*]const i8,
+    b: [*]const i8,
+    esc_a: [*]const f32,
+    esc_b: [*]const f32,
+    n: usize,
+    bloque: usize,
+) f32 {
+    const VI8 = @Vector(8, i8);
+    const VI32 = @Vector(8, i32);
+    const VF = @Vector(8, f32);
+
+    var acumulador: VF = @splat(0.0);
+    const n_bloques = n / bloque;
+
+    var bl: usize = 0;
+    while (bl < n_bloques) : (bl += 1) {
+        var parcial: VI32 = @splat(0);
+        var i: usize = bl * bloque;
+        const fin = i + bloque;
+
+        while (i + 8 <= fin) : (i += 8) {
+            const pa: *align(@alignOf(i8)) const VI8 = @ptrCast(a + i);
+            const pb: *align(@alignOf(i8)) const VI8 = @ptrCast(b + i);
+            // Ensanchar y multiplicar: sin rodeos de signo, correcto en todo
+            // el rango de i8 incluido -128.
+            parcial += @as(VI32, pa.*) * @as(VI32, pb.*);
+        }
+
+        const escala: VF = @splat(esc_a[bl] * esc_b[bl]);
+        acumulador += @as(VF, @floatFromInt(parcial)) * escala;
+    }
+
+    return @reduce(.Add, acumulador);
+}

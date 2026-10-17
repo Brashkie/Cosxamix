@@ -37,14 +37,34 @@ Eso define qué tiene sentido construir acá y qué sería tirar años a la basu
 | capa | quién la hace | ¿propia? |
 |---|---|---|
 | API HTTP, gestión de modelos, caché, planificador | **Cosxamix** | **sí** |
-| Ejecución del grafo, atención, cuantización | motor existente (`llama.cpp`, ONNX Runtime, `candle`) | no |
+| Ejecución del grafo, atención, cuantización | **Cosxamix** — en curso, reemplazando a `candle` pieza por pieza | **sí** |
 | Kernels sueltos del camino caliente | Cosxamix, **solo donde el perfilado lo justifique** | puede |
 
-Escribir un motor de inferencia desde cero compite con años de trabajo de mucha
-gente en `llama.cpp`. Escribir la capa de servicio es un proyecto abarcable y
-es donde están las decisiones que de verdad cambian la latencia percibida: que
-el modelo no se descargue, que el prompt no se recalcule entero, que una
-petición no espere detrás de otra.
+**Esa segunda fila decía "no" hasta la 0.3.0, y lo que la cambió fueron
+mediciones, no ambición.** Apoyarse en candle salía barato y resultó ser un
+techo en cinco sitios a la vez, todos comprobados en este repositorio:
+
+| | |
+|---|---|
+| `QMatMul` no implementa `bwd` | el gradiente no atraviesa una multiplicación cuantizada, así que entrenar el 3B pide 12 GB en f32 contra 7,3 libres |
+| su `matmul` relee la matriz entera por cada fila del lote | 8 filas cuestan 8,55x una, y eso es lo que mató a la decodificación especulativa |
+| no usa AVX-512 ni SVE | `avx.rs` es de 256 bits y `neon.rs` de 128 |
+| no soporta los formatos IQ | su enumeración llega a los k-quants clásicos |
+| su backprop calcula `dL/dW` de capas congeladas | 17% del paso de entrenamiento, tirado |
+
+Ninguno de los cinco se arregla desde afuera. Y la superficie que de verdad se
+usa es estrecha —`Tensor`, `QMatMul`, el lector de GGUF y una docena de
+funciones sueltas—, así que reemplazarla es un trabajo acotado y no una
+reescritura de `llama.cpp`.
+
+Se hace **pieza por pieza, con candle de oráculo**: cada parte propia se
+compara contra la suya sobre los modelos reales antes de reemplazarla, y
+candle se queda como dependencia de test aunque salga del binario. Tener un
+motor propio no es razón para tirar la forma más barata de saber si está bien.
+
+La capa de servicio sigue siendo donde están las decisiones que más mueven la
+latencia percibida: que el modelo no se descargue, que el prompt no se
+recalcule entero, que una petición no espere detrás de otra.
 
 **Crear modelos sí está en el alcance; crear uno grande, no.** Un modelo de
 mil millones de parámetros son miles de horas de GPU y cientos de GB de texto,

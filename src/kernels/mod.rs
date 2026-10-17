@@ -181,6 +181,74 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// no**, que es al reves de lo que pasa con `dot` y `rmsnorm`. Es la primera
 /// vez que la ventaja de Zig en este proyecto no es "corre en ARM" sino "el
 /// lenguaje trae la herramienta".
+/// Producto punto de `i8`, acumulando en `i32`.
+///
+/// Es la operacion de una multiplicacion cuantizada de verdad: pesos y
+/// activacion como enteros chicos, y la escala aparte. AVX2 hace 32 por
+/// instruccion contra los 8 del camino en f32, y ahi esta la diferencia entre
+/// nuestra multiplicacion y la de candle.
+///
+/// No hay camino Zig todavia: la instruccion que hace falta, `vpmaddubsw`, no
+/// tiene equivalente portable en `@Vector`, asi que en Zig habria que escribir
+/// el mismo rodeo con intrinsecos y deja de ser una fuente para todas las
+/// plataformas. Queda pendiente mirarlo para NEON, donde `sdot` hace esto en
+/// una sola instruccion y no hace falta ningun rodeo.
+pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    assert_eq!(a.len(), b.len(), "dot_i8: los vectores miden distinto");
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if matches!(elegido(), Backend::Avx2 | Backend::Zig) {
+            return unsafe { x86::dot_i8_avx2(a, b) };
+        }
+    }
+    scalar::dot_i8(a, b)
+}
+
+/// Producto punto cuantizado por bloques, con una escala por bloque en cada
+/// lado.
+///
+/// Es la operacion que de verdad necesita una multiplicacion cuantizada, y es
+/// una sola operacion y no `dot_i8` en un bucle por un motivo medido: la suma
+/// horizontal del final es barata una vez y carisima una por bloque.
+pub fn dot_i8_escalado(a: &[i8], b: &[i8], esc_a: &[f32], esc_b: &[f32], bloque: usize) -> f32 {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "dot_i8_escalado: los vectores miden distinto"
+    );
+
+    // AVX2 primero en x86-64, y no es la eleccion que parecia. El de Zig es
+    // mas correcto —acepta todo el rango de i8— y mas portable, pero el banco
+    // dijo otra cosa: 85 ns contra 259 en n=2048, o sea **3x**.
+    //
+    // El motivo es estructural y no se arregla afinando: ensanchar i8 a i32
+    // para multiplicar da 8 carriles por vector, mientras el rodeo del signo
+    // de `vpmaddubsw` trabaja con 32. El rodeo existe justamente para eso.
+    //
+    // Asi que Zig se queda por el segundo brazo de la regla 3 —habilita ARM,
+    // donde el camino de Rust usa `core::arch::x86_64` y no existe— y no por
+    // velocidad.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if (bloque == 16 || bloque.is_multiple_of(32))
+            && a.len().is_multiple_of(bloque.max(32))
+            && matches!(elegido(), Backend::Avx2 | Backend::Zig)
+        {
+            return unsafe { x86::dot_i8_escalado_avx2(a, b, esc_a, esc_b, bloque) };
+        }
+    }
+
+    #[cfg(all(feature = "zig", not(target_arch = "x86_64")))]
+    {
+        if bloque.is_multiple_of(8) && a.len().is_multiple_of(bloque) && elegido() == Backend::Zig {
+            return zig::dot_i8_escalado(a, b, esc_a, esc_b, bloque);
+        }
+    }
+
+    scalar::dot_i8_escalado(a, b, esc_a, esc_b, bloque)
+}
+
 pub fn silu(salida: &mut [f32], entrada: &[f32]) {
     assert_eq!(
         salida.len(),
@@ -226,6 +294,134 @@ pub fn rmsnorm(salida: &mut [f32], entrada: &[f32], peso: &[f32], eps: f32) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Sub-bloques de 16, que es lo que usan Q2_K, Q3_K y Q6_K.
+    #[test]
+    fn dot_i8_escalado_con_bloques_de_16() {
+        for k in [32usize, 64, 2048] {
+            let nb = k / 16;
+            let a: Vec<i8> = (0..k)
+                .map(|i| ((i * 37) % 251) as i32 as i8)
+                .map(|v| v.max(-127))
+                .collect();
+            let b: Vec<i8> = (0..k)
+                .map(|i| ((i * 53) % 251) as i32 as i8)
+                .map(|v| v.max(-127))
+                .collect();
+            let ea: Vec<f32> = (0..nb).map(|i| 0.01 + i as f32 * 0.003).collect();
+            let eb: Vec<f32> = (0..nb).map(|i| 0.02 - i as f32 * 0.0007).collect();
+            let esperado = scalar::dot_i8_escalado(&a, &b, &ea, &eb, 16);
+            let obtenido = dot_i8_escalado(&a, &b, &ea, &eb, 16);
+            let tol = esperado.abs() * 1e-5 + 1e-4;
+            assert!(
+                (esperado - obtenido).abs() <= tol,
+                "k={k}: {esperado} contra {obtenido}"
+            );
+        }
+    }
+
+    /// El de Zig contra la referencia, y con -128 adentro.
+    ///
+    /// Ese valor esta FUERA del contrato del camino de AVX2 —el rodeo del
+    /// signo lo devuelve con el signo cambiado— y DENTRO del de Zig, que
+    /// ensancha a i32. Es la diferencia concreta entre los dos, probada y no
+    /// afirmada.
+    #[cfg(feature = "zig")]
+    #[test]
+    fn zig_aguanta_todo_el_rango_de_i8() {
+        for k in [32usize, 64, 2048] {
+            let nb = k / 32;
+            // -128 puesto a proposito, no esperando que caiga por
+            // aritmetica modular: es el valor que se quiere probar.
+            let mut a: Vec<i8> = (0..k).map(|i| ((i * 37) % 251) as i32 as i8).collect();
+            let mut b: Vec<i8> = (0..k).map(|i| ((i * 53) % 251) as i32 as i8).collect();
+            a[0] = i8::MIN;
+            a[k / 2] = i8::MIN;
+            b[1] = i8::MIN;
+            b[k - 1] = i8::MIN;
+            let ea: Vec<f32> = (0..nb).map(|i| 0.01 + i as f32 * 0.003).collect();
+            let eb: Vec<f32> = (0..nb).map(|i| 0.02 - i as f32 * 0.001).collect();
+
+            let esperado = scalar::dot_i8_escalado(&a, &b, &ea, &eb, 32);
+            let obtenido = zig::dot_i8_escalado(&a, &b, &ea, &eb, 32);
+            let tol = esperado.abs() * 1e-5 + 1e-4;
+            assert!(
+                (esperado - obtenido).abs() <= tol,
+                "k={k}: referencia {esperado} contra zig {obtenido}"
+            );
+        }
+    }
+
+    /// El camino de AVX2 contra la referencia, con bloques y escalas.
+    #[test]
+    fn dot_i8_escalado_coincide_con_la_referencia() {
+        for k in [32usize, 64, 256, 2048] {
+            let nb = k / 32;
+            let a: Vec<i8> = (0..k)
+                .map(|i| ((i * 37) % 251) as i32 as i8)
+                .map(|v| v.max(-127))
+                .collect();
+            let b: Vec<i8> = (0..k)
+                .map(|i| ((i * 53) % 251) as i32 as i8)
+                .map(|v| v.max(-127))
+                .collect();
+            let ea: Vec<f32> = (0..nb).map(|i| 0.01 + i as f32 * 0.003).collect();
+            let eb: Vec<f32> = (0..nb).map(|i| 0.02 - i as f32 * 0.001).collect();
+
+            let esperado = scalar::dot_i8_escalado(&a, &b, &ea, &eb, 32);
+            let obtenido = dot_i8_escalado(&a, &b, &ea, &eb, 32);
+            let tol = esperado.abs() * 1e-5 + 1e-4;
+            assert!(
+                (esperado - obtenido).abs() <= tol,
+                "k={k}: referencia {esperado} contra avx2 {obtenido}"
+            );
+        }
+    }
+
+    /// El `dot_i8` de AVX2 contra la referencia, con igualdad EXACTA.
+    ///
+    /// Son enteros: no hay nada que redondear distinto, asi que una diferencia
+    /// de uno significa que el rodeo del signo esta mal o que la cola se
+    /// quedo afuera. Se prueban los extremos de i8 a proposito, que es donde
+    /// el truco de `vpmaddubsw` podria saturar: -128 no tiene opuesto en i8.
+    #[test]
+    fn dot_i8_coincide_con_la_referencia() {
+        for n in [0usize, 1, 7, 31, 32, 33, 64, 100, 2048, 2049] {
+            // Dentro de [-127, 127], que es lo que producen los
+            // cuantizadores de GGML y lo unico que el kernel promete.
+            let a: Vec<i8> = (0..n)
+                .map(|i| ((i * 37) % 255) as i32 as i8)
+                .map(|v| v.max(-127))
+                .collect();
+            let b: Vec<i8> = (0..n)
+                .map(|i| (((i * 53) % 255) as i32 - 127) as i8)
+                .map(|v| v.max(-127))
+                .collect();
+            assert_eq!(scalar::dot_i8(&a, &b), dot_i8(&a, &b), "n={n}");
+        }
+    }
+
+    /// El peor caso dentro del contrato: todo en el extremo del rango.
+    ///
+    /// -128 no esta porque **no es un valor valido** para este kernel: en i8
+    /// no tiene opuesto, y el rodeo del signo de AVX2 devuelve el producto con
+    /// el signo cambiado. Los cuantizadores de GGML calculan la escala como
+    /// `amax / 127`, asi que producen [-127, 127] y nunca -128. Lo encontro
+    /// este test cuando probaba -128, y la respuesta correcta no fue arreglar
+    /// el kernel sino escribir la precondicion.
+    #[test]
+    fn dot_i8_en_los_extremos() {
+        let n = 2048;
+        for (x, y) in [(127i8, 127i8), (-127, 127), (-127, -127), (127, -127)] {
+            let a = vec![x; n];
+            let b = vec![y; n];
+            assert_eq!(
+                scalar::dot_i8(&a, &b),
+                dot_i8(&a, &b),
+                "con {x} y {y} el resultado difiere"
+            );
+        }
+    }
 
     /// La SiLU de Zig contra la referencia.
     ///

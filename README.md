@@ -44,14 +44,33 @@ away:
 | layer | who does it | ours? |
 |---|---|---|
 | HTTP API, model management, cache, scheduler | **Cosxamix** | **yes** |
-| Graph execution, attention, quantization | an existing engine (`llama.cpp`, ONNX Runtime, `candle`) | no |
+| Graph execution, attention, quantization | **Cosxamix** — in progress, replacing `candle` piece by piece | **yes** |
 | Individual hot-path kernels | Cosxamix, **only where profiling justifies it** | maybe |
 
-Writing an inference engine from scratch competes with years of work by many
-people on `llama.cpp`. Writing the service layer is a tractable project, and
-it's where the decisions that actually change perceived latency live: that the
-model isn't unloaded, that the prompt isn't recomputed in full, that one
-request doesn't wait behind another.
+**That second row said "no" until 0.3.0, and what changed it was
+measurements, not ambition.** Leaning on candle was cheap and turned out to be
+a ceiling in five places at once, all verified in this repository:
+
+| | |
+|---|---|
+| `QMatMul` doesn't implement `bwd` | gradients can't flow through a quantized matmul, so training the 3B needs 12 GB in f32 against 7.3 free |
+| its `matmul` re-reads the whole matrix per batch row | 8 rows cost 8.55x one, and that's what killed speculative decoding |
+| no AVX-512, no SVE | `avx.rs` is 256-bit and `neon.rs` is 128-bit |
+| no IQ quantization formats | its enumeration stops at the classic k-quants |
+| its backprop computes `dL/dW` for frozen layers | 17% of the training step, wasted |
+
+None of the five is fixable from the outside. And the surface actually in use
+is narrow — `Tensor`, `QMatMul`, the GGUF reader and a dozen loose functions —
+so replacing it is a bounded job, not a rewrite of `llama.cpp`.
+
+It happens **piece by piece, with candle as the oracle**: each part of ours is
+compared against theirs on the real models before it replaces anything, and
+candle stays as a dev-dependency even after it leaves the binary. Owning the
+engine is no reason to throw away the cheapest way to know whether it's right.
+
+The service layer is still where the decisions that move perceived latency the
+most live: that the model isn't unloaded, that the prompt isn't recomputed in
+full, that one request doesn't wait behind another.
 
 **Creating models is in scope; creating a large one is not.** A
 billion-parameter model is thousands of GPU-hours and hundreds of GB of text,

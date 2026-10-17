@@ -1,6 +1,6 @@
 [package]
 name = "cosxamix"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Runtime de IA que sirve modelos de lenguaje por HTTP, compatible con el dialecto de Ollama"
 license     = "MIT"
@@ -38,7 +38,10 @@ candle-nn           = { version = "0.9", optional = true }
 # El pool de rayon se configura a mano al arrancar y num_cpus es lo unico que
 # distingue nucleos fisicos de logicos — available_parallelism() devuelve 12
 # en un i5-10400 que tiene 6.
-rayon               = { version = "1", optional = true }
+# Directa y no opcional desde la 0.3.0: el motor propio reparte su trabajo en
+# hilos, asi que rayon deja de ser algo que arrastra candle y pasa a ser parte
+# de la base.
+rayon               = "1"
 num_cpus            = { version = "1", optional = true }
 
 # `default-features = false` NO es cosmetico: por defecto `tokenizers` trae el
@@ -65,7 +68,7 @@ zig = []
 # eso.
 #
 #   cargo run --release --features candle
-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:rayon", "dep:num_cpus"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:num_cpus"]
 
 # Entrenamiento LoRA. Implica `candle` porque no puede existir sin el, y va
 # aparte porque quien solo quiera servir no tiene por que compilarlo.
@@ -90,6 +93,18 @@ required-features = ["candle"]
 
 [[example]]
 name = "check_cache"
+required-features = ["candle"]
+
+[[example]]
+name = "check_gguf"
+required-features = ["candle"]
+
+[[example]]
+name = "check_quant"
+required-features = ["candle"]
+
+[[example]]
+name = "measure_own_matmul"
 required-features = ["candle"]
 
 [[example]]

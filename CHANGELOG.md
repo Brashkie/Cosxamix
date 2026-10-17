@@ -9,7 +9,7 @@ acá va qué cambió, no por qué.
 
 ---
 
-## [0.2.0] - sin publicar
+## [0.3.0] - 2026-10-17
 
 ### Averiguado
 
@@ -66,6 +66,29 @@ hacia esperar el conteo de operaciones, porque el paso tiene mucho mas que las
 siete matrices.
 
 ### Añadido
+
+- **`quant::desempaquetar_i8` cubre los siete formatos cuantizados** —Q8_0,
+  Q5_0, Q2_K, Q3_K, Q4_K, Q5_K y Q6_K—, desempaquetando a `i8` con una escala y
+  un desplazamiento por sub-bloque **sin pasar por `f32`**. Los de sub-bloque de
+  16 pedían además que el kernel aceptara ese tamaño: `dot_i8_escalado_avx2` lo
+  hace a ancho completo aprovechando que, después de `maddubs` y `madd`, los
+  carriles `i32` 0-3 cubren los bytes 0-15 y los 4-7 los bytes 16-31, así que un
+  vector de escalas `[s0 s0 s0 s0 s1 s1 s1 s1]` aplica la correcta a cada mitad
+  — no hace falta bajar a 128 bits. Medido, el camino de 16 resultó **más**
+  rápido que el de 32, 1,07 contra 1,52 ms, al revés de lo que se suponía.
+  Nueva `quant::sub_bloque`, que es de dónde sale el tamaño: los dos lados del
+  producto tienen que usar el mismo, así que `matmul_i8_directo` cuantiza la
+  entrada con el del formato de los pesos y no con una constante, y
+  `cuantizar_i8_en` lo recibe. Un test reconstruye `escala * q + desplazamiento`
+  y exige igualdad **exacta** contra `descuantizar` en los siete formatos: es
+  exacta y no aproximada porque no hay recuantización de por medio.
+
+- **`examples/profile_i8.rs`**, que mide el desempaquetado y el kernel por
+  separado sobre tres formatos con el mismo número de valores. Hizo falta porque
+  la ventaja medida sobre Q4_K no se sostuvo en Q3_K y había dos sospechosos;
+  dijo que el desempaquetado era el 94% del trabajo de un hilo y que el kernel
+  no tenía nada que ver.
+
 
 **Gestor de varios modelos** (`src/engine_manager.rs`). Hasta acá Cosxamix
 servía **uno**, fijado por `COSXAMIX_GGUF`; pedir otro devolvía
@@ -239,6 +262,38 @@ Queda escrito en el ROADMAP con la condición que lo haría valer la pena: que
 reiniciar deje de costar 45 s.
 
 ### Corregido
+
+- **La comprobación de límites costaba entre 4 y 12 veces el kernel entero.**
+  Los diecinueve bucles de descuantización y desempaquetado escribían por
+  índice calculado —`q[i * 256 + par * 64 + j] = ...`—, así que cada valor
+  llevaba su comprobación de límites, y una comprobación dentro del bucle le
+  prohíbe vectorizar a LLVM: iba a 0,43 ns por valor, unos 1,3 ciclos, que es
+  un bucle escalar byte a byte en el camino más caliente del motor. Ahora la
+  ventana se pide una vez con su longitud fija —`&mut q[k..k + 32]`, o
+  `split_at_mut` cuando el formato intercala mitades— y adentro va un par de
+  iteradores de longitud conocida. Desempaquetado a `i8` de los 22,5 millones
+  de valores del `ffn_gate`, un hilo: Q4_K de 10,733 a 2,364 ms (4,5x), Q3_K de
+  31,616 a 2,623 (12,1x), Q2_K de 18,114 a 4,192 (4,3x). La matmul en `f32`
+  sobre Q3_K con una fila, de 5,827 a 1,126 ms; `matmul_i8_directo`, de 5,989 a
+  0,880. Sigue siendo exacto: 21 tensores y 8 formatos **idénticos** a candle,
+  `output.weight` de 311.164.928 valores en Q6_K incluido. Aparte, en Q2_K y
+  Q3_K el bucle interno iba de 16 en 16 porque el formato tiene sub-bloques de
+  16, pero los dos sub-bloques seguidos comparten corrimiento y máscara y son
+  contiguos en el origen y en el destino, así que quedaba a **medio registro**
+  de AVX2 sin motivo; fusionados a 32. Razonado en
+  [DECISIONES](DECISIONES.md) §15.
+
+- **El banco estaba sesgado a favor de quien fuera más rápido.**
+  `measure_own_matmul` fijaba 20 repeticiones por muestra, así que una llamada
+  de 0,2 ms daba una muestra de 4 ms que el ruido del reloj y del planificador
+  se comía: dos pasadas seguidas del mismo binario, sin tocar una línea,
+  midieron **0,205 y 0,361 ms** para candle con una fila, un 76% de diferencia,
+  mientras lo nuestro —diez veces más lento— variaba un 4%. Una medición que
+  depende de a quién mide no decide nada. Ahora las repeticiones se calibran
+  para juntar 60 ms por muestra, con cinco muestras y mediana: esa celda pasó
+  de ±76% a ±3%. Y queda anotado que en trabajo que recorre memoria esta
+  máquina da hasta 1,8x entre pasadas, así que solo se comparan cifras tomadas
+  en el mismo proceso.
 
 - **El caché de sesión pesa tres veces lo que decía el README.** Son 24,0 KB
   por token en el 0,5B pero **72,0 KB en el 3B**, que es el modelo por defecto:
@@ -533,4 +588,5 @@ agrega una sección a uno y se olvida del otro, CI falla.
 - Verificado en esta versión: **22 tests**, 0 avisos, clippy limpio en las tres
   combinaciones (por defecto, `candle`, `zig,candle`).
 
+[0.3.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.3.0
 [0.1.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.1.0
