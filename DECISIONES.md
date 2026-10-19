@@ -228,6 +228,333 @@ El criterio queda así, y es falsable:
 
 Si no vuelca, no entra. Como hasta ahora.
 
+### Se ejecutó el criterio, y la respuesta es que no
+
+Se escribió `dot_q4k_i8_x4_avx2`: el kernel fusionado de Q4_K para **cuatro
+columnas de una vez**, con los cuatro acumuladores vivos y la entrada cargada
+una sola vez en vez de cuatro.
+
+Los dos pasos del criterio, medidos:
+
+| kernel | instrucciones | ymm usados | volcados a pila |
+|---|---:|---:|---:|
+| `dot_i8_escalado_avx2` | 151 | 6/16 | **0** |
+| `dot_q3k_i8_avx2` | 277 | 8/16 | **0** |
+| `dot_q4k_i8_avx2` | 568 | 8/16 | **0** |
+| `dot_q4k_i8_x4_avx2` | 1031 | **12/16** | **0** |
+
+LLVM subió a 12 registros y **no volcó nada**. Y lo segundo, que ni siquiera
+hacía falta preguntar: el bloqueo es **más lento**, 855 ns contra 712 de
+cuatro llamadas sueltas, un 20% peor.
+
+**El motivo no tiene nada que ver con registros**, que es lo interesante.
+Cuatro llamadas sueltas recorren **una fila contigua cada una**: acceso
+secuencial perfecto, que es lo que el prefetcher hace bien. La bloqueada salta
+entre cuatro filas separadas por el ancho de una fila entera, o sea cuatro
+flujos entrelazados. Lo que se ahorra —una carga de la entrada, que está en
+L1— cuesta menos que lo que se pierde.
+
+Y el ensamblador no arregla eso: el patrón de acceso es del algoritmo, no de
+la selección de instrucciones. Una persona escribiendo a mano choca con los
+mismos cuatro flujos.
+
+Por la regla 3 el microkernel se borró. Y con él se cierra la pregunta que
+esta sección dejaba abierta desde hace versiones:
+
+> **No hay ninguna apertura para el ensamblador en este código hoy.** Se midió
+> la presión de registros de los cuatro kernels calientes —ninguno pasa de
+> 12 de 16, ninguno vuelca— y se construyó el único algoritmo que se suponía
+> que la crearía, que resultó más lento por una razón ajena a los registros.
+
+Lo que **sí** apareció en el camino, y es lo contrario de lo que se buscaba:
+el bloqueo que gana ya estaba puesto, y es el otro. `matmul_i8_fusionado`
+recorre una columna de pesos y la usa para las `m` filas de entrada: un solo
+flujo de pesos, contiguo, reutilizado. Bloquear por el lado de la salida
+rompía justamente eso.
+
+### Qué es exactamente lo que hay en `kernels/*.s`, dicho sin adornos
+
+Conviene que esto esté escrito, porque mirando el repositorio la pregunta
+aparece sola: los dos `.s` cubren `cosxamix_dot_bloques`, que es el producto
+punto de `f32` —el **primer** kernel del proyecto— y **no** cubren los
+fusionados de Q4_K y Q3_K, que son el camino caliente de hoy. El ensamblador
+no siguió al resto.
+
+Eso no es un olvido, y tampoco es que dé igual. Es el resultado de lo medido
+arriba: ninguno de los cuatro kernels calientes pasa de 12 de 16 registros,
+ninguno vuelca, el único algoritmo que iba a crear presión salió 20% más
+lento, y adelantar el trabajo escalar fuera del bucle vectorial no movió la
+aguja —188,9 ns contra 186,2, dentro del ruido—, o sea que LLVM ya lo estaba
+programando bien. Tres hipótesis, tres mediciones, ninguna apertura.
+
+Para qué siguen entonces: están **verificados idénticos a los intrínsecos**
+por un test, y un job de CI comprueba que ensamblan en los tres formatos de
+objeto —ELF, COFF y Mach-O—, que es donde se rompió un release una vez por
+una directiva `.type` que solo existe en ELF. Ese valor es real y no depende
+de que sean el camino rápido.
+
+**Qué los haría crecer.** Una medición, no una intención. En concreto,
+cualquiera de estas tres:
+
+1. que un kernel caliente empiece a volcar registros a la pila;
+2. que aparezca una instrucción que el compilador no emite y la CPU tenga
+   —`vpdpbusd` de AVX-VNNI haría en una lo que hoy son dos, `vpmaddubsw` más
+   `vpmaddwd`, pero este i5-10400 es Comet Lake y no la tiene, así que medirlo
+   acá es imposible—;
+3. que el perfil muestre al planificador de LLVM perdiendo ciclos en un bucle
+   concreto.
+
+### El ensamblador del kernel fusionado, y lo que midió
+
+`kernels/q4k_avx2_win64.s` y `kernels/q4k_avx2_sysv.s` son el bucle vectorial
+del fusionado de Q4_K, partiendo del que genera el compilador y limpiado a
+mano: las constantes armadas con inmediatos en vez de leerse de una sección de
+datos —que se declara distinto en COFF, ELF y Mach-O—, etiquetas numéricas
+locales para no chocar con las que genera rustc dentro de `global_asm!`, y el
+de System V sin `.type` y con el símbolo con y sin guion bajo, así sirve a ELF
+y Mach-O a la vez. Solo `ymm0`–`ymm5`, sin prólogo. Un solo índice que avanza
+de a 8 hace de tres punteros con las escalas del direccionamiento: `×4` son 32
+bytes de `qs`, `×8` son 64 de `xq`, `×1` son dos `f32` de `esc`.
+
+**Es correcto**: los tres tests pasan, contra la referencia escalar, contra los
+intrínsecos y con filas de uno y de diecisiete bloques. Y mide así, en el
+mismo proceso, dos pasadas, con las escalas y la reducción calculadas con el
+**mismo código** en los dos caminos para que lo único distinto sea el bucle:
+
+| camino | tiempo |
+|---|---:|
+| escalar | 690 ns |
+| Zig | 296–301 ns |
+| **ensamblador** | **107–110 ns** |
+| intrínsecos | 92–93 ns |
+
+6,4x sobre el escalar y 2,8x sobre Zig; 1,16x detrás de los intrínsecos. Y la
+causa está medida, no supuesta: de las 82 instrucciones que ejecuta por
+bloque, **14 son de armar y desarmar la llamada** —leer `acc`, reconstruir las
+dos constantes, guardar `acc`, `vzeroupper`, volver—, o sea el 17%. Los
+intrínsecos hacen eso una vez por fila; este kernel, una vez por bloque, ocho
+por fila del 3B. **No es el bucle, es el contrato**: una llamada por bloque.
+
+Para cerrar esa distancia el ensamblador tendría que recorrer la fila entera
+en una llamada, con el acumulador y las constantes en registros de punta a
+punta. Eso pide cambiar el contrato: el paso entre bloques —144 bytes, con
+`qs` a 16 de cada comienzo— y las escalas de todos los bloques de la fila.
+
+**El contrato por fila ya está del lado de Rust**: `cosxamix_q4k_fila`, con los
+mismos cinco argumentos en las mismas posiciones —así la entrada de la ABI no
+cambia— pero recorriendo bloques enteros. De los tres punteros, solo `qs` no es
+contiguo a lo largo de la fila; `xq` y `esc` sí, y avanzan por par igual que en
+el contrato por bloque. Rust calcula las escalas de a 64 bloques, 2 KB de pila,
+y llama una vez por tanda: una sola llamada para cualquier fila del 3B.
+`build.rs` detecta cada contrato por su **etiqueta** y no por el nombre a
+secas, porque el nombre aparece en los comentarios de cabecera y eso daba por
+presente una función ausente; puede haber uno, el otro o los dos en el mismo
+archivo, y el bench los compara.
+
+### El contrato por fila: el bucle gana, el kernel pierde
+
+`cosxamix_q4k_fila` quedó escrito en los dos `.s` —un índice global para `xq` y
+`esc` que no se reinicia entre bloques, un puntero propio para `qs` que salta
+144 por bloque—, pasa los tres tests y da bit a bit lo mismo que el contrato por
+bloque. Pero de punta a punta salió **más lento**, y hubo que desarmar el
+porqué en capas.
+
+**Una: el arreglo puesto en cero.** El envoltorio declaraba
+`[0f32; TANDA * 8]`, 2 KB escritos en cada llamada aunque una fila de 8 bloques
+usa 256 bytes, más una copia con comprobación de límites. La hipótesis vino del
+lado del ensamblador, sin medirla, y era correcta: sin ponerlo en cero, de
+139–141 a **120–121 ns**.
+
+**Dos: el bucle aislado.** Midiendo los dos bucles con las escalas calculadas
+fuera de lo cronometrado:
+
+| | tiempo |
+|---|---:|
+| bucle por fila | **61–62 ns** |
+| bucle por bloque | 71–73 ns |
+
+El bucle por fila es **14% más rápido**, que es justo lo que se ahorra al no
+armar la llamada en cada bloque. El ensamblador hizo exactamente lo que se le
+pidió, y su bucle solo cuesta menos que el kernel entero de intrínsecos.
+
+**Tres: lo que lo hunde es el envoltorio.** Por fila calcula todas las escalas
+en una pasada aparte, las copia a un buffer y recién después llama. Llamarlo en
+tandas chicas no lo arregla, y lo prueba un caso: con tanda 1 hace una llamada
+por bloque, igual que el contrato por bloque, y aun así mide 130 ns contra 108.
+La diferencia no está en el ensamblador sino en cómo se le entregan las escalas.
+
+**Lo que haría ganar al ensamblador** es dejar de entregárselas: que calcule
+las escalas él mismo, intercaladas con el bucle bloque por bloque, en una sola
+pasada sin buffer y sin llamada por bloque. Ahí además puede usar `vcvtph2ps`,
+que convierte los `f16` de `d` y `dmin` con una instrucción, donde el Rust de
+hoy los convierte por software.
+
+### El contrato completo: el primer ensamblador en el camino caliente
+
+`cosxamix_q4k_completo` calcula todo en una sola pasada: `d` y `dmin` con
+`vcvtph2ps`, las escalas con el desempaquetado sin ramas, el bucle con los 4
+pares desenrollados, y el desplazamiento sobre `acc[8..16]`. En Windows no toca
+ningún registro no volátil —así no necesita directivas de desenrollado— y
+guarda las 8 escalas del bloque en el espacio de sombra; en System V, en la zona
+roja. Pasa los tres tests, que lo recorren junto a los otros dos contratos.
+
+Contra los intrínsecos de entonces ganaba **1,28x a 1,32x**. Pero no se le
+atribuyó esa ganancia sin antes separarla, y fue lo correcto:
+
+| | |
+|---|---:|
+| intrínsecos, `f16` por software | 96–99 ns |
+| **intrínsecos con `vcvtph2ps`** | **78–79 ns** |
+| ensamblador completo | 74–77 ns |
+
+**La mayor parte era la instrucción.** Dándosela a los intrínsecos, sin tocar
+nada más, pasaron de ~97 a ~79 ns: 1,24x. El Rust convertía los `f16` de cada
+bloque por software desde siempre y nadie lo había notado, hasta que el
+ensamblador usó la instrucción y ganó. Se pasó a `escalas_q4k`, y F16C entró a
+la detección del camino AVX2 —todo procesador con AVX2 la tiene, pero una
+máquina virtual puede esconder una extensión y dejar la otra—.
+
+Con la misma instrucción de los dos lados, en tres pasadas:
+
+| | 1 | 2 | 3 |
+|---|---:|---:|---:|
+| intrínsecos | 79,9 | 78,4 | 78,1 |
+| **ensamblador completo** | **73,8** | **75,6** | **75,4** |
+| ventaja | 1,08x | 1,04x | 1,04x |
+
+Chica, pero en las tres pasadas en la misma dirección y con los intervalos sin
+cruzarse. Por la regla 3, **el ensamblador entra primero en el despachador**
+cuando `asm_q4k` está encendida: el primer ensamblador del proyecto en el camino
+caliente, y entró midiendo, como cualquier otro kernel.
+
+**De punta a punta.** En la matmul del 3B sobre Q4_K, el fusionado con una fila
+—el caso del decode— queda **parejo con candle**, entre 0,81x y 1,09x en el mismo
+proceso, donde antes perdía entre 0,55x y 0,85x: eso es `vcvtph2ps` llegando al
+motor. En el 0,5B, generar con y sin el ensamblador da lo mismo, 28 tok/s, porque
+ahí casi ningún tensor pasa por este kernel: el ancho, 896, no es múltiplo de
+256, y solo `ffn_down` lo usa.
+
+**Una lección de medición.** La primera comparación de punta a punta daba el
+motor con ensamblador un 30% más lento. Era ruido, y con causa: con `cargo run`,
+cambiar de features dispara una recompilación justo antes de medir, y la corrida
+sale con el procesador caliente. Con los dos binarios compilados de antemano y
+alternados, ronda por ronda, salen parejos. El motor completo se mide así.
+
+**Una optimización que se probó antes de pedirla, y no servía.** El
+ensamblador acumula el desplazamiento en memoria, `acc[8..16]`, con una lectura
+y una escritura por bloque, porque no le queda un `ymm` libre sin tocar `xmm6`.
+Tenerlo en un registro pediría salvar `xmm6`, y en Windows eso obliga a declarar
+el prólogo con `.seh_savexmm` para el desenrollado. Antes de pedir ese cambio se
+probó lo inverso en los intrínsecos, que ya lo tienen en registro: una variante
+que lo lee y lo escribe en memoria en cada bloque, con accesos volátiles para que
+LLVM no lo devolviera a un registro —verificado en el ensamblador generado, 11
+movimientos con la pila contra 2—.
+
+| | 1 | 2 | 3 |
+|---|---:|---:|---:|
+| en registro | 77,3 | 81,0 | 76,0 |
+| en memoria | 78,7 | 78,7 | 77,5 |
+
+La diferencia cambia de signo entre pasadas y no pasa del 3%. **El procesador
+esconde la ida y vuelta**, porque la cadena del desplazamiento no depende de la
+del acumulador principal. Así que la forma del ensamblador era la correcta: no
+salvar `xmm6` le evita las directivas de desenrollado a cambio de nada que se
+pueda medir. Es la segunda vez que probar en Rust antes de pedir un cambio en el
+ensamblador evitó trabajo inútil; la primera fueron los acumuladores múltiples.
+
+**Lo que no se ejecutó todavía**: el de System V. Ensambla para ELF y Mach-O,
+pero se desarrolla en Windows. CI lo ejecuta ahora en `ubuntu-latest` con
+`asm_q4k` en la matriz; el de Mach-O x86-64 sigue solo ensamblado, porque
+`macos-latest` es ARM.
+
+### ARM: donde el ensamblador no es una opción sino el único camino
+
+En x86 el ensamblador le gana a los intrínsecos por un 4-8%, porque los dos
+usan las mismas instrucciones. En ARM64 la pregunta es otra, y se comprobó
+antes de escribir nada:
+
+- **Rust estable no expone `sdot`.** `vdotq_s32` da E0658, detrás de
+  `stdarch_neon_dotprod`. Lo que sí es estable es
+  `is_aarch64_feature_detected!("dotprod")`: se puede preguntar si está, pero
+  no usarla;
+- **Zig no la genera.** `cosxamix_dot_q4k_i8_f32` compilado con
+  `-mcpu=cortex_a76`, que la tiene, sale con 26 `smull`/`smlal` y ningún
+  `sdot`: LLVM no reconoce el patrón de ensanchar y multiplicar.
+
+`sdot` hace 16 productos de `i8` por instrucción, cuatro por carril de 32 bits,
+que es la forma exacta del producto de Q4_K. Hoy el camino vectorizado de ARM es
+el de Zig, que ensancha a `i32`. Así que el kernel NEON es la primera vez que un
+lenguaje del proyecto entra **por habilitar algo que los otros no pueden**, que
+es la segunda mitad de la regla 3.
+
+El andamio está puesto con el mismo contrato `completo`, en AAPCS64: un solo
+`kernels/q4k_neon.s` para Linux, Android y macOS, con `.arch_extension dotprod`
+para que el ensamblador acepte la instrucción, sin tocar `v8`–`v15` ni `x18`.
+`build.rs` lo detecta por la etiqueta, como a los de x86, y si falta avisa sin
+romper nada.
+
+**Lo que esta máquina no puede hacer es ejecutarlo**: es x86-64, sin WSL ni
+QEMU. Se verificó lo que sí se puede —clippy para `aarch64-unknown-linux-gnu`
+con el módulo, sus tests y el bench, con y sin Zig— y la ejecución queda en dos
+lugares: el job `arm` de CI, en un runner ARM64 nativo con `dotprod`, que
+prueba que **calcula bien**; y un teléfono con Termux, que es la plataforma
+objetivo y la única medición que decide si **entra al despachador**.
+
+### Las escalas sin ramas, y una regresión de 2x que salió de escribirlas mal
+
+Las 8 escalas y los 8 mínimos de 6 bits se rearman ahora con máscaras sobre
+tres palabras de 32 bits, sin ramas —la técnica de llama.cpp para estos mismos
+bloques—, en lugar de 8 llamadas a `escala_y_minimo` con su `if j < 4`. Un test
+lo compara **bit a bit** contra la versión legible sobre 5.000 bloques al azar.
+Aislado calcula las escalas un 23% más rápido; en los tres kernels **no se
+nota**, porque ese trabajo ya se superponía con el vectorial.
+
+Pero la primera versión **duplicó** el tiempo del kernel de intrínsecos, de 90 a
+178 ns, con un escalar de control que no se movió. El ensamblador generado
+mostró por qué: leía los 12 bytes con `bloque[4 + i]` uno por uno, y las doce
+comprobaciones de límites con sus caminos de pánico agrandaron la función lo
+suficiente para que LLVM **dejara de ponerla en línea**. Con una llamada por
+bloque y el resultado devuelto por memoria se perdió la superposición. Leyendo
+los 12 bytes como un solo arreglo de tamaño fijo —una comprobación— vuelve a
+quedar en línea y a 92 ns. La técnica estaba bien; la hundió cómo estaba
+escrita, que es el mismo tipo de error que el de §15.
+
+### Una hipótesis sobre el bucle que no se sostuvo
+
+Antes de cambiar el contrato se probó otra explicación de la lentitud. En cada
+par, los dos `vfmadd213ps` encadenan el acumulador: cada uno espera el
+resultado del anterior, unos 4 ciclos, así que hay un piso de 8 ciclos por par.
+Con varios acumuladores independientes las cadenas se solapan.
+
+Se probó en los intrínsecos, donde se puede tocar sin costo, antes de pedir
+tocarlo en el ensamblador:
+
+| | pasada 1 | pasada 2 |
+|---|---:|---:|
+| 1 acumulador | 94,1 ns | 104,8 ns |
+| 2 acumuladores | 90,5 ns | 104,5 ns |
+| 4 acumuladores | 92,1 ns | 95,8 ns |
+
+En cada pasada gana uno distinto, y las diferencias quedan dentro del ruido de
+la máquina. **La cadena no es el cuello**: cada par tiene suficiente trabajo
+independiente —cargas, `maddubs`, `madd`, conversiones— para que la CPU cubra
+la espera del FMA. Se borró por la regla 3, y de haberse pedido en el
+ensamblador sin probarlo, habría sido trabajo para nada.
+
+Por la regla 3 el despachador sigue eligiendo los intrínsecos, igual que con
+`dot_avx2_*.s`. La regla decide qué va primero en el camino caliente, no qué
+lenguajes tiene el proyecto: el ensamblador queda compilado con
+`asm_q4k`, con sus tests y en el bench.
+
+Para el armado del lado de Rust hubo que corregir dos cosas del andamio. El
+puente calculaba las escalas de a una, que es la forma lenta reemplazada por
+el 1,90x, y medido así el ensamblador habría parecido peor por culpa del
+envoltorio; ahora las calcula `x86::escalas_q4k`, compartida con los
+intrínsecos. Y el test armaba los encabezados de los bloques con bytes al
+azar, que con 17 bloques dieron un `f16` infinito: el kernel y la referencia
+daban NaN los dos, y como NaN no es igual a NaN el test fallaba aunque
+coincidieran.
+
 #### Un detalle chico a favor del escrito a mano
 
 LLVM usó `ymm6` y `ymm7` en `dot_avx2` y pagó por eso un prólogo y un epílogo
@@ -561,7 +888,7 @@ La regla 3 borra lo que no rinde, no lo que se aprendió haciéndolo.
 
 ---
 
-## 11. El kernel fusionado propio: no se escribió porque ya existe
+## 11. El kernel fusionado propio: se escribió, y había que escribirlo
 
 Se propuso escribir un `fused_dequant_gemv` para Q3_K, partiendo de que la ruta
 convencional descuantiza a f32 y después multiplica.
@@ -572,6 +899,197 @@ desempaqueta los bloques directo a registros y acumula con FMA.
 
 Competir contra eso tiene muy poca chance. Por la regla 3 se borraría igual,
 solo que después de días de trabajo.
+
+### Revertido, y por una medición
+
+Eso era un pronóstico, no un número, y el número dice otra cosa. Se escribió:
+`kernels::dot_q4k_i8`, con referencia escalar y versión AVX2, y
+`ops::matmul_i8_fusionado`.
+
+Sobre el `ffn_gate` del 3B en Q4_K, 2048 → 11008, todo en el mismo proceso:
+
+| filas | candle | i8 directo | **fusionado** | fusionado vs candle |
+|---:|---:|---:|---:|---:|
+| 1 | 0,912 ms | 1,426 | **1,079** | 0,85x |
+| 2 | 1,574 | 1,500 | **1,224** | **1,29x** |
+| 5 | 4,037 | 2,734 | **2,179** | **1,85x** |
+| 8 | 6,279 | 3,937 | **3,252** | **1,93x** |
+
+En tres pasadas, el fusionado le gana al camino con buffer entre **1,16x y
+1,44x** en todas las filas, y contra candle va de 0,82-0,92x con una fila a
+1,93-2,39x con ocho. El caso de una fila, que estaba en 0,55x, queda en 0,85x:
+candle sigue adelante pero por un 15%, no por el 80%.
+
+Exactitud sin cambios: 0,26% de diferencia contra candle, a nuestro favor.
+
+**Lo que el pronóstico no vio.** Dos cosas, y ninguna es "esforzarse más":
+
+- **Q4_K no necesita el rodeo del signo.** Sus nibbles son enteros **sin
+  signo**, 0 a 15, y la entrada cuantizada es con signo: eso es literalmente
+  la firma de `vpmaddubsw`, `u8 × i8 → i16`. El kernel de `dot_i8_escalado` usa
+  `vpsignb` para fabricar esa combinación a partir de dos operandos con signo,
+  y acá no hay nada que fabricar. Se va también su único caso límite, el del
+  −128 en los dos lados a la vez. Y no puede saturar: 15 × 127 = 1905, dos de
+  esos son 3810, contra 32.767 que entran en un `i16` — 8,6 veces de margen.
+- **Una fila en Q4_K son 1152 bytes.** Cabe de sobra en L1, así que las `m`
+  filas de salida la reusan desde ahí. El camino con buffer tocaba `k` bytes
+  de `i8` más sus escalas por cada columna.
+
+Lo que el pronóstico **sí** acertó: competir con candle a una fila es duro, y
+ahí sigue adelante. Pero perder por un 15% mientras se gana 1,9x en lote no es
+lo mismo que no haberlo escrito.
+
+### Q3_K también, y con el rodeo que le corresponde
+
+Q3_K es el formato dominante del modelo por defecto, así que era el siguiente.
+Sus valores van de **−4 a 3**, con signo, y `vpmaddubsw` quiere un operando sin
+signo. El rodeo es sumarles 4 —con lo que quedan en 0 a 7— y descontarlo
+después:
+
+```text
+    Σ x·q  =  Σ x·(q + 4)  −  4·Σx
+```
+
+y `Σx` por sub-bloque es exactamente `xs`, que el multiplicador ya calcula una
+vez por fila. La corrección sale gratis. Su sub-bloque es de 16, que se
+resuelve con el reparto de carriles ya usado en §15.
+
+### Y acá apareció lo que el fusionado no puede: el lote
+
+| filas | Q4_K con buffer | Q4_K fusionado | Q4_K `f32` | Q3_K con buffer | Q3_K fusionado |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1,412 | **1,123** | 1,316 | 1,347 | **1,147** |
+| 2 | 1,712 | **1,350** | 1,774 | **1,547** | 1,742 |
+| 4 | 2,381 | **1,998** | 2,052 | **1,915** | 3,028 |
+| 8 | 4,125 | 3,189 | **2,929** | **2,955** | 5,776 |
+| 16 | 7,409 | 6,507 | **4,757** | **4,646** | 10,926 |
+| 32 | 13,905 | 12,558 | **9,611** | **9,052** | 22,941 |
+
+**El fusionado desempaqueta una vez por fila de salida; el camino con buffer,
+una vez por columna.** Con una fila no hay nada que amortizar y el fusionado
+gana; al crecer el lote paga `m` desempaquetados contra uno. Q3_K cruza antes
+que Q4_K porque su desempaquetado cuesta mucho más —máscara de bits y
+rearmado de 16 escalas de 6 bits por bloque, contra enmascarar nibbles—, y con
+32 filas llega a ser **2,5x peor**.
+
+Y aparece un tercero que no estaba en el plan: **con lote grande en Q4_K gana
+el camino de `f32`**, porque la multiplicación deja de estar limitada por el
+desempaquetado y los productos en `f32` tienen FMA de 8 carriles sin
+recuantizar nada.
+
+O sea que ninguno de los tres gana siempre. El punto del ROADMAP que decía
+"hoy hay que elegir a mano, debería elegirlo el motor" queda cerrado con
+`ops::matmul_auto`, que despacha por formato y por número de filas. Los
+umbrales son **un valor por defecto medido en un tensor y esta máquina**, no
+una ley; en otro hardware el cruce se mueve y la forma de saberlo es correr
+`measure_own_matmul`.
+
+### Leer el ensamblador que genera el compilador dio 1,90x
+
+Esto llegó por el camino menos esperado. La pregunta era si los `.s` del
+proyecto se estaban quedando atrás; la respuesta resultó ser que sí, pero lo
+útil no fue escribir ensamblador sino **leerlo**.
+
+Volcando lo que LLVM genera para `dot_q4k_i8_avx2`:
+
+```
+40 vmulss    16 vcvtsi2ss    8 vsubss        <- escalar
+ 8 vpmaddubsw  8 vpmaddwd  8 vfmadd213ps     <- vectorial
+```
+
+**Más instrucciones escalares que vectoriales** en el bucle caliente. Son las
+escalas: ocho sub-bloques por bloque, cada uno con dos conversiones de entero
+a flotante y cinco multiplicaciones, todo de a uno. Eso no se ve leyendo el
+código, que parece razonable; se ve leyendo la salida del compilador.
+
+Un intento previo las había **adelantado** fuera del bucle vectorial y no
+cambió nada —188,9 ns contra 186,2, dentro del ruido—, y ahí se cerró mal la
+pregunta: adelantarlas las mueve, no las quita. Lo que faltaba era
+**calcularlas las ocho juntas**, y se puede porque `xe[bl*8 + j]` con `j` de 0
+a 7 es contiguo, igual que `xs`:
+
+| | tiempo |
+|---|---:|
+| escalar | 698 ns |
+| AVX2, escalas de a una | 175,3 ns |
+| **AVX2, escalas de a ocho** | **92,2 ns** |
+
+**1,90x**, y sin tocar una sola instrucción del producto punto. `cvtepu8_epi32`
+más `cvtepi32_ps` convierten ocho bytes en dos instrucciones donde había
+dieciséis.
+
+A Q3_K le tocó lo mismo y algo peor que arreglar: además de calcular las
+escalas de a dos, armaba el vector de ocho con `_mm256_setr_ps` de valores
+sueltos, que son ocho inserciones por grupo y ocho grupos por bloque. Ahora
+sale de **una carga y una permutación** —`permutevar8x32_ps` con el patrón
+`[0 0 0 0 1 1 1 1]`, que reparte dos escalas en las dos mitades de los
+carriles, que es exactamente la forma que el reparto de AVX2 pide—. Queda en
+156 ns contra 2.297 del escalar.
+
+### Lo que eso le hizo a la tabla de despacho
+
+La rehizo entera, y conviene decirlo porque es el riesgo de escribir umbrales
+medidos:
+
+| filas | Q4_K antes | Q4_K ahora | Q3_K antes | Q3_K ahora |
+|---:|---|---|---|---|
+| 1 a 2 | fusionado | **fusionado** | fusionado (solo 1) | **fusionado** |
+| 4 | reñido | **fusionado** | con buffer | **fusionado** |
+| 8 y más | `f32` | **fusionado** | con buffer | con buffer |
+
+En Q4_K el fusionado pasó a ganar en **todo el rango medido**, de 1 a 32
+filas, y el camino de `f32` dejó de tener un hueco donde ganara. Q3_K sigue
+cruzando en 8 porque su desempaquetado cuesta bastante más.
+
+Los tres umbrales anteriores eran correctos **para el kernel de entonces**.
+Un umbral medido hay que volver a medirlo cuando cambia lo que mide.
+
+Y en el forward entero, sobre el 0,5B en Q4_K: prefill **72 ms contra 149 de
+candle, 2,07x**, y la generación voraz sale idéntica en los 24 tokens sobre el
+modelo cuantizado, donde antes divergía en el 13. Eso último **no es una
+mejora de precisión** y no hay que leerlo así: la diferencia de logits sigue
+siendo del mismo orden, 1,67% contra 1,88%. Lo que cambió es de qué lado
+cayeron los empates cercanos.
+
+### Y en ARM lo hace Zig, porque si no no lo hace nadie
+
+El kernel fusionado se escribió en intrínsecos de AVX2, que **no existen fuera
+de x86-64**. En ARM y en Termux —objetivo declarado del proyecto— el
+despachador caía a la referencia escalar: byte a byte, en el bucle más
+caliente del motor. Era un agujero abierto por las dos tandas anteriores, y lo
+tapa `cosxamix_dot_q4k_i8_f32` en `kernels/dot.zig`.
+
+| camino | tiempo | contra escalar |
+|---|---:|---:|
+| escalar | 683 ns | 1,00x |
+| **Zig** | **303 ns** | **2,25x** |
+| AVX2 | 179 ns | 3,81x |
+
+Zig pierde contra AVX2 y eso es esperado: no reproduce el truco de
+`vpmaddubsw`, que suma pares de productos de 8 bits dentro de un registro de
+16 y es lo que le da a AVX2 sus 32 carriles; Zig ensancha a `i32` y
+multiplica, que con NEON de 128 bits son 8. Por eso el despachador sigue
+eligiendo AVX2 primero en x86-64.
+
+Pero **en ARM la elección no es Zig contra AVX2, es Zig contra el escalar**, y
+ahí son 2,25x. Entra por el segundo brazo de la regla 3.
+
+A cambio de la pérdida de ancho gana en otra cosa: `@Vector` deja que LLVM
+elija la instrucción de cada arquitectura, así que en ARMv8.2 con `dotprod`
+puede salir `sdot` —el producto punto de cuatro `i8` en un `i32`— y si el
+objetivo no lo tiene sale la versión con `smull` y sigue andando. Verificado
+que cruza: el objeto de `aarch64-unknown-linux-gnu` contiene el símbolo y
+`clippy` para ese target pasa limpio.
+
+Hay un test aparte para el camino de Zig, y hace falta: en x86-64 el
+despachador elige AVX2 y nunca lo llamaría, así que sin ese test el único
+camino que tiene ARM se quedaría sin probar en la máquina donde se desarrolla.
+
+**Los cinco formatos que faltan** caen a `matmul_i8_directo`, que los cubre.
+Cada uno resta algo distinto —32 en Q6_K, 16 en Q5_0, un mínimo por sub-bloque
+en Q2_K y Q5_K— así que cada uno pide su propio rodeo, y cada uno tiene que
+justificarse midiendo. Visto el cruce de arriba, varios puede que no lleguen a
+justificarse nunca.
 
 ### Un detalle con consecuencias
 
@@ -619,6 +1137,132 @@ Cuánto pesa el vocabulario, medido:
 |---|---:|---:|---:|
 | 0,5B | 19,3% | 29,8% | **49,1%** |
 | 3B | 7,8% | 14,9% | **22,6%** |
+
+### Medido, y no se aplazó por lo que yo creía
+
+El aplazamiento de arriba era un argumento, no un número, así que se midió.
+`examples/measure_rank.rs` estima la fracción de energía de Frobenius que
+captura la mejor aproximación de rango `k`, con un buscador de rango
+aleatorizado e iteraciones de potencia —el método de Halko, Martinsson y
+Tropp—, que da una cota **por debajo**: si dice que hay estructura, la hay.
+
+La comparación es controlada: el mismo tensor y la misma forma en un modelo
+entrenado (Qwen2.5-0.5B) y en uno recién inicializado (daiss-0.5b).
+
+`output.weight`, 151.936 × 896, rango máximo 896:
+
+| k | k/máx | Qwen entrenado | daiss aleatorio | ventaja |
+|---:|---:|---:|---:|---:|
+| 8 | 0,9% | **20,3%** | 0,9% | **22,1x** |
+| 32 | 3,6% | 23,5% | 3,7% | 6,41x |
+| 128 | 14,3% | 34,3% | 14,6% | 2,34x |
+| 256 | 28,6% | 47,5% | 29,2% | 1,63x |
+
+Y `blk.0.ffn_gate.weight`, 4864 × 896: 10,9% con k=8 contra 1,4%, o sea 7,58x,
+bajando a 1,37x con k=256.
+
+**Tres conclusiones, y una es contra mí.**
+
+**Uno: sobre daiss no sirve, y ahora está probado.** La matriz aleatoria
+captura exactamente `k / rango_máximo` —0,9% con k=8, 29,2% con k=256— que es
+lo que la teoría predice para rango completo. Cero estructura. Toda
+descomposición de rango bajo apuesta a que el entrenamiento concentró la
+información en pocas direcciones, y en un peso recién inicializado no hay nada
+concentrado. Que el estimador reproduzca la predicción teórica al décimo de
+punto en todo el rango es además lo que valida el estimador.
+
+**Dos: la excepción que §12 ya había aislado es la correcta, y ahora se sabe
+por qué.** `output.weight` tiene la señal más fuerte con `k` chico, 22,1x
+contra 7,58x del FFN: hay unas ocho direcciones que cargan el 20% de la
+energía. Ese es el sitio donde una descomposición de rango bajo pagaría.
+
+**Tres, y esto contradice a los papers que se citan a favor:** las cifras de
+50-70% de reducción de parámetros con más del 98% de precisión **no se ven
+acá**. Para llegar al 47,5% de la energía de `output.weight` hace falta el
+28,6% del rango; recortar el 50-70% de los parámetros tiraría la mayor parte
+de la matriz.
+
+La salvedad, que es real y hay que decirla: **energía de Frobenius no es
+precisión.** Puede que las direcciones descartadas importen funcionalmente
+menos de lo que pesan, y los papers miden la precisión después de curar el
+modelo con reentrenamiento. Así que esto no refuta sus cifras: muestra que
+cualquier compresión de ese tamaño se apoya en una de esas dos cosas, y
+ninguna de las dos es gratis. Que es exactamente lo que los 50-70% no dicen.
+
+### El control que hubo que hacer antes de creerse nada
+
+Los pesos de Qwen vienen cuantizados, y el error de cuantización es de rango
+completo por naturaleza, así que infla el rango aparente. Si fuera el que
+manda, la medición no diría nada sobre la matriz de verdad.
+
+El mismo tensor del 3B a tres niveles de ruido, `blk.0.ffn_gate.weight`:
+
+| k | Q2_K | Q3_K_M | Q4_K_M |
+|---:|---:|---:|---:|
+| 8 | 4,1% | 4,3% | 4,4% |
+| 32 | 8,6% | 9,0% | 9,2% |
+| 128 | 21,7% | 22,7% | 22,9% |
+
+Entre Q2_K, que son unos 2,6 bits por valor, y Q4_K_M hay **entre 0,3 y 1,2
+puntos**. El ruido no explica nada y lo medido es la matriz.
+
+---
+
+## 18. `mmap`: 1,25x en la carga, y el 1,22x era gratis
+
+`Gguf::datos_de` abría el archivo **de nuevo por cada tensor** y copiaba sus
+bytes a un `Vec`. En el daiss-7b son 339 aperturas y 7,5 GB al montículo.
+
+Había dos arreglos y había que saber cuánto aporta cada uno antes de sumar una
+dependencia por el segundo. `examples/measure_mmap.rs`, sobre el 3B en Q4_K,
+1,95 GB en 435 tensores, con el archivo ya en la caché del sistema:
+
+| camino | ms | GB/s | vs hoy |
+|---|---:|---:|---:|
+| reabriendo (hoy) | 2352 | 0,83 | 1,00x |
+| un solo descriptor | 1924 | 1,02 | **1,22x** |
+| mapeado, sin copias | 1820 | 1,07 | **1,29x** |
+
+Estable entre corridas: 1,21x, 1,28x y 1,29x en tres.
+
+**El 1,22x no cuesta nada**: es dejar de reabrir el archivo. Lo que compra
+`memmap2` encima es un 4-5% de tiempo y **1,95 GB de montículo que no se
+reservan** —7,5 GB en el daiss-7b—, y en una máquina donde el daiss-7b no
+entra en RAM eso es el argumento, no el 5%.
+
+### Y una afirmación mía que no sobrevivió
+
+Al conectar el mapeo a los dos ejemplos del camino caliente, sus cifras
+empeoraron —el desempaquetado de Q4_K de 2,36 a 3,25 ms— y lo atribuí a que
+releer el mismo tensor miles de veces paga recorrer 3.072 páginas por vuelta,
+cosa que un `Vec` residente no hace. Suena bien y es falso: estaba comparando
+**entre procesos distintos**, que es justo lo que §15 prohíbe porque en esta
+máquina el trabajo que recorre memoria varía hasta 1,8x entre corridas.
+
+Medido en el mismo proceso, mapeado contra copiado sobre el mismo tensor de
+12,1 MB con 21 pasadas: **1,17x, 0,93x y 1,04x** en tres corridas. O sea
+ninguna diferencia. La copia que había agregado para arreglar el problema no
+arreglaba nada porque no había problema, y se quitó.
+
+La conclusión de diseño queda más simple de lo que yo había complicado: se
+mapea y se usa la porción tal cual, en los dos regímenes.
+
+Y habilita algo que el tiempo no muestra: `Pesos::de` devuelve una porción que
+apunta al archivo, y `descuantizar`, `desempaquetar_i8` y las dos `matmul` ya
+reciben `&[u8]`. El camino del disco al producto punto queda **sin una sola
+copia**.
+
+Lo que esto NO arregla: la primera lectura. El disco hace 41 MB/s (§17) y la
+pagan los tres caminos igual.
+
+### El test encontró el bug en el acto
+
+`Pesos` es `unsafe`, y una porción fuera de rango sobre un mapeo no devuelve
+`Err`: da una violación de acceso que mata el proceso. El test que prueba un
+offset absurdo falló en la primera corrida — `inicio_datos + offset` se
+desbordaba **antes** de llegar a la comprobación de límites, y en release eso
+da un índice envuelto que apunta a cualquier parte del mapeo. Las tres cuentas
+van comprobadas ahora.
 
 ---
 
@@ -835,6 +1479,209 @@ ejecuciones distintas no se usan para decidir.
 
 ---
 
+## 16. daiss: qué es nuestro, qué no, y por qué dice `qwen2`
+
+**daiss** es la familia de modelos propia: cinco tamaños de 0,08 a 14,77 mil
+millones de parámetros, definidos en `src/daiss.rs`, inicializados y escritos
+como GGUF por `src/gguf_write.rs`.
+
+Conviene separar las tres cosas sin adornos, porque la diferencia importa y
+confundirlas sería venderse humo a uno mismo.
+
+**Nuestro**: los tamaños, la inicialización, el generador con semilla, el
+cuantizador, el escritor de GGUF, y —cuando se entrene— los pesos, que son el
+modelo.
+
+**No nuestro**: la forma del bloque. daiss es un decoder con RMSNorm, atención
+agrupada, SwiGLU y RoPE, que es la misma forma que usan Llama, Qwen y Mistral
+desde 2023. Inventar una forma distinta sin tener con qué entrenarla sería
+inventar un problema, no resolver uno.
+
+**Prestado a propósito**: el vocabulario, 151.936 piezas de Qwen2.5. Un
+tokenizador propio es el punto 3 del ROADMAP §8 y no está escrito; hasta que
+lo esté, reusar uno que funciona permite evaluar el modelo en vez de
+esperarlo.
+
+### Por qué `general.architecture` dice `qwen2` y no `daiss`
+
+Porque esa clave no nombra a un modelo sino a una **forma de bloque**, y es la
+que daiss tiene. Poner `daiss` ahí haría que ningún runtime del mundo lo
+cargara —ni el nuestro, que lee esa clave en `model/qwen2.rs`— a cambio de
+nada. El nombre va en `general.name`, que es donde se mira.
+
+### La verificación
+
+Que nuestro lector lea lo que nuestro escritor escribe no prueba casi nada:
+los dos podrían estar equivocados igual. La prueba es **candle**, que no
+comparte una línea con el escritor. Sobre el daiss-7b recién creado:
+
+- 339 tensores y 17 metadatos, los mismos que contamos nosotros;
+- `output.weight` descuantizado, 544.538.624 valores, **cero diferencias**;
+- los 339 tensores que el cargador pide, presentes y con su forma.
+
+El modelo entero no se construye acá y no por culpa del archivo: cargarlo pide
+7,5 GB y la máquina tiene 7,3 libres. Con el daiss-mini, que sí entra, candle
+lo construye entero.
+
+### Un hallazgo de la familia: el 0.5b no admite k-quants
+
+`daiss-0.5b` tiene `dim` 896, que son 3,5 bloques de 256, y los k-quants piden
+filas de 256 exactas. No es un descuido de la tabla: es exactamente la razón
+por la que los GGUF de Qwen2.5-0.5B que circulan **mezclan formatos**, con la
+atención en Q8_0 o Q5_0 y solo el FFN en k-quant. Hay un test que afirma que
+el 0.5b es el único de la familia así, para que se entere si algún día cambia.
+
+### Lo que este módulo no hace
+
+No entrena. Un daiss recién escrito genera ruido. Lo que da es que el camino
+completo exista y esté verificado, que es la condición previa de cualquier
+entrenamiento.
+
+---
+
+## 17. El disco de esta máquina hace 41 MB/s, y eso cambia cuentas
+
+Escribir el daiss-mini daba 24 MB/s. Se paralelizó la generación por tandas
+acotadas y subió a 34. Se agruparon las filas para amortizar las reservas de
+memoria y las escrituras —316.000 de cada una solo en el `token_embd`— y
+subió a **35**.
+
+Las dos hipótesis apuntaban al código. Las dos eran falsas, y la segunda no
+movió la aguja un 3%. Lo que faltaba era medir el disco:
+
+| unidad | escritura secuencial |
+|---|---:|
+| **F:**, donde vive el proyecto | **41 MB/s** |
+| C:, el del sistema | 165 MB/s |
+
+Estábamos al **85% del techo físico** de F:. El generador nunca fue el cuello
+de botella. Escribiendo el mismo modelo en C: da **324 MB/s**, así que el
+código puede dar al menos nueve veces lo que ese disco acepta.
+
+La paralelización se queda igual, y por la regla 3: a 24 MB/s estaba por
+debajo del techo del disco y ahora choca contra él, y en una unidad normal da
+324. No se queda "por si acaso" — se queda porque se midió que gana.
+
+Lo que esto cambia más allá de daiss: **cargar un modelo en frío desde F: es
+disco y nada más.** El 3B en Q4_K son 12,1 GB, o sea unos 5 minutos de lectura
+en frío si no está en la caché del sistema operativo. Cualquier medición de
+arranque hecha sobre este disco está midiendo el disco.
+
+---
+
+## 19. El tokenizador propio: 3,4% más tokens por un modelo 9 veces más chico
+
+Era el punto que bloqueaba los tamaños chicos de daiss, y la pregunta se podía
+contestar con un número antes de decidir nada: **¿cuánto peor comprime un
+vocabulario de 8.192 que uno de 151.936?**
+
+`src/tokenizer.rs` es un BPE **a nivel de bytes**, con entrenamiento propio.
+`examples/train_tokenizer.rs` lo entrena con los documentos del proyecto y los
+comentarios de su código —382 KB de español técnico— y mide sobre el **20%
+final, que el entrenamiento no vio**. Sin esa separación el número sería
+mentira: un BPE medido sobre su propio corpus comprime de maravilla y no
+generaliza nada.
+
+| vocabulario | fusiones | tokens | bytes/token | entrenar |
+|---:|---:|---:|---:|---:|
+| 256 (solo bytes) | 0 | 78.256 | 1,00 | — |
+| 1.024 | 768 | 32.190 | 2,43 | 0,9 s |
+| 4.096 | 3.840 | 24.843 | 3,15 | 3,5 s |
+| **8.192** | 7.185 | **23.433** | **3,34** | 5,6 s |
+| **Qwen2.5, 151.936** | — | **22.659** | **3,45** | — |
+
+**El nuestro de 8.192 necesita un 3,4% más de tokens que el de Qwen**, con un
+vocabulario 18 veces más chico. Y lo que eso compra, en daiss-mini —256 de
+ancho, 6 capas—:
+
+| vocabulario | parámetros | % en tablas de vocabulario | Q8_0 |
+|---:|---:|---:|---:|
+| 1.024 | 5,2 M | 10% | 5 MB |
+| **8.192** | **8,9 M** | **47%** | 9 MB |
+| 32.768 | 21,5 M | 78% | 22 MB |
+| 151.936 | 82,5 M | **94%** | 84 MB |
+
+Con el vocabulario de Qwen, un daiss chico es **94% tabla de búsqueda**: el
+transformer sería el 6% de los parámetros y el resto, memoria de palabras. Con
+8.192 pasa a 47% y el modelo es **9,3 veces más chico**. El canje es a favor
+por un margen que no deja lugar a discusión.
+
+### Las dos salvedades, que son reales
+
+**El entrenamiento se saturó en 7.185 fusiones.** Los objetivos de 16.384 y
+32.768 dieron exactamente lo mismo que el de 8.192, porque en 306 KB no queda
+ningún par que aparezca dos veces. Eso es lo correcto —llenar el vocabulario
+con rarezas de un solo uso sería gastarlo— pero significa que el 3,4% está
+medido con unos 7.441 tokens efectivos y que **no se sabe qué pasa con un
+vocabulario grande bien lleno**. Para eso hace falta un corpus de gigabytes.
+
+**El texto de prueba es del mismo dominio que el de entrenamiento.** Parte de
+ese 3,4% es especialización y no eficiencia: nuestro tokenizador conoce
+"descuantizar" y "sub-bloque" porque los vio, y el de Qwen los parte. Sobre
+texto general la comparación le iría peor, y el límite ahí sería el **corpus**
+y no el tamaño del vocabulario. La forma de la curva es creíble; el número
+exacto no se extrapola.
+
+### Decisiones de diseño, y por qué
+
+**A nivel de bytes, con los 256 bytes como base.** Así no existe un token
+desconocido y no hace falta un `<unk>`: cualquier secuencia se representa
+siempre. Para un bot de WhatsApp eso no es teoría — un emoji nuevo o un byte
+roto en un mensaje no puede tirar nada. Hay un test que lo afirma sobre bytes
+al azar, incluidos los que no son UTF-8 válido.
+
+**Codificar aplica siempre la fusión de menor rango primero.** No es un
+detalle de implementación: es lo que hace que el resultado sea determinista y
+coincida con lo que el entrenamiento aprendió. Fundiendo de izquierda a
+derecha, el mismo texto daría tokens distintos según dónde empezara.
+
+**El entrenamiento desempata por el par más chico.** `HashMap` no tiene orden,
+así que entre dos pares igual de frecuentes el elegido dependería de la semilla
+de la tabla y el tokenizador cambiaría en cada corrida. Hay un test que entrena
+dos veces y compara.
+
+**El formato guardado son solo las fusiones.** Los 256 bytes son implícitos y
+la pieza de cada token se reconstruye desde su par, con el rango igual a su
+posición: 8 bytes por fusión, y el de 8.192 pesa **57 KB**. Al cargar se
+comprueba que cada fusión se apoye en tokens anteriores, que es lo que
+convierte un archivo corrupto en un error con nombre en vez de un pánico por
+índice.
+
+### El círculo cerrado, y medido
+
+Un tokenizador que no usa nadie es un adorno, así que daiss lo incrusta:
+`daiss::escribir_con` acepta un `Bpe`, y cuando se le pasa uno **el
+vocabulario del tokenizador manda sobre el de la configuración** — un modelo
+cuya tabla de embeddings no coincide con su tokenizador está roto, y en
+silencio, así que no se deja que las dos cifras puedan discrepar.
+
+Medido de punta a punta, daiss-mini con nuestro vocabulario de 7.441 tokens:
+
+| | vocabulario | archivo |
+|---|---:|---:|
+| prestado de Qwen2.5 | 151.936 | **84 MB** |
+| propio | 7.441 | **9 MB** |
+
+Nueve veces más chico, el tokenizador viaja dentro del archivo y el que sale
+codifica igual que el que entró, y candle sigue construyendo el modelo entero
+con cero diferencias sobre los pesos.
+
+Las fusiones van bajo `cosxamix.tokenizer.*` y **no** bajo `tokenizer.ggml.*`,
+que es la convención de ggml. Es a propósito: esa convención guarda las piezas
+como cadenas y las nuestras son secuencias de bytes, que para representarse
+como texto necesitan la tabla de byte-a-unicode de GPT-2. Esa tabla no está
+escrita ni verificada, y poner las fusiones bajo la clave estándar sin ella
+haría que otro runtime leyera un vocabulario equivocado **creyendo que lo
+entiende**. Con nuestra clave, un runtime ajeno la ignora y lo dice.
+
+**La pre-tokenización es más simple que la de GPT-2** —espacio pegado a la
+palabra siguiente, corridas de letras, corridas de dígitos, y todo lo demás de
+a un carácter— y lo que se pierde está dicho: en inglés, las contracciones con
+apóstrofo dan tres piezas en vez de dos. En español no hay y la diferencia no
+aparece.
+
+------
+
 ## Cifras que hubo que corregir
 
 Se listan porque una cifra mal medida dirige el trabajo hacia el lado
@@ -852,6 +1699,12 @@ equivocado, y todas estas lo hicieron un rato.
 | la matmul propia le gana 2,10x a candle a 8 filas | **1,19x a 1,30x** sobre Q4_K, 1,05x a 1,12x sobre Q3_K | la cifra salió de una pasada cuya columna de candle marcó 7,717 ms donde el mismo código sin tocar marca hoy 2,5 a 4,3; no es reproducible y la causa no quedó establecida (§15) |
 | el camino de enteros le gana siempre al de `f32` | **depende del formato**: en Q3_K gana el de enteros, en Q4_K gana `f32` desde 2 filas | quitar la comprobación de límites le aprovechó más al de `f32` (§15) |
 | el sub-bloque de 16 encarece el kernel | lo **abarata**: 1,07 contra 1,52 ms | era una conjetura sobre el coste de `setr_ps`, nunca medida (§15) |
+| escribir modelos es lento por el generador | es **el disco**: F: hace 41 MB/s y escribíamos a 35 | dos hipótesis seguidas sobre el código, ninguna medida; el disco no se midió hasta el final (§17) |
+| el mapeo pierde 1,4x al releer el mismo tensor | **no hay diferencia**: 1,17x, 0,93x, 1,04x | se comparó entre procesos distintos, que es lo que §15 prohíbe (§18) |
+| escribir el kernel fusionado no vale la pena porque candle ya lo tiene | **1,16x a 1,44x** sobre nuestro camino, y el caso de una fila de 0,55x a 0,85x contra candle | era un pronóstico y no una medición; Q4_K no necesita el rodeo del signo, que es lo que el pronóstico no vio (§11) |
+| el microkernel con bloqueo de registros es la primera oportunidad del ensamblador | **es 20% más lento**, y por el patrón de acceso, no por los registros | se escribió y se midió: 12 de 16 registros, cero volcados, y cuatro flujos entrelazados donde antes había uno contiguo (§5) |
+| adelantar el cálculo de las escalas fuera del bucle no sirve, LLVM ya lo hace | cierto, pero la conclusión era otra: **vectorizarlo da 1,90x** | adelantar las mueve, no las quita; se midió lo primero y se dio por cerrado lo segundo sin probarlo (§11) |
+| los umbrales de `matmul_auto` | **los tres cambiaron** al duplicarse la velocidad del kernel | eran correctos para el kernel de entonces; un umbral medido hay que volver a medirlo cuando cambia lo que mide (§11) |
 
 ---
 

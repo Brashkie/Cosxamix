@@ -108,6 +108,125 @@ pub fn dot_i8_escalado(a: &[i8], b: &[i8], esc_a: &[f32], esc_b: &[f32], bloque:
     total
 }
 
+/// Producto punto de una fila en **Q4_K** contra una entrada ya cuantizada a
+/// `i8`, **sin materializar los pesos**.
+///
+/// Es la referencia del kernel fusionado. El camino de hoy desempaqueta la
+/// fila entera a un buffer y después multiplica; medido, ese desempaquetado es
+/// el 94% del trabajo de un hilo. Fusionar quita el buffer: cada sub-bloque se
+/// desempaqueta y se consume en el acto.
+///
+/// La aritmética que hay que reproducir exactamente es la de
+/// `ops::matmul_i8_directo`:
+///
+/// ```text
+///     total = Σ_b  xe[b] · ( d·sc_b · Σ_i xq_i·q_i  +  (-dmin·m_b) · xs[b] )
+/// ```
+///
+/// donde `xs[b]` es la suma de los `xq` del sub-bloque `b`. El desplazamiento
+/// sale afuera del producto punto porque `Σ x·(s·q + o)` es
+/// `s·Σ(x·q) + o·Σx`, y la suma de la entrada se calcula una vez por fila.
+///
+/// `bloques` son los 144 bytes por cada 256 valores; `xq`, `xe` y `xs` cubren
+/// la fila entera, con un sub-bloque de 32.
+pub fn dot_q4k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
+    debug_assert!(xq.len().is_multiple_of(256));
+    debug_assert_eq!(xe.len(), xq.len() / 32);
+    debug_assert_eq!(xs.len(), xe.len());
+
+    let mut total = 0f32;
+    for bl in 0..xq.len() / 256 {
+        let o = bl * 144;
+        let d = crate::quant::leer_f16(bloques, o);
+        let dmin = crate::quant::leer_f16(bloques, o + 2);
+        let esc = &bloques[o + 4..o + 16];
+        let qs = &bloques[o + 16..o + 144];
+
+        for par in 0..4 {
+            let base = par * 32;
+            for mitad in 0..2 {
+                let j = par * 2 + mitad;
+                let (sc, mn) = crate::quant::escala_y_minimo(j, esc);
+                let sub = bl * 8 + j;
+                let x = &xq[bl * 256 + par * 64 + mitad * 32..][..32];
+
+                let mut entero = 0i32;
+                for (i, v) in x.iter().enumerate() {
+                    // Los nibbles bajos son el sub-bloque par y los altos el
+                    // impar, que es como lo guarda el formato.
+                    let q = if mitad == 0 {
+                        qs[base + i] & 0x0F
+                    } else {
+                        qs[base + i] >> 4
+                    };
+                    entero += *v as i32 * q as i32;
+                }
+
+                total += xe[sub] * (d * sc as f32 * entero as f32 - dmin * mn as f32 * xs[sub]);
+            }
+        }
+    }
+    total
+}
+
+/// Producto punto de una fila en **Q3_K** contra una entrada en `i8`, sin
+/// materializar los pesos. Referencia del kernel fusionado.
+///
+/// Q3_K necesita un rodeo que Q4_K no: sus valores van de **−4 a 3**, con
+/// signo, y `vpmaddubsw` quiere un operando sin signo. El rodeo es sumarles 4
+/// —con lo que quedan en 0 a 7— y descontarlo después, porque
+///
+/// ```text
+///     Σ x·q  =  Σ x·(q + 4)  −  4·Σx
+/// ```
+///
+/// y `Σx` por sub-bloque es exactamente `xs`, que el multiplicador ya calcula
+/// una vez por fila para el término del desplazamiento. O sea que la
+/// corrección sale gratis.
+///
+/// El sub-bloque de Q3_K es de **16** y no de 32, así que hay dos escalas por
+/// cada 32 valores.
+pub fn dot_q3k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
+    debug_assert!(xq.len().is_multiple_of(256));
+    debug_assert_eq!(xe.len(), xq.len() / 16);
+    debug_assert_eq!(xs.len(), xe.len());
+
+    let mut total = 0f32;
+    for bl in 0..xq.len() / 256 {
+        let o = bl * 110;
+        let hmask = &bloques[o..o + 32];
+        let qs = &bloques[o + 32..o + 96];
+        let d = crate::quant::leer_f16(bloques, o + 108);
+        let esc = crate::quant::escalas_q3k(bloques, o);
+
+        // Ocho grupos de 32 valores. En cada uno cambian el corrimiento de los
+        // dos bits bajos y el bit de `hmask` que aporta el tercero.
+        for g in 0..8 {
+            let qsg = &qs[(g / 4) * 32..][..32];
+            let corrimiento = 2 * (g % 4);
+            let m = 1u8 << g;
+            let x = &xq[bl * 256 + g * 32..][..32];
+
+            for medio in 0..2 {
+                let sub = bl * 16 + g * 2 + medio;
+                let escala = d * (esc[g * 2 + medio] as f32 - 32.0);
+                let mut entero = 0i32;
+                for l in 0..16 {
+                    let idx = medio * 16 + l;
+                    // El tercer bit vive en `hmask`, y cuando esta puesto el
+                    // valor sube 4. Sumarselo es lo que lo deja sin signo.
+                    let extra = if hmask[idx] & m != 0 { 4i32 } else { 0 };
+                    let q = ((qsg[idx] >> corrimiento) & 3) as i32 + extra;
+                    entero += x[idx] as i32 * q;
+                }
+                // Y aca se descuenta el 4 que se le sumo a cada valor.
+                total += xe[sub] * escala * (entero as f32 - 4.0 * xs[sub]);
+            }
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -230,10 +230,52 @@ It's in **[ROADMAP.md](ROADMAP.md)**, with the measured state up top and the
 order set by how much it moves latency, not by how interesting it is to write.
 
 In short: the engine is at **51% of this machine's memory-bandwidth ceiling**,
-meaning there's less than 2x left to win here, and what blocks it is that 6
-cores yield 2.6x instead of 6x — a gap that still has **no explanation**. Until
-it closes, any memory-side optimization underdelivers, which is exactly what
-killed speculative decoding.
+meaning there's less than 2x left to win here. Why 6 cores yield 2.6x instead
+of 6x **is now explained**: the matrices that don't fit in the 12 MB of L3
+don't scale, and they are 89% of the weights. It's the memory wall, and more
+threads won't fix it — which is exactly what killed speculative decoding.
+
+---
+
+## daiss: the project's own models
+
+Cosxamix doesn't only serve other people's models. **daiss** is its own
+family: five sizes the project defines, initialises and writes as GGUF.
+
+| model | parameters | Q8_0 | cache/token |
+|---|---:|---:|---:|
+| daiss-mini | 0.08 B | 0.08 GB | 6.0 KB |
+| daiss-0.5b | 0.63 B | 0.62 GB | 24.0 KB |
+| daiss-3b | 3.40 B | 3.36 GB | 72.0 KB |
+| daiss-7b | 7.61 B | 7.54 GB | 112.0 KB |
+| daiss-14b | 14.77 B | 14.62 GB | 384.0 KB |
+
+```
+cargo run --release --example create_daiss
+COSXAMIX_DAISS=daiss-7b cargo run --release --example create_daiss
+```
+
+They are generated streaming and in parallel, with peak memory capped at 16 MB
+whatever the size, and seeded: the same seed yields the same file byte for
+byte. daiss-7b has been created and candle reads it with zero differences.
+
+And with the project's own tokenizer — `src/tokenizer.rs`, a byte-level BPE it
+trains itself — the vocabulary drops from 151,936 pieces to 8,192 for a
+measured **3.4% more tokens** on held-out text, taking daiss-mini from
+**84 MB to 9 MB**:
+
+```
+cargo run --release --example train_tokenizer
+COSXAMIX_BPE=modelos/daiss-8192.bpe cargo run --release --example create_daiss
+```
+
+The tokenizer travels inside the model file.
+
+**A freshly written daiss is not trained**: its weights are noise with the
+right standard deviation, so it generates nonsense. What exists and is
+verified is the whole path — define, initialise, quantise, write, read, load —
+which is the precondition for any training. What's missing is in
+[ROADMAP.md](ROADMAP.md) §8.
 
 ---
 
@@ -719,7 +761,7 @@ open to whichever language wins the measurement:
 | | what it brings | what's missing |
 |---|---|---|
 | **Zig** | one source covering x86-64, ARM64 and Android | nothing: it's already in |
-| **Assembly** | full control where the compiler emits something redundant | a specific loop flagged by profiling, or an instruction candle doesn't use |
+| **Assembly** | the fused Q4_K kernel on x86-64, first in the dispatcher with `asm_q4k` (1.04x-1.08x over intrinsics); on ARM64, the only way to use `sdot` | the NEON body, `kernels/q4k_neon.s`, and measuring it on ARM |
 | **Fortran** | arrays without aliasing, which is why BLAS and LAPACK are still Fortran | a compiler on every platform, and Android is exactly the problem |
 | **Ada / SPARK** | proving a kernel cannot overflow, instead of testing that it doesn't | a kernel critical enough to justify the toolchain |
 | **C** | the common denominator, and what candle already uses underneath | nothing the others don't cover |
@@ -750,6 +792,7 @@ same machine.
 cargo test                      # reference and AVX2
 cargo test  --features zig      # and Zig as well
 cargo bench --features zig      # rule 3, executable
+cargo test  --features asm_q4k  # the hand-written assembly kernels
 ```
 
 ### What the first kernel measured

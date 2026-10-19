@@ -229,3 +229,116 @@ export fn cosxamix_dot_i8_escalado_f32(
 
     return @reduce(.Add, acumulador);
 }
+
+// ─── El kernel fusionado, que en x86 lo hace AVX2 y aca nadie ───────────────
+
+/// Lee un `f16` little-endian de un flujo de bytes.
+///
+/// Zig tiene `f16` nativo, asi que esto es un `bitCast` y una ampliacion: no
+/// hace falta la aritmetica de exponente y mantisa que pide hacerlo a mano.
+fn leerF16(b: [*]const u8, i: usize) f32 {
+    const bits: u16 = @as(u16, b[i]) | (@as(u16, b[i + 1]) << 8);
+    const h: f16 = @bitCast(bits);
+    return @floatCast(h);
+}
+
+/// La escala y el minimo de 6 bits del sub-bloque `j` de un bloque Q4_K.
+///
+/// Los doce bytes guardan ocho pares de 6 bits de una forma que no es
+/// regular: los primeros cuatro pares van enteros en los ocho primeros bytes,
+/// y los otros cuatro reparten sus dos bits altos en los cuatro ultimos.
+fn escalaYMinimo(j: usize, q: [*]const u8) struct { u8, u8 } {
+    if (j < 4) {
+        return .{ q[j] & 63, q[j + 4] & 63 };
+    }
+    return .{
+        (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+        (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+    };
+}
+
+/// Producto punto de una fila en **Q4_K** contra una entrada en `i8`, sin
+/// desempaquetar los pesos a ningun buffer.
+///
+/// ## Por que existe teniendo la version de AVX2
+///
+/// Porque la de AVX2 **no existe fuera de x86-64**. En ARM y en Termux, que
+/// son objetivo declarado del proyecto, el camino de Rust usa
+/// `core::arch::x86_64` y no compila, asi que el despachador cae a la
+/// referencia escalar: byte a byte, en el bucle mas caliente del motor. Esta
+/// funcion es la que evita eso, y entra por el **segundo brazo de la regla 3**
+/// —habilita una plataforma— y no por ganarle a nadie en velocidad.
+///
+/// ## Lo que puede y lo que no
+///
+/// No reproduce el truco de `vpmaddubsw`, que suma pares de productos de 8
+/// bits dentro de un registro de 16 y es lo que le da a AVX2 sus 32 carriles.
+/// Aca se ensancha a `i32` y se multiplica, que son 8 carriles con NEON de 128
+/// bits — cuatro veces menos ancho.
+///
+/// A cambio es **mas simple y mas portable**: `@Vector` deja que LLVM elija la
+/// instruccion de cada arquitectura, y en ARMv8.2 con `dotprod` puede salir
+/// `sdot`, que hace exactamente el producto punto de cuatro `i8` en un `i32`.
+/// Si el objetivo no lo tiene, sale la version con `smull` y sigue andando.
+///
+/// `n` son los valores de la fila, multiplo de 256. `xe` y `xs` tienen un
+/// valor por cada 32.
+export fn cosxamix_dot_q4k_i8_f32(
+    bloques: [*]const u8,
+    xq: [*]const i8,
+    xe: [*]const f32,
+    xs: [*]const f32,
+    n: usize,
+) f32 {
+    const VU8 = @Vector(ANCHO, u8);
+    const VI8 = @Vector(ANCHO, i8);
+    const VI32 = @Vector(ANCHO, i32);
+
+    const mascara: VU8 = @splat(0x0F);
+    const cuatro: @Vector(ANCHO, u3) = @splat(4);
+
+    var total: f32 = 0.0;
+    const n_bloques = n / 256;
+
+    var bl: usize = 0;
+    while (bl < n_bloques) : (bl += 1) {
+        const o = bl * 144;
+        const d = leerF16(bloques, o);
+        const dmin = leerF16(bloques, o + 2);
+        const esc = bloques + o + 4;
+        const qs = bloques + o + 16;
+
+        var par: usize = 0;
+        while (par < 4) : (par += 1) {
+            const base = par * 32;
+            var mitad: usize = 0;
+            while (mitad < 2) : (mitad += 1) {
+                const j = par * 2 + mitad;
+                const sc_m = escalaYMinimo(j, esc);
+                const sub = bl * 8 + j;
+                const desde = bl * 256 + par * 64 + mitad * 32;
+
+                // El acumulador entero se vacia una vez por sub-bloque, que
+                // es donde cambia la escala. Reducir mas seguido fue el error
+                // que hizo lenta a la primera version de `dot_i8`.
+                var parcial: VI32 = @splat(0);
+                var i: usize = 0;
+                while (i < 32) : (i += ANCHO) {
+                    const pq: *align(1) const VU8 = @ptrCast(qs + base + i);
+                    // Los nibbles bajos son el sub-bloque par y los altos el
+                    // impar, que es como lo guarda el formato.
+                    const nib: VU8 = if (mitad == 0) pq.* & mascara else pq.* >> cuatro;
+                    const px: *align(1) const VI8 = @ptrCast(xq + desde + i);
+                    parcial += @as(VI32, nib) * @as(VI32, px.*);
+                }
+
+                const entero: f32 = @floatFromInt(@reduce(.Add, parcial));
+                const escala = d * @as(f32, @floatFromInt(sc_m[0]));
+                const minimo = dmin * @as(f32, @floatFromInt(sc_m[1]));
+                total += xe[sub] * (escala * entero - minimo * xs[sub]);
+            }
+        }
+    }
+
+    return total;
+}

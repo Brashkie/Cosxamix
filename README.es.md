@@ -224,11 +224,53 @@ Está en **[ROADMAP.md](ROADMAP.md)**, con el estado medido arriba y el orden
 puesto por cuánto mueve la latencia, no por cuán interesante es de programar.
 
 En resumen: el motor está al **51% del techo de ancho de banda** de esta
-máquina, o sea que queda menos de 2x por ganar acá, y lo que lo bloquea es que
-de 6 núcleos se obtienen 2,6x en vez de 6x — y esa brecha todavía **no tiene
-explicación**. Hasta cerrarla, cualquier optimización del lado de la memoria
-rinde menos de lo que promete, que es exactamente lo que mató a la
-decodificación especulativa.
+máquina, o sea que queda menos de 2x por ganar acá. Que de 6 núcleos salgan
+2,6x en vez de 6x **ya tiene explicación**: las matrices que no entran en los
+12 MB de L3 no escalan, y son el 89% de los pesos. Es el muro de memoria, y
+más hilos no lo arreglan — que es exactamente lo que mató a la decodificación
+especulativa.
+
+---
+
+## daiss: los modelos propios
+
+Cosxamix no solo sirve modelos ajenos. **daiss** es la familia propia, cinco
+tamaños que el proyecto define, inicializa y escribe como GGUF:
+
+| modelo | parámetros | Q8_0 | caché/token |
+|---|---:|---:|---:|
+| daiss-mini | 0,08 B | 0,08 GB | 6,0 KB |
+| daiss-0.5b | 0,63 B | 0,62 GB | 24,0 KB |
+| daiss-3b | 3,40 B | 3,36 GB | 72,0 KB |
+| daiss-7b | 7,61 B | 7,54 GB | 112,0 KB |
+| daiss-14b | 14,77 B | 14,62 GB | 384,0 KB |
+
+```
+cargo run --release --example create_daiss
+COSXAMIX_DAISS=daiss-7b cargo run --release --example create_daiss
+```
+
+Se generan en flujo y en paralelo, con el pico de memoria acotado a 16 MB sea
+cual sea el tamaño, y con semilla: la misma semilla da el mismo archivo byte
+por byte. El daiss-7b está creado y candle lo lee con cero diferencias.
+
+Y con el tokenizador propio —`src/tokenizer.rs`, un BPE a nivel de bytes
+entrenado por el proyecto— el vocabulario baja de 151.936 piezas a 8.192 a
+cambio de un **3,4% más de tokens** medido sobre texto no visto, y daiss-mini
+pasa de **84 MB a 9 MB**:
+
+```
+cargo run --release --example train_tokenizer
+COSXAMIX_BPE=modelos/daiss-8192.bpe cargo run --release --example create_daiss
+```
+
+El tokenizador viaja dentro del archivo del modelo.
+
+**Un daiss recién escrito no está entrenado**: sus pesos son ruido con la
+desviación correcta y genera texto sin sentido. Lo que existe y está
+verificado es el camino entero —definir, inicializar, cuantizar, escribir,
+leer, cargar—, que es la condición previa de cualquier entrenamiento. Lo que
+falta está en [ROADMAP.md](ROADMAP.md) §8.
 
 ---
 
@@ -703,7 +745,7 @@ abierta al que gane la medición:
 | | qué aporta | qué falta |
 |---|---|---|
 | **Zig** | una sola fuente que cubre x86-64, ARM64 y Android | nada: ya está dentro |
-| **Ensamblador** | control total donde el compilador emite algo redundante | un bucle concreto señalado por el perfilado, o una instrucción que candle no use |
+| **Ensamblador** | el kernel fusionado de Q4_K en x86-64, primero en el despachador con `asm_q4k` (1,04x-1,08x sobre los intrínsecos); en ARM64, la única forma de usar `sdot` | el cuerpo NEON, `kernels/q4k_neon.s`, y medirlo en ARM |
 | **Fortran** | arreglos sin aliasing, que es por lo que BLAS y LAPACK siguen siendo Fortran | un compilador en cada plataforma, y Android es justo el problema |
 | **Ada / SPARK** | demostrar que un kernel no desborda, en vez de comprobarlo con tests | un kernel lo bastante crítico como para que valga el toolchain |
 | **C** | el denominador común, y lo que candle ya usa por debajo | nada que no cubran los otros |
@@ -732,6 +774,7 @@ uno, para poder medir uno contra otro en la misma máquina.
 cargo test                      # referencia y AVX2
 cargo test  --features zig      # y además Zig
 cargo bench --features zig      # la regla 3, ejecutable
+cargo test  --features asm_q4k  # los kernels escritos en ensamblador
 ```
 
 ### Lo que midió el primer kernel

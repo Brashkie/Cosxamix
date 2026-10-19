@@ -10,6 +10,92 @@ fn main() {
 
     #[cfg(feature = "zig")]
     compilar_zig();
+
+    comprobar_asm_q4k();
+}
+
+/// Decide si el kernel de Q4_K escrito a mano se puede compilar.
+///
+/// El cuerpo de ese kernel lo escribe una persona en dos `.s` que todavia no
+/// existen, y `include_str!` falla si el archivo falta. Dejar que falle
+/// romperia `--all-features`, que es el comando con el que se verifica el
+/// proyecto entero: un hueco a medio hacer no puede tirar abajo la
+/// verificacion de todo lo demas.
+///
+/// Asi que el modulo se compila solo si los dos archivos estan, y si la
+/// feature esta encendida sin ellos se avisa en vez de fallar.
+fn comprobar_asm_q4k() {
+    // Hace falta declararlos o `unexpected_cfgs` los marca: son cfg propios y
+    // el compilador no puede saber que existen.
+    println!("cargo:rustc-check-cfg=cfg(hay_q4k_asm)");
+    println!("cargo:rustc-check-cfg=cfg(hay_q4k_fila)");
+    println!("cargo:rustc-check-cfg=cfg(hay_q4k_completo)");
+    println!("cargo:rustc-check-cfg=cfg(hay_q4k_neon)");
+    for f in [
+        "kernels/q4k_avx2_win64.s",
+        "kernels/q4k_avx2_sysv.s",
+        "kernels/q4k_neon.s",
+    ] {
+        println!("cargo:rerun-if-changed={f}");
+    }
+
+    // En ARM64 hay un solo archivo para los tres sistemas, porque Linux,
+    // Android y macOS usan la misma convencion, AAPCS64. Y solo el contrato
+    // completo: los otros dos se escribieron en x86 para medir, y perdieron.
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+        let texto = std::fs::read_to_string("kernels/q4k_neon.s").unwrap_or_default();
+        if define_etiqueta(&texto, "cosxamix_q4k_completo") {
+            println!("cargo:rustc-cfg=hay_q4k_neon");
+        } else if std::env::var_os("CARGO_FEATURE_ASM_Q4K").is_some() {
+            println!(
+                "cargo:warning=la feature asm_q4k esta encendida pero kernels/q4k_neon.s no define cosxamix_q4k_completo: el kernel NEON no se compila. El contrato esta en src/kernels/q4k_neon.rs."
+            );
+        }
+        return;
+    }
+
+    // Un archivo por convencion de llamada, y se mira SOLO el del target que
+    // se compila. `CARGO_CFG_TARGET_OS` es el sistema del target y no el del
+    // host, que es lo que importa cuando se cruza.
+    let archivo = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("windows") => "kernels/q4k_avx2_win64.s",
+        // Linux y macOS comparten el de System V, como `dot_avx2_sysv.s`.
+        _ => "kernels/q4k_avx2_sysv.s",
+    };
+    let texto = std::fs::read_to_string(archivo).unwrap_or_default();
+
+    let pares = define_etiqueta(&texto, "cosxamix_q4k_pares");
+    let fila = define_etiqueta(&texto, "cosxamix_q4k_fila");
+    let completo = define_etiqueta(&texto, "cosxamix_q4k_completo");
+
+    if pares {
+        println!("cargo:rustc-cfg=hay_q4k_asm");
+    }
+    if fila {
+        println!("cargo:rustc-cfg=hay_q4k_fila");
+    }
+    if completo {
+        println!("cargo:rustc-cfg=hay_q4k_completo");
+    }
+    if !pares && !fila && !completo && std::env::var_os("CARGO_FEATURE_ASM_Q4K").is_some() {
+        println!(
+            "cargo:warning=la feature asm_q4k esta encendida pero {archivo} no define ni cosxamix_q4k_pares ni cosxamix_q4k_fila: el kernel en ensamblador no se compila. El contrato esta en src/kernels/q4k_asm.rs."
+        );
+    }
+}
+
+/// Si el ensamblador define la funcion, mirando la ETIQUETA con los dos puntos.
+///
+/// No el nombre a secas: el nombre aparece en los comentarios de la cabecera,
+/// y buscarlo asi daba por presente una funcion que no estaba. En Mach-O la
+/// etiqueta lleva un guion bajo delante. Se quitan los comentarios `//`, que
+/// el ensamblador de LLVM acepta tanto en x86 con AT&T como en ARM64, ELF y
+/// Mach-O: por eso los `.s` comentan siempre asi.
+fn define_etiqueta(texto: &str, nombre: &str) -> bool {
+    texto.lines().any(|l| {
+        let l = l.split("//").next().unwrap_or("").trim();
+        l == format!("{nombre}:") || l == format!("_{nombre}:")
+    })
 }
 
 /// Traduce el target de Rust al de Zig, con el `-mcpu` que corresponde.

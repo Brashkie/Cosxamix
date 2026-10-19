@@ -60,7 +60,7 @@ pub fn f16_a_f32(bits: u16) -> f32 {
 }
 
 #[inline]
-fn leer_f16(b: &[u8], i: usize) -> f32 {
+pub(crate) fn leer_f16(b: &[u8], i: usize) -> f32 {
     f16_a_f32(u16::from_le_bytes([b[i], b[i + 1]]))
 }
 
@@ -76,7 +76,36 @@ fn leer_u32(b: &[u8], i: usize) -> u32 {
 /// parte del formato donde es más fácil equivocarse y no notarlo: un error acá
 /// da pesos plausibles pero mal escalados.
 #[inline]
-fn escala_y_minimo(j: usize, q: &[u8]) -> (u8, u8) {
+/// Las dieciséis escalas de 6 bits de un bloque Q3_K.
+///
+/// Vienen repartidas en 12 bytes: los cuatro bits bajos en los ocho primeros y
+/// los dos altos en los cuatro últimos. Se rearman en cuatro palabras de 32 y
+/// salen como enteros con signo a los que hay que restarles 32.
+///
+/// Estaba escrito dos veces, idéntico, y ahora lo usan tres sitios: los dos
+/// descuantizadores y el kernel fusionado.
+pub(crate) fn escalas_q3k(b: &[u8], o: usize) -> [i8; 16] {
+    const MASCARA1: u32 = 0x0303_0303;
+    const MASCARA2: u32 = 0x0F0F_0F0F;
+
+    let mut aux = [0u32; 4];
+    for (j, a) in aux.iter_mut().take(3).enumerate() {
+        *a = leer_u32(b, o + 96 + j * 4);
+    }
+    let tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & MASCARA2) | (((tmp >> 4) & MASCARA1) << 4);
+    aux[3] = ((aux[1] >> 4) & MASCARA2) | (((tmp >> 6) & MASCARA1) << 4);
+    aux[0] = (aux[0] & MASCARA2) | ((tmp & MASCARA1) << 4);
+    aux[1] = (aux[1] & MASCARA2) | (((tmp >> 2) & MASCARA1) << 4);
+
+    let mut esc = [0i8; 16];
+    for (j, e) in esc.iter_mut().enumerate() {
+        *e = (aux[j / 4] >> (8 * (j % 4))) as u8 as i8;
+    }
+    esc
+}
+
+pub(crate) fn escala_y_minimo(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {
@@ -366,28 +395,12 @@ pub fn desempaquetar_i8(
             }
         }
         TipoGgml::Q3K => {
-            const MASCARA1: u32 = 0x0303_0303;
-            const MASCARA2: u32 = 0x0F0F_0F0F;
             for i in 0..n {
                 let o = i * 110;
                 let hmask = &bloques[o..o + 32];
                 let qs = &bloques[o + 32..o + 96];
                 let d_todo = leer_f16(bloques, o + 108);
-
-                let mut aux = [0u32; 4];
-                for (j, a) in aux.iter_mut().take(3).enumerate() {
-                    *a = leer_u32(bloques, o + 96 + j * 4);
-                }
-                let tmp = aux[2];
-                aux[2] = ((aux[0] >> 4) & MASCARA2) | (((tmp >> 4) & MASCARA1) << 4);
-                aux[3] = ((aux[1] >> 4) & MASCARA2) | (((tmp >> 6) & MASCARA1) << 4);
-                aux[0] = (aux[0] & MASCARA2) | ((tmp & MASCARA1) << 4);
-                aux[1] = (aux[1] & MASCARA2) | (((tmp >> 2) & MASCARA1) << 4);
-
-                let mut esc = [0i8; 16];
-                for (j, e) in esc.iter_mut().enumerate() {
-                    *e = (aux[j / 4] >> (8 * (j % 4))) as u8 as i8;
-                }
+                let esc = escalas_q3k(bloques, o);
 
                 let mut m: u8 = 1;
                 let mut is = 0usize;
@@ -520,33 +533,12 @@ fn q2_k(b: &[u8], y: &mut [f32], n: usize) {
 }
 
 fn q3_k(b: &[u8], y: &mut [f32], n: usize) {
-    const MASCARA1: u32 = 0x0303_0303;
-    const MASCARA2: u32 = 0x0F0F_0F0F;
-
     for i in 0..n {
         let o = i * 110;
         let hmask = &b[o..o + 32];
         let qs = &b[o + 32..o + 96];
         let d_todo = leer_f16(b, o + 108);
-
-        // Las dieciséis escalas de 6 bits vienen repartidas en 12 bytes: los
-        // cuatro bits bajos en los ocho primeros y los dos altos en los
-        // cuatro últimos. Se rearman en tres palabras de 32 y salen como
-        // enteros con signo a los que hay que restarles 32.
-        let mut aux = [0u32; 4];
-        for (j, a) in aux.iter_mut().take(3).enumerate() {
-            *a = leer_u32(b, o + 96 + j * 4);
-        }
-        let tmp = aux[2];
-        aux[2] = ((aux[0] >> 4) & MASCARA2) | (((tmp >> 4) & MASCARA1) << 4);
-        aux[3] = ((aux[1] >> 4) & MASCARA2) | (((tmp >> 6) & MASCARA1) << 4);
-        aux[0] = (aux[0] & MASCARA2) | ((tmp & MASCARA1) << 4);
-        aux[1] = (aux[1] & MASCARA2) | (((tmp >> 2) & MASCARA1) << 4);
-
-        let mut escalas = [0i8; 16];
-        for (j, e) in escalas.iter_mut().enumerate() {
-            *e = (aux[j / 4] >> (8 * (j % 4))) as u8 as i8;
-        }
+        let escalas = escalas_q3k(b, o);
 
         let mut m: u8 = 1;
         let mut is = 0;
@@ -686,6 +678,117 @@ fn q6_k(b: &[u8], y: &mut [f32], n: usize) {
     }
 }
 
+// ─── El camino de vuelta: de `f32` al formato ────────────────────────────────
+
+/// `f32` a `f16`, con subnormales y redondeo al par más cercano.
+///
+/// Es el inverso de [`f16_a_f32`] y hace falta para **escribir** modelos, no
+/// solo para leerlos: las escalas de cada bloque de los formatos cuantizados
+/// se guardan en `f16`, así que sin esto no se puede producir un GGUF.
+///
+/// El redondeo es al par y no truncando. Truncar sesga cada escala hacia cero,
+/// y una escala sesgada desvía los 32 o 256 valores que cuelgan de ella.
+pub fn f32_a_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let signo = ((bits >> 16) & 0x8000) as u16;
+    let magnitud = bits & 0x7FFF_FFFF;
+
+    // NaN e infinito: el exponente se satura y la mantisa se conserva para no
+    // convertir un NaN en un infinito, que son cosas distintas.
+    if magnitud >= 0x7F80_0000 {
+        let mantisa = (magnitud & 0x007F_FFFF) != 0;
+        return signo | 0x7C00 | if mantisa { 0x0200 } else { 0 };
+    }
+
+    let exponente = (magnitud >> 23) as i32 - 127;
+
+    if exponente > 15 {
+        // Más grande de lo que `f16` representa: satura a infinito. Devolver
+        // el máximo finito mentiría sobre el orden de magnitud.
+        return signo | 0x7C00;
+    }
+
+    if exponente < -14 {
+        // Subnormal de `f16`, o cero. Se corre la mantisa con el bit implícito
+        // puesto y se redondea sobre el resultado corrido.
+        let corrimiento = (-14 - exponente) as u32;
+        if corrimiento > 24 {
+            return signo;
+        }
+        let mantisa = (magnitud & 0x007F_FFFF) | 0x0080_0000;
+        let valor = mantisa >> (corrimiento + 13);
+        let resto = mantisa & ((1 << (corrimiento + 13)) - 1);
+        let mitad = 1 << (corrimiento + 12);
+        let redondeo = u32::from(resto > mitad || (resto == mitad && valor & 1 == 1));
+        return signo | (valor + redondeo) as u16;
+    }
+
+    let mantisa = magnitud & 0x007F_FFFF;
+    let valor = ((exponente + 15) as u32) << 10 | (mantisa >> 13);
+    let resto = mantisa & 0x1FFF;
+    let redondeo = u32::from(resto > 0x1000 || (resto == 0x1000 && valor & 1 == 1));
+    signo | (valor + redondeo) as u16
+}
+
+/// Pasa `f32` al formato pedido y lo agrega a `salida`.
+///
+/// Es el inverso de [`descuantizar`] y cubre los tres formatos con los que
+/// tiene sentido **escribir** un modelo nuevo:
+///
+/// - `F32`, que no pierde nada y pesa cuatro bytes por valor;
+/// - `F16`, mitad de tamaño y el error de redondeo de `f16`;
+/// - `Q8_0`, un byte por valor más una escala `f16` cada 32, o sea 1,0625
+///   bytes por valor — nueve veces menos que `F32` por diez.
+///
+/// Los k-quants no están, y a propósito: su cuantizador busca la escala y el
+/// mínimo que minimizan el error de cada sub-bloque con una búsqueda
+/// iterativa, no es una formula cerrada, y escribirlo sin tener contra qué
+/// compararlo valor por valor sería justo lo que este proyecto no hace. Un
+/// modelo propio se escribe en `Q8_0` y se recuantiza después con una
+/// herramienta que ya esté verificada.
+pub fn cuantizar_bloques(tipo: TipoGgml, x: &[f32], salida: &mut Vec<u8>) -> Result<(), String> {
+    let por_bloque = tipo.valores_por_bloque();
+    if !x.len().is_multiple_of(por_bloque) {
+        return Err(format!(
+            "{tipo:?}: {} valores no es multiplo de {por_bloque}",
+            x.len()
+        ));
+    }
+    salida.reserve(tipo.bytes_de(x.len()));
+
+    match tipo {
+        TipoGgml::F32 => {
+            for v in x {
+                salida.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        TipoGgml::F16 => {
+            for v in x {
+                salida.extend_from_slice(&f32_a_f16(*v).to_le_bytes());
+            }
+        }
+        TipoGgml::Q8_0 => {
+            for trozo in x.chunks(32) {
+                // La escala es `max|x| / 127`, igual que en los cuantizadores
+                // de GGML, y por eso el resultado entra en [-127, 127].
+                let amax = trozo.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let d = amax / 127.0;
+                salida.extend_from_slice(&f32_a_f16(d).to_le_bytes());
+                // La escala se guarda en `f16`, así que al leerla de vuelta no
+                // es `d` sino su redondeo. Cuantizar con la que SE VA A LEER y
+                // no con la original quita ese error de un paso entero.
+                let leida = f16_a_f32(f32_a_f16(d));
+                let inv = if leida > 0.0 { 1.0 / leida } else { 0.0 };
+                for v in trozo {
+                    salida.push(((v * inv).round() as i32).clamp(-127, 127) as i8 as u8);
+                }
+            }
+        }
+        otro => return Err(format!("{otro:?}: sin cuantizador para escribir")),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,6 +910,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `f32` a `f16` y de vuelta tiene que devolver el mismo numero cuando el
+    /// numero **es** representable en `f16`.
+    ///
+    /// Se prueban los casos que rompen una conversion mal escrita: cero y cero
+    /// negativo, el subnormal mas chico, el normal mas chico, el finito mas
+    /// grande, y potencias de dos a los dos lados del limite de los
+    /// subnormales.
+    #[test]
+    fn f16_ida_y_vuelta_en_los_valores_representables() {
+        let exactos = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            2.0,
+            65504.0, // el finito mas grande de f16
+            -65504.0,
+            6.103_515_6e-5, // el normal mas chico
+            5.960_464_5e-8, // el subnormal mas chico
+            1.0 / 1024.0,
+        ];
+        for v in exactos {
+            let vuelta = f16_a_f32(f32_a_f16(v));
+            assert_eq!(
+                vuelta.to_bits(),
+                v.to_bits(),
+                "{v:e} volvio como {vuelta:e}"
+            );
+        }
+
+        // Fuera de rango satura a infinito y no al maximo finito, que diria
+        // una magnitud equivocada.
+        assert!(f16_a_f32(f32_a_f16(1e30)).is_infinite());
+        assert!(f16_a_f32(f32_a_f16(-1e30)).is_infinite());
+        assert!(f16_a_f32(f32_a_f16(f32::NAN)).is_nan());
+
+        // Y el redondeo es al par mas cercano, no truncando: a mitad de
+        // camino entre dos f16 consecutivos tiene que caer en el par.
+        let medio = (f16_a_f32(0x3C00) + f16_a_f32(0x3C01)) / 2.0;
+        assert_eq!(f32_a_f16(medio), 0x3C00, "1.0 es el par de los dos");
+    }
+
+    /// Cuantizar y descuantizar de vuelta tiene que dar lo mismo en los
+    /// formatos sin perdida, y un error acotado en Q8_0.
+    ///
+    /// La cota no es un numero elegido a gusto: Q8_0 guarda un entero de 8
+    /// bits con signo por valor y una escala por bloque de 32, asi que el
+    /// error de cada valor no puede pasar de media escala, y la escala es
+    /// `max|x| / 127`. O sea `max|x| / 254` por valor, mas lo que agregue el
+    /// redondeo de la escala a `f16`.
+    #[test]
+    fn cuantizar_y_volver_cierra_el_circulo() {
+        let x: Vec<f32> = (0..256).map(|i| (i as f32 * 0.11).sin() * 3.0).collect();
+        let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+
+        for (tipo, cota) in [
+            (TipoGgml::F32, 0.0f32),
+            (TipoGgml::F16, amax * 1e-3),
+            (TipoGgml::Q8_0, amax / 254.0 * 1.01),
+        ] {
+            let mut bytes = Vec::new();
+            cuantizar_bloques(tipo, &x, &mut bytes).unwrap();
+            assert_eq!(
+                bytes.len(),
+                tipo.bytes_de(x.len()),
+                "{tipo:?}: tamano escrito"
+            );
+
+            let mut vuelta = vec![0f32; x.len()];
+            descuantizar(tipo, &bytes, &mut vuelta).unwrap();
+
+            let peor = x
+                .iter()
+                .zip(&vuelta)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                peor <= cota,
+                "{tipo:?}: el peor error fue {peor} y la cota es {cota}"
+            );
+        }
+    }
+
+    /// Un bloque entero en cero no puede dar NaN.
+    ///
+    /// La escala sale de dividir por el maximo absoluto, y en un modelo
+    /// cuantizado los bloques en cero existen de verdad.
+    #[test]
+    fn un_bloque_en_cero_no_da_nan() {
+        let x = vec![0f32; 64];
+        let mut bytes = Vec::new();
+        cuantizar_bloques(TipoGgml::Q8_0, &x, &mut bytes).unwrap();
+        let mut vuelta = vec![9f32; 64];
+        descuantizar(TipoGgml::Q8_0, &bytes, &mut vuelta).unwrap();
+        assert!(vuelta.iter().all(|v| *v == 0.0), "{vuelta:?}");
     }
 
     #[test]

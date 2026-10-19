@@ -116,6 +116,45 @@ pub fn dot_i8_escalado(a: &[i8], b: &[i8], esc_a: &[f32], esc_b: &[f32], bloque:
 }
 
 unsafe extern "C" {
+    fn cosxamix_dot_q4k_i8_f32(
+        bloques: *const u8,
+        xq: *const i8,
+        xe: *const f32,
+        xs: *const f32,
+        n: usize,
+    ) -> f32;
+}
+
+/// El kernel **fusionado** de Q4_K: multiplica sin desempaquetar los pesos.
+///
+/// Existe porque el de AVX2 **no existe fuera de x86-64**. En ARM y en Termux
+/// el camino de Rust usa `core::arch::x86_64` y no compila, así que sin esto
+/// el despachador cae a la referencia escalar, byte a byte, en el bucle más
+/// caliente del motor. Entra por el **segundo brazo de la regla 3** —habilita
+/// una plataforma— y no por ganarle a nadie.
+///
+/// No reproduce el truco de `vpmaddubsw`, que suma pares de productos de 8
+/// bits dentro de un registro de 16 y es lo que le da a AVX2 sus 32 carriles:
+/// acá se ensancha a `i32` y se multiplica, que con NEON de 128 bits son 8.
+/// A cambio, `@Vector` deja que LLVM elija la instrucción de cada
+/// arquitectura, y en ARMv8.2 con `dotprod` puede salir `sdot`.
+pub fn dot_q4k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
+    debug_assert!(xq.len().is_multiple_of(256));
+    debug_assert_eq!(xe.len(), xq.len() / 32);
+    debug_assert_eq!(xs.len(), xe.len());
+    debug_assert!(bloques.len() >= xq.len() / 256 * 144);
+    unsafe {
+        cosxamix_dot_q4k_i8_f32(
+            bloques.as_ptr(),
+            xq.as_ptr(),
+            xe.as_ptr(),
+            xs.as_ptr(),
+            xq.len(),
+        )
+    }
+}
+
+unsafe extern "C" {
     fn cosxamix_noop(x: f32) -> f32;
 }
 

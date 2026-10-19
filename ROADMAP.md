@@ -144,12 +144,27 @@ caché, que eran lo difícil, ya están en el árbol.
 
 ### 6. Redes de tensores (MPS / Tensor-Train)
 
-Álgebra real y aplicable, pero reduce **bytes que leer**, y el motor está
-limitado por cálculo. Es la misma trampa que mató a la especulativa.
+**Medido, y el resultado reordena el punto.** `examples/measure_rank.rs` dice
+que un peso aleatorio no tiene nada que descomponer —captura exactamente
+`k / rango`— y que uno entrenado sí, pero mucho menos de lo que prometen los
+papers: `output.weight` del 0,5B necesita el 28,6% del rango para el 47,5% de
+la energía.
 
-Se mide después del punto 1, no antes. El punto 2 es un caso particular de esto
-que sí vale ya, porque la matriz de salida es el único sitio donde comprimir
-también recorta aritmética.
+Dónde sí vale, con número: `output.weight` con `k` chico, **22,1x** sobre el
+control aleatorio con k=8 contra 7,58x del FFN. Hay unas ocho direcciones que
+cargan el 20% de la energía.
+
+Así que el punto queda dividido:
+
+- **el FFN y la atención salen de la lista**: 7,58x cayendo a 1,37x no paga la
+  complejidad de una Tensor-Train;
+- **la proyección de salida se queda**, y pasa a depender de medir el efecto en
+  los logits y no en la energía, porque energía de Frobenius no es precisión;
+- **nada de esto se aplica a daiss hasta que esté entrenado**, y eso ya no es
+  una opinión.
+
+El detalle y el control de ruido de cuantización, en
+[DECISIONES](DECISIONES.md) §12.
 
 ### 7. Entrenamiento y ajuste fino en hardware débil
 
@@ -186,13 +201,40 @@ Lo que falta:
    guardada como `(n, k)` cuantizada. Va último porque es lo más caro y porque
    los puntos 1 a 3 sirven igual sin él.
 
-### 8. Crear modelos, no solo servirlos
+### 8. daiss: crear modelos, no solo servirlos
 
-Hoy Cosxamix sirve modelos ajenos y ajusta uno con LoRA. Crear modelos propios
-es un objetivo declarado, **chicos y grandes**.
+**La familia existe y se escribe.** `src/daiss.rs` define cinco tamaños,
+`src/gguf_write.rs` los guarda como GGUF, y los dos están verificados:
 
-Lo que no sale de una máquina sin GPU es **preentrenar** uno grande desde cero:
-son miles de horas de GPU y cientos de GB de texto, y eso es aritmética, no
+| modelo | params | capas | dim | cab/kv | Q8_0 | F16 | caché/token | k-quants |
+|---|---:|---:|---:|---:|---:|---:|---:|:---:|
+| daiss-mini | 0,08 B | 6 | 256 | 4/2 | 0,08 GB | 0,15 GB | 6,0 KB | sí |
+| daiss-0.5b | 0,63 B | 24 | 896 | 14/2 | 0,62 GB | 1,17 GB | 24,0 KB | **no** |
+| daiss-3b | 3,40 B | 36 | 2048 | 16/2 | 3,36 GB | 6,33 GB | 72,0 KB | sí |
+| daiss-7b | 7,61 B | 28 | 3584 | 28/4 | 7,54 GB | 14,18 GB | 112,0 KB | sí |
+| daiss-14b | 14,77 B | 48 | 5120 | 40/8 | 14,62 GB | 27,51 GB | 384,0 KB | sí |
+
+El daiss-7b está escrito y comprobado: 339 tensores, 7,54 GB, y **candle lo
+lee con cero diferencias** sobre los 544.538.624 valores de `output.weight`,
+con los 339 tensores que el cargador pide presentes y con su forma. Que una
+implementación que no comparte una línea con la nuestra lea el archivo es lo
+que separa escribir GGUF de escribir un formato parecido.
+
+Se genera en flujo, fila por fila y en paralelo: el pico de memoria son 16 MB
+sea cual sea el modelo, así que el 14b no pide 14 GB. Y con semilla, porque un
+modelo que no se puede regenerar bit por bit es un archivo, no un modelo — hay
+un test que escribe el mini dos veces y compara los bytes.
+
+**Lo que NO es**: un modelo entrenado. Los pesos son ruido con la desviación
+correcta y genera texto sin sentido. Lo que sí es: el camino entero —definir,
+inicializar, cuantizar, escribir, leer, cargar— existiendo y verificado, que
+es lo que hay que tener antes de poder entrenar nada. El razonamiento sobre
+qué parte de daiss es nuestra y cuál no está en [DECISIONES](DECISIONES.md)
+§16.
+
+Lo que sigue bloqueado es **preentrenar** uno grande desde cero.
+
+Son miles de horas de GPU y cientos de GB de texto, y eso es aritmética, no
 pesimismo. Pero preentrenar desde cero no es la única forma de crear un modelo
 grande, ni la más usada:
 
@@ -224,21 +266,27 @@ opinión. Parámetros de un modelo según su vocabulario:
 Con el vocabulario de Qwen, un modelo chico es **casi todo tabla de
 búsqueda**: el transformer sería el 13% de los parámetros. Así que el orden es:
 
-1. **Un tokenizador propio.** Es lo primero, no un accesorio: sin él no hay
-   modelo chico que valga la pena. El crate `tokenizers` ya está en el árbol y
-   sabe entrenar un BPE.
-2. **Inicialización aleatoria** en vez de cargar pesos. Es un delta pequeño
-   sobre `src/training/model.rs`, que hoy construye la misma estructura leyendo
-   un GGUF — hay que hacer `Var` todos los parámetros en vez de solo los
-   adaptadores.
-3. **Medir un paso** con todos los parámetros entrenables, que es otro régimen:
+1. ~~**Inicialización aleatoria**~~ **hecho**: `daiss::escribir`, con
+   `normal(0, 0.02)` y las dos proyecciones que escriben en el residual
+   divididas por `sqrt(2 * capas)`, que es lo que evita que la varianza crezca
+   con la profundidad.
+2. ~~**Exportar a GGUF**~~ **hecho**: `gguf_write`, en flujo y verificado
+   contra candle. Lo que se cree acá lo sirve el mismo motor y corre en un
+   teléfono.
+3. ~~**Un tokenizador propio**~~ **hecho**: `src/tokenizer.rs`, un BPE a nivel
+   de bytes con entrenamiento propio — sin el crate `tokenizers`, que queda
+   solo para comparar. Medido sobre texto que no vio, el nuestro de 8.192
+   necesita **3,4% más tokens** que el de Qwen de 151.936, y eso lleva a
+   daiss-mini de 94% tabla de búsqueda y 82,5 M de parámetros a **47% y
+   8,9 M** — nueve veces más chico. Con dos salvedades medidas: el
+   entrenamiento se satura en 7.185 fusiones porque el corpus son 382 KB, y el
+   texto de prueba es del mismo dominio, así que parte del 3,4% es
+   especialización ([DECISIONES](DECISIONES.md) §19). **Lo que falta ahora es
+   un corpus**, no código.
+4. **Medir un paso** con todos los parámetros entrenables, que es otro régimen:
    el LoRA entrena el 0,1% y acá se entrena el 100%, así que el optimizador
-   deja de ser gratis y la memoria del backward crece mucho.
-4. **Exportar a GGUF**, para que lo creado lo pueda servir el mismo motor y
-   correr en un teléfono. Sin esto el modelo entrenado no sale del entrenador.
-
-Va después del punto 7 porque reusa todo lo de ahí, y lo que falta medir —el
-punto 3— no se puede estimar desde el LoRA.
+   deja de ser gratis y la memoria del backward crece mucho. Es lo único del
+   punto que no se puede estimar desde el LoRA, y reusa el §7.
 
 ### 9. El motor propio, reemplazando candle pieza por pieza
 
@@ -250,8 +298,8 @@ se usa es estrecha.
 |---|---|---|
 | **1** | lector de GGUF propio | **hecho**: coincide con candle en los 5 modelos, incluidos bytes crudos y offsets |
 | 1b | descuantización de los k-quants y de Q5_0/Q8_0 | **hecho**: los 8 formatos, **valor por valor idénticos** a candle en 21 tensores de los 5 modelos. El desempaquetado directo a `i8` cubre los 7 cuantizados, con sub-bloque de 16 y de 32 |
-| **2** | las operaciones: matmul cuantizada, RoPE, softmax | **la matmul le gana a candle en lote**: 1,19x a 8 filas sobre Q4_K y 1,05x sobre Q3_K. Con una fila candle sigue adelante, 1,8x y 2,7x |
-| 3 | el forward de Qwen2 sobre la pila propia | |
+| **2** | las operaciones: matmul cuantizada, RoPE, softmax | **hecha**: la matmul le gana a candle en lote, y con una fila —el decode— quedó **pareja** desde que los `f16` se convierten con `vcvtph2ps`; RoPE y softmax coinciden con candle **valor por valor** |
+| **3** | el forward de Qwen2 sobre la pila propia | **anda y genera texto**: idéntico a candle token por token, prefill 2,8x más rápido, decode a la par y 1,26x de punta a punta. Falta enchufarlo al servidor |
 | 4 | el backward cuantizado | es lo que candle no tiene y lo que desbloquea entrenar el 3B |
 
 **La matmul propia ya le gana a candle en lote.** Medida sobre el `ffn_gate`
@@ -284,23 +332,107 @@ porque candle usa una escala cada 256 valores y nosotros una cada 32.
 
 **Lo que falta:**
 
-1. **El caso de una fila**, donde candle sigue adelante — 1,8x sobre Q4_K y
-   2,7x sobre Q3_K. Ya no es un misterio: candle a una fila mueve los 9,2 MB en
-   0,32 ms, que son 28 GB/s y lo pone contra el muro de memoria de esta
-   máquina, mientras lo nuestro hace 2,4 ms de desempaquetado más 1,0 de kernel
-   en **dos pasadas separadas**, con la ida y vuelta a L1 entre una y otra.
-   El arreglo es fusionarlas: desempaquetar un bloque de 256 y multiplicarlo
-   sin que salga de los registros, que es lo que hace `vec_dot_q3k_q8k` de
-   candle ([DECISIONES](DECISIONES.md) §11). Pide AVX2 a mano por formato, así
-   que es trabajo de días y no de horas — y es la primera tarea donde el
-   ensamblador y Zig tienen algo real que hacer.
-2. **Elegir el camino según el formato.** En Q3_K gana el de enteros y en Q4_K
-   gana el de `f32` desde 2 filas, porque el arreglo de los límites le
-   aprovechó más. Hoy hay que elegir a mano; debería elegirlo el motor, y para
-   eso hace falta medirlo en los cinco modelos y no en uno.
+1. ~~**El caso de una fila**~~ **hecho para Q4_K**: el kernel fusionado
+   existe, `kernels::dot_q4k_i8` y `ops::matmul_i8_fusionado`, y pasó de 0,55x
+   a **0,85x** contra candle con una fila mientras gana **1,93-2,39x** con
+   ocho. Candle sigue adelante en el decode, pero por un 15%. Lo que falta son
+   **los otros seis formatos**, y cada uno pide su propio truco porque todos
+   restan algo —32 en Q6_K, 16 en Q5_0, hasta 4 en Q3_K según una máscara— y
+   restar rompe el rango sin signo que `vpmaddubsw` necesita. Q3_K es el
+   siguiente, porque es el formato del modelo por defecto
+   ([DECISIONES](DECISIONES.md) §11).
+2. ~~**Elegir el camino según el formato**~~ **hecho**: `ops::matmul_auto`
+   despacha por formato y por número de filas, con los umbrales medidos — y
+   resultó que hay **tres** caminos en juego y ninguno gana siempre. Lo que
+   falta es medirlo en los cinco modelos y no en un tensor, y en otro hardware,
+   porque el cruce se mueve ([DECISIONES](DECISIONES.md) §11).
 3. El microkernel con bloqueo de registros, que es donde el ensamblador tendría
    su primera oportunidad real — ver [DECISIONES](DECISIONES.md) §5, con el
    paso previo que le faltaba al criterio en §15.
+
+**RoPE y softmax están**, y los dos coinciden con candle valor por valor. De
+RoPE lo que importaba no era la velocidad sino acertar la convención: Qwen2 usa
+la de **mitades partidas** y no la intercalada, y elegir mal **no da ningún
+error** — el modelo carga, genera y dice cosas sin sentido. Por eso el test que
+vale es el que compara contra candle y no el de propiedades, aunque los dos
+estén. Las tablas de ángulos se calculan en `f64` y se guardan en `f32`: con
+32.768 de contexto el ángulo llega a 32.768 radianes, donde un `f32` tiene
+0,002 de resolución.
+
+**La atención también está**, con máscara causal y cabezas agrupadas, y
+coincide con candle valor por valor.
+
+**Y la fase 3 anda.** `src/forward.rs` encadena las piezas propias —lector de
+GGUF mapeado, descuantización, `matmul_auto`, RoPE, atención, softmax— hasta
+los logits, sin candle en el camino. Comparado contra candle sobre el 0,5B en
+Q4_K, con `examples/compare_forward.rs`:
+
+| régimen | tokens | nuestro | candle | peor diferencia | argmax |
+|---|---:|---:|---:|---:|---|
+| prefill | 6 | **68 ms** | 130 ms | 1,88% del rango | el mismo |
+| decode | 1 | 36 ms | 30 ms | 1,35% | el mismo |
+
+Y la prueba que de verdad decide, porque coincidir en un argmax puede ser
+suerte: generando con el mismo criterio voraz, las dos producen **los mismos
+13 tokens** y divergen en el catorceavo, donde dos candidatos estaban casi
+empatados.
+
+**De dónde sale esa diferencia, medido y no supuesto.** La hipótesis obvia era
+que la causa fuera nuestra cuantización de la entrada, así que se agregó
+`COSXAMIX_MATMUL=f32` para forzar el camino que no cuantiza nada. El resultado
+la descarta: con `f32` la diferencia de logits **sube** a 2,19% y la coincidencia
+**sube** a 16 tokens. O sea que no es nuestra cuantización. Nuestro camino de
+`f32` es en principio el más preciso de los dos y aun así se aparta un 2%, lo
+que apunta a la cuantización de activaciones de candle a Q8_K —una escala cada
+256 valores contra una cada 32, ya medida en 0,25% por matmul a nuestro favor—
+compuesta a lo largo de 24 capas.
+
+**Y se zanjó, con el modelo sin cuantizar.** `examples/make_f32_model.rs`
+convierte un GGUF cuantizado a `F32` con el escritor propio —tensor por
+tensor, así que un modelo más grande que la RAM se convierte igual— y la
+conversión es exacta: cero diferencias sobre los 136.134.656 valores de
+`token_embd`. Con esos pesos ninguno de los dos cuantiza nada, y entonces
+tienen que coincidir. Coinciden:
+
+| régimen | nuestro | candle | peor diferencia | argmax |
+|---|---:|---:|---:|---|
+| prefill | 136 ms | 146 ms | **0,0000** | el mismo |
+| decode | 92 ms | 119 ms | **0,0000** | el mismo |
+
+Y la generación voraz sale **idéntica en los 24 tokens**, no 13.
+
+Eso prueba las dos cosas que antes solo se podían inferir: el forward propio
+es **correcto**, y el 1,88-2,19% del modelo cuantizado era **íntegramente
+cuantización**, de los dos lados.
+
+### Y genera
+
+`src/sampler.rs` es el muestreador propio —temperatura y núcleo de top-p, la
+misma semántica que el `LogitsProcessor` de candle— y `Modelo::generar` hace
+el prefill de una vez y después va de a un token, parando en el `eos` del
+archivo o cuando el que recibe los tokens dice que basta. Sobre el 0,5B, con
+el mismo prompt de chat que arma el bot y los dos motores calentados:
+
+| | prefill | decode | total |
+|---|---:|---:|---:|
+| propio | **303–315 ms** | 23,0–23,5 tok/s | **2,06–2,09 s** |
+| candle | 864–891 ms | 23,4–23,5 tok/s | 2,61–2,64 s |
+
+Las dos secuencias salen **idénticas en los 42 tokens**, en las dos corridas.
+El prefill gana por lo mismo que gana la matmul en lote, y el decode queda a la
+par por lo mismo que la matmul de una fila.
+
+La primera medición dio un prefill **9x peor** que candle, y era el disco: el
+mapeo trae los pesos en el primer toque, así que la primera llamada leía 0,45
+GB a los 41 MB/s de F:, mientras candle los lee en `from_gguf`, fuera de su
+cronómetro, y encima con el archivo ya en caché gracias a nosotros. Los dos lo
+pagan; en sitios distintos. Ahora los dos calientan antes de medir.
+
+De paso, el experimento encontró un bug que nadie habría visto de otra forma:
+`matmul_auto` mandaba los formatos sin cuantizar al camino de enteros, que no
+tiene nada que desempaquetar, y fallaba con *"F32: sin desempaquetado directo
+a i8"*. Nunca había aparecido porque todos los modelos vienen cuantizados. Ya
+está arreglado y el test del despacho cubre `F32` y `F16`.
 
 **La regla del reemplazo**: nada sale de candle hasta que la pieza propia dé lo
 mismo sobre los modelos reales. Candle se queda como dependencia de **test**

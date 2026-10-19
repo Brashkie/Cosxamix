@@ -39,7 +39,14 @@ jobs:
         # verdad, 155 crates. Se prueban las dos porque la capa HTTP tiene que
         # seguir compilando sola — es lo que permite tocarla sin pagar el
         # minuto y medio del motor.
-        features: ['', 'candle', 'training']
+        #
+        # `asm_q4k` EJECUTA el kernel fusionado de Q4_K escrito en ensamblador
+        # contra la referencia. Es la unica forma de correr el de System V: se
+        # desarrolla en Windows, donde solo se puede ensamblar. En
+        # `ubuntu-latest` corre el de ELF y en `windows-latest` el de COFF; en
+        # `macos-latest`, que es ARM, el modulo no existe y no se prueba —el de
+        # Mach-O x86-64 solo lo ensambla el job `ensamblador`, no lo ejecuta—.
+        features: ['', 'candle', 'training', 'asm_q4k']
     steps:
       - uses: actions/checkout@v4
 
@@ -77,8 +84,8 @@ jobs:
             cargo clippy --features "${{ matrix.features }}" --all-targets -- -D warnings
           fi
 
-      # Ningun test carga un modelo: los 22 son unitarios y los que necesitan
-      # un GGUF son ejemplos, no tests. Por eso CI no baja 1,6 GB.
+      # Ningun test carga un modelo: todos son unitarios y los que necesitan un
+      # GGUF son ejemplos, no tests. Por eso CI no baja 1,6 GB.
       - name: Tests
         shell: bash
         run: |
@@ -185,6 +192,40 @@ jobs:
           file target/aarch64-unknown-linux-gnu/release/cosxamix
           file target/aarch64-unknown-linux-gnu/release/cosxamix | grep -q 'ARM aarch64'
 
+  # ── Ejecutar en ARM, no solo compilar ────────────────────────────────────
+  #
+  # `cruzar` demuestra que el camino de ARM compila; este lo EJECUTA, en un
+  # runner ARM64 nativo. Hace falta por el kernel NEON de Q4_K
+  # (`kernels/q4k_neon.s`): la maquina de desarrollo es x86-64 y no puede
+  # correrlo, y sin esto el unico lugar donde se probaria es un telefono.
+  #
+  # Los runners ARM de GitHub son Neoverse N2, que tiene `dotprod`, asi que los
+  # tests del kernel corren de verdad y no salen por el `return` de "esta CPU no
+  # tiene sdot". Mientras `q4k_neon.s` no exista, el modulo no se compila y el
+  # job prueba igual el de Zig en ARM, que es el que el NEON tiene que superar.
+  arm:
+    name: ejecutar en ARM64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/instalar-zig
+
+      - name: Que esta CPU tenga sdot
+        run: grep -m1 -o -w asimddp /proc/cpuinfo || echo "SIN dotprod: los tests del kernel NEON se saltan"
+
+      - name: Clippy
+        run: cargo clippy --features zig,asm_q4k --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --features zig,asm_q4k
+
+      # No decide nada —un runner compartido mide con ruido y no es el telefono—,
+      # pero deja en el log el orden de magnitud de escalar, Zig y NEON en la
+      # misma maquina, que es la comparacion que importa.
+      - name: Bench del fusionado
+        run: cargo bench --features zig,asm_q4k --bench kernels -- dot_q4k_i8 --warm-up-time 1 --measurement-time 3
+
   # -- Que el ensamblador ensamble en los tres formatos de objeto ----------
   #
   # El kernel de `kernels/*.s` depende de TRES cosas de la plataforma, no de
@@ -203,11 +244,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rustup target add x86_64-unknown-linux-gnu x86_64-apple-darwin
+      - run: rustup target add x86_64-unknown-linux-gnu x86_64-apple-darwin aarch64-unknown-linux-gnu aarch64-apple-darwin
+      # Con `asm_q4k`: sin la feature los `.s` de Q4_K no entran al build y
+      # este job no los veria.
       - name: ELF
-        run: cargo build --lib --target x86_64-unknown-linux-gnu
+        run: cargo build --lib --features asm_q4k --target x86_64-unknown-linux-gnu
       - name: Mach-O
-        run: cargo build --lib --target x86_64-apple-darwin
+        run: cargo build --lib --features asm_q4k --target x86_64-apple-darwin
+      # El NEON es un solo archivo para ELF y Mach-O, y Mach-O es el que
+      # rechaza directivas: aca se ve antes que en un Mac.
+      - name: ARM64 ELF
+        run: cargo build --lib --features asm_q4k --target aarch64-unknown-linux-gnu
+      - name: ARM64 Mach-O
+        run: cargo build --lib --features asm_q4k --target aarch64-apple-darwin
       # COFF lo cubre la matriz de Windows, que compila el binario entero.
 
 

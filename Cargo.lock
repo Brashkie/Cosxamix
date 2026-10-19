@@ -334,13 +334,14 @@ dependencies = [
 
 [[package]]
 name = "cosxamix"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "candle-core",
  "candle-nn",
  "candle-transformers",
  "criterion",
+ "memmap2",
  "num_cpus",
  "rayon",
  "serde",

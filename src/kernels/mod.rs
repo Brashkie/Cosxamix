@@ -45,6 +45,27 @@ pub mod x86;
 #[cfg(target_arch = "x86_64")]
 pub mod x86_asm;
 
+/// El hueco para el kernel fusionado de Q4_K escrito a mano, con el andamio
+/// —puente, envoltorio, tests y bench— ya puesto.
+///
+/// Detras de la feature `asm_q4k`, apagada por defecto: el cuerpo del kernel
+/// lo escribe una persona en `kernels/q4k_avx2_*.s` y hasta que existan esos
+/// archivos este modulo no se compila. El contrato esta documentado adentro, y
+/// la especificacion de lo que tiene que calcular es `scalar::dot_q4k_i8`.
+#[cfg(all(
+    feature = "asm_q4k",
+    any(hay_q4k_asm, hay_q4k_fila, hay_q4k_completo),
+    target_arch = "x86_64"
+))]
+pub mod q4k_asm;
+
+/// El mismo contrato completo de Q4_K en ensamblador para ARM64, con `sdot`,
+/// que es la unica forma de usar esa instruccion desde este proyecto: Rust
+/// estable no la expone y Zig no la genera. Fuera del despachador hasta que se
+/// mida en ARM de verdad. Ver la cabecera del modulo.
+#[cfg(all(feature = "asm_q4k", hay_q4k_neon, target_arch = "aarch64"))]
+pub mod q4k_neon;
+
 #[cfg(feature = "zig")]
 pub mod zig;
 
@@ -79,8 +100,16 @@ pub fn disponibles() -> Vec<Backend> {
     #[allow(unused_mut)]
     let mut v = vec![Backend::Escalar];
 
+    // F16C tambien: el kernel fusionado de Q4_K convierte los f16 de cada
+    // bloque con `vcvtph2ps`, que es la mitad de su ventaja. Todo procesador
+    // con AVX2 tiene F16C —salio antes, en Ivy Bridge y Piledriver—, asi que en
+    // la practica no excluye a nadie; se pregunta igual porque una maquina
+    // virtual puede esconder una extension y dejar la otra.
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+    if is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("fma")
+        && is_x86_feature_detected!("f16c")
+    {
         v.push(Backend::Avx2);
     }
 
@@ -247,6 +276,91 @@ pub fn dot_i8_escalado(a: &[i8], b: &[i8], esc_a: &[f32], esc_b: &[f32], bloque:
     }
 
     scalar::dot_i8_escalado(a, b, esc_a, esc_b, bloque)
+}
+
+/// Producto punto de una fila en **Q4_K** contra una entrada en `i8`, sin
+/// desempaquetar los pesos a ningun buffer.
+///
+/// Es el kernel fusionado. El camino de [`dot_i8_escalado`] necesita que
+/// alguien haya desempaquetado la fila antes, y medido eso era el 94% del
+/// trabajo de un hilo; aca cada sub-bloque se desempaqueta en registros y se
+/// consume en el acto.
+///
+/// Solo Q4_K por ahora, y a proposito: es el unico formato cuyos valores son
+/// enteros **sin signo** sin corrimiento, que es justo lo que `vpmaddubsw`
+/// pide. Los demas necesitan restar antes —32 en Q6_K, 16 en Q5_0— y eso rompe
+/// el rango sin signo.
+pub fn dot_q4k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
+    assert!(
+        xq.len().is_multiple_of(256),
+        "dot_q4k_i8: la fila tiene que ser multiplo de 256"
+    );
+    assert_eq!(xe.len(), xq.len() / 32, "dot_q4k_i8: faltan escalas");
+    assert_eq!(xs.len(), xe.len(), "dot_q4k_i8: faltan sumas");
+    assert!(
+        bloques.len() >= xq.len() / 256 * 144,
+        "dot_q4k_i8: faltan bytes de pesos"
+    );
+
+    // El ensamblador del contrato COMPLETO va primero cuando esta: le gana a
+    // los intrinsecos en tres pasadas de tres, entre 1,04x y 1,08x, con los
+    // dos usando `vcvtph2ps`. Es el primer ensamblador del proyecto en el
+    // camino caliente, y entro por la regla 3 como cualquier otro kernel:
+    // midiendo. Los contratos por bloque y por fila no estan aca porque los
+    // dos pierden contra los intrinsecos —ver DECISIONES §5—.
+    #[cfg(all(feature = "asm_q4k", hay_q4k_completo, target_arch = "x86_64"))]
+    {
+        if matches!(elegido(), Backend::Avx2 | Backend::Zig) {
+            return unsafe { q4k_asm::dot_q4k_i8_asm_completo(bloques, xq, xe, xs) };
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if matches!(elegido(), Backend::Avx2 | Backend::Zig) {
+            return unsafe { x86::dot_q4k_i8_avx2(bloques, xq, xe, xs) };
+        }
+    }
+
+    // Fuera de x86-64 el de Zig es el UNICO camino vectorizado: el de arriba
+    // usa `core::arch::x86_64` y ni siquiera compila. Sin esto, ARM y Termux
+    // corren el bucle mas caliente del motor byte a byte.
+    #[cfg(feature = "zig")]
+    {
+        if elegido() == Backend::Zig {
+            return zig::dot_q4k_i8(bloques, xq, xe, xs);
+        }
+    }
+
+    scalar::dot_q4k_i8(bloques, xq, xe, xs)
+}
+
+/// Igual que [`dot_q4k_i8`] pero para **Q3_K**, que es el formato dominante
+/// del modelo por defecto.
+///
+/// Necesita un rodeo que Q4_K no: sus valores llevan signo, −4 a 3, asi que se
+/// les suma 4 y se descuenta con la suma de la entrada. El detalle, en
+/// [`scalar::dot_q3k_i8`].
+pub fn dot_q3k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
+    assert!(
+        xq.len().is_multiple_of(256),
+        "dot_q3k_i8: la fila tiene que ser multiplo de 256"
+    );
+    assert_eq!(xe.len(), xq.len() / 16, "dot_q3k_i8: faltan escalas");
+    assert_eq!(xs.len(), xe.len(), "dot_q3k_i8: faltan sumas");
+    assert!(
+        bloques.len() >= xq.len() / 256 * 110,
+        "dot_q3k_i8: faltan bytes de pesos"
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if matches!(elegido(), Backend::Avx2 | Backend::Zig) {
+            return unsafe { x86::dot_q3k_i8_avx2(bloques, xq, xe, xs) };
+        }
+    }
+
+    scalar::dot_q3k_i8(bloques, xq, xe, xs)
 }
 
 pub fn silu(salida: &mut [f32], entrada: &[f32]) {
@@ -554,5 +668,154 @@ mod tests {
     fn rmsnorm_longitudes_distintas_avisan() {
         let mut s = [0.0f32; 2];
         rmsnorm(&mut s, &[1.0, 2.0], &[1.0], 1e-5);
+    }
+
+    /// El kernel fusionado tiene que dar lo mismo que desempaquetar y despues
+    /// multiplicar, que es el camino ya verificado contra candle.
+    ///
+    /// No se exige igualdad de bits: los dos suman en otro orden y en `f32` el
+    /// orden importa. Se exige que la diferencia sea despreciable frente al
+    /// tamano del resultado, que es lo unico que se puede exigir.
+    #[test]
+    fn el_fusionado_coincide_con_desempaquetar_y_multiplicar() {
+        use crate::gguf::TipoGgml;
+
+        for (tipo, bytes_bloque) in [(TipoGgml::Q4K, 144usize), (TipoGgml::Q3K, 110)] {
+            let n_bloques = 8usize; // 2048 valores, el ancho del 3B
+            let k = n_bloques * 256;
+            let sub = crate::quant::sub_bloque(tipo).unwrap();
+            let pesos: Vec<u8> = (0..n_bloques * bytes_bloque)
+                .map(|i| ((i * 131 + 17) % 251) as u8)
+                .collect();
+
+            let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.013).sin()).collect();
+            let mut xq = vec![0i8; k];
+            let mut xe = vec![0f32; k / sub];
+            crate::ops::cuantizar_i8_en(&x, &mut xq, &mut xe, sub);
+            let xs: Vec<f32> = xq
+                .chunks(sub)
+                .map(|c| c.iter().map(|v| *v as i32).sum::<i32>() as f32)
+                .collect();
+
+            // El camino de referencia: desempaquetar y multiplicar.
+            let mut wq = vec![0i8; k];
+            let mut we = vec![0f32; k / sub];
+            let mut wd = vec![0f32; k / sub];
+            assert_eq!(
+                crate::quant::desempaquetar_i8(tipo, &pesos, &mut wq, &mut we, &mut wd).unwrap(),
+                sub
+            );
+            let mut esperado = dot_i8_escalado(&wq, &xq, &we, &xe, sub);
+            for b in 0..k / sub {
+                esperado += wd[b] * xe[b] * xs[b];
+            }
+
+            let (escalar, despachado) = if tipo == TipoGgml::Q4K {
+                (
+                    scalar::dot_q4k_i8(&pesos, &xq, &xe, &xs),
+                    dot_q4k_i8(&pesos, &xq, &xe, &xs),
+                )
+            } else {
+                (
+                    scalar::dot_q3k_i8(&pesos, &xq, &xe, &xs),
+                    dot_q3k_i8(&pesos, &xq, &xe, &xs),
+                )
+            };
+
+            // El de Zig se comprueba aparte, porque en x86-64 el despachador
+            // elige AVX2 y nunca lo llamaria: sin esto, el unico camino que
+            // tiene ARM se quedaria sin test en la maquina donde se desarrolla.
+            #[cfg(feature = "zig")]
+            if tipo == TipoGgml::Q4K {
+                let suyo = zig::dot_q4k_i8(&pesos, &xq, &xe, &xs);
+                assert!(
+                    (suyo - escalar).abs() / esperado.abs().max(1.0) < 1e-4,
+                    "zig dio {suyo} y la referencia {escalar}"
+                );
+            }
+
+            let escala = esperado.abs().max(1.0);
+            for (quien, v) in [("escalar", escalar), ("despachado", despachado)] {
+                assert!(
+                    (v - esperado).abs() / escala < 1e-4,
+                    "{tipo:?} {quien} dio {v} y el camino verificado {esperado}"
+                );
+            }
+
+            // Y el escalar y el vectorizado tienen que coincidir entre si, que
+            // es lo que detecta un error en los intrinsecos y no en la formula.
+            assert!(
+                (escalar - despachado).abs() / escala < 1e-5,
+                "{tipo:?}: escalar {escalar} contra vectorizado {despachado}"
+            );
+        }
+    }
+
+    /// El desempaquetado sin ramas de las escalas de Q4_K tiene que dar
+    /// **exactamente** lo mismo que `escala_y_minimo`, que es la versión
+    /// legible y la que está verificada contra candle.
+    ///
+    /// Exacto y no aproximado: las escalas se calculan con las mismas
+    /// multiplicaciones en el mismo orden, así que un solo bit de diferencia
+    /// significa una máscara o un corrimiento mal puesto. Se prueban miles de
+    /// bloques porque cada uno de los 96 bits de las escalas tiene que caer en
+    /// su sitio.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn las_escalas_sin_ramas_coinciden_con_las_legibles() {
+        if !matches!(elegido(), Backend::Avx2 | Backend::Zig) {
+            return;
+        }
+        let mut estado = 0x9E37_79B9_7F4A_7C15u64;
+        let mut azar = || {
+            estado ^= estado << 13;
+            estado ^= estado >> 7;
+            estado ^= estado << 17;
+            estado
+        };
+        for _ in 0..5000 {
+            let mut bloque = [0u8; 144];
+            for b in bloque.iter_mut() {
+                *b = azar() as u8;
+            }
+            // `d` y `dmin` validos: con bytes al azar podrian ser infinito.
+            let d = 0.001 + (azar() % 1000) as f32 * 1e-5;
+            let dmin = 0.0005 + (azar() % 1000) as f32 * 1e-5;
+            bloque[0..2].copy_from_slice(&crate::quant::f32_a_f16(d).to_le_bytes());
+            bloque[2..4].copy_from_slice(&crate::quant::f32_a_f16(dmin).to_le_bytes());
+            let xe: Vec<f32> = (0..8).map(|_| (azar() % 1000) as f32 * 1e-3).collect();
+            let xs: Vec<f32> = (0..8).map(|_| (azar() % 4000) as f32 - 2000.0).collect();
+
+            let mut desp = unsafe { std::arch::x86_64::_mm256_setzero_ps() };
+            let nuevas = unsafe { x86::escalas_q4k(&bloque, &xe, &xs, &mut desp) };
+
+            let d = crate::quant::leer_f16(&bloque, 0);
+            for j in 0..8 {
+                let (sc, _) = crate::quant::escala_y_minimo(j, &bloque[4..16]);
+                let esperada = d * sc as f32 * xe[j];
+                assert_eq!(
+                    nuevas[j].to_bits(),
+                    esperada.to_bits(),
+                    "escala {j}: sin ramas {} y legible {esperada}",
+                    nuevas[j]
+                );
+            }
+
+            // Y el desplazamiento, con tolerancia: ahi hay un FMA, que
+            // redondea una vez donde la cuenta escalar redondea dos.
+            let dmin = crate::quant::leer_f16(&bloque, 2);
+            let mut esperado = 0f32;
+            for j in 0..8 {
+                let (_, mn) = crate::quant::escala_y_minimo(j, &bloque[4..16]);
+                esperado += dmin * mn as f32 * xe[j] * xs[j];
+            }
+            let mut v = [0f32; 8];
+            unsafe { std::arch::x86_64::_mm256_storeu_ps(v.as_mut_ptr(), desp) };
+            let obtenido: f32 = v.iter().sum();
+            assert!(
+                (obtenido - esperado).abs() <= esperado.abs() * 1e-5 + 1e-6,
+                "desplazamiento: sin ramas {obtenido} y legible {esperado}"
+            );
+        }
     }
 }

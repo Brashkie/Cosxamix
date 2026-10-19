@@ -35,7 +35,7 @@ use std::path::Path;
 ///
 /// Los números son los del formato y no se pueden cambiar: están escritos en
 /// los archivos que ya existen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TipoGgml {
     F32 = 0,
     F16 = 1,
@@ -366,6 +366,81 @@ impl Gguf {
     }
 }
 
+/// Los pesos del archivo, mapeados en memoria virtual.
+///
+/// Reemplaza al camino de [`Gguf::datos_de`], que abre el archivo **de nuevo
+/// por cada tensor** y copia sus bytes a un `Vec`. En el daiss-7b eso son 339
+/// aperturas y 7,5 GB copiados al montículo; acá es un mapeo y cero copias,
+/// porque [`Pesos::de`] devuelve una porción que apunta al archivo.
+///
+/// Que devuelva `&[u8]` y no `Vec<u8>` es el punto: `descuantizar`,
+/// `desempaquetar_i8` y las dos `matmul` ya reciben `&[u8]`, así que el camino
+/// entero desde el disco hasta el producto punto queda sin una sola copia.
+///
+/// **El archivo no se puede modificar mientras esto viva.** Un mapeo no es una
+/// copia: si otro proceso trunca o reescribe el archivo, las porciones ya
+/// entregadas pasan a leer otra cosa, o el proceso recibe un SIGBUS. Para pesos
+/// de un modelo es la condición normal —se escriben una vez y se leen— y es la
+/// razón por la que `gguf_write` escribe a un temporal y renombra.
+pub struct Pesos {
+    mapa: memmap2::Mmap,
+    inicio_datos: u64,
+}
+
+impl Pesos {
+    pub fn abrir(g: &Gguf, ruta: &Path) -> Resultado<Self> {
+        let f = File::open(ruta).map_err(|e| format!("no pude abrir {}: {e}", ruta.display()))?;
+        // SEGURIDAD: se cumple la condición documentada arriba — el archivo no
+        // se modifica mientras el mapeo viva. No hay forma de garantizarlo con
+        // el sistema de tipos porque el dueño del archivo es el sistema
+        // operativo y no este proceso.
+        let mapa = unsafe { memmap2::Mmap::map(&f) }
+            .map_err(|e| format!("no pude mapear {}: {e}", ruta.display()))?;
+        if (mapa.len() as u64) < g.inicio_datos {
+            return Err(format!(
+                "el archivo mide {} y los datos empiezan en {}",
+                mapa.len(),
+                g.inicio_datos
+            ));
+        }
+        Ok(Self {
+            mapa,
+            inicio_datos: g.inicio_datos,
+        })
+    }
+
+    /// Los bytes de un tensor, sin copiarlos.
+    pub fn de(&self, info: &InfoTensor) -> Resultado<&[u8]> {
+        // Las TRES cuentas van comprobadas, no solo la última. La suma de
+        // `inicio_datos` y `offset` se desbordaba antes de llegar a la
+        // comprobación de abajo, y en release eso da un índice envuelto que
+        // apunta a cualquier parte del mapeo: lo encontró el test que probaba
+        // un offset absurdo, que es exactamente para lo que estaba escrito.
+        let desde = self
+            .inicio_datos
+            .checked_add(info.offset)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| format!("{}: el offset se desborda", info.nombre))?;
+        let hasta = desde
+            .checked_add(info.bytes())
+            .ok_or_else(|| format!("{}: el tamaño se desborda", info.nombre))?;
+        // Comprobar antes de cortar: una porción fuera de rango sobre un mapeo
+        // no da un error, da una violación de acceso.
+        if hasta > self.mapa.len() {
+            return Err(format!(
+                "{}: pide hasta el byte {hasta} y el archivo mide {}",
+                info.nombre,
+                self.mapa.len()
+            ));
+        }
+        Ok(&self.mapa[desde..hasta])
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.mapa.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +598,42 @@ mod tests {
             assert_eq!(t.valores_por_bloque(), valores, "{t:?}: valores");
             assert_eq!(t.bytes_por_bloque(), bytes, "{t:?}: bytes");
         }
+    }
+
+    /// El mapeo tiene que entregar **los mismos bytes** que el camino que
+    /// copia, y tiene que rechazar un tensor que se salga del archivo.
+    ///
+    /// Lo segundo es lo que mas importa: `Pesos` es `unsafe` y una porcion
+    /// fuera de rango sobre un mapeo no da un `Err`, da una violacion de
+    /// acceso que mata el proceso. La comprobacion de limites de `de()` es lo
+    /// unico que separa un error con nombre de un `SIGSEGV`.
+    #[test]
+    fn el_mapeo_entrega_los_mismos_bytes_y_respeta_los_limites() {
+        let dir = std::env::temp_dir().join("cosxamix_mapeo");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ruta = dir.join("prueba.gguf");
+        std::fs::write(&ruta, gguf_de_prueba()).unwrap();
+
+        let g = Gguf::abrir(&ruta).unwrap();
+        let p = Pesos::abrir(&g, &ruta).unwrap();
+        assert_eq!(p.bytes(), std::fs::metadata(&ruta).unwrap().len() as usize);
+
+        for t in &g.tensores {
+            let copiado = g.datos_de(&ruta, t).unwrap();
+            let mapeado = p.de(t).unwrap();
+            assert_eq!(copiado, mapeado, "{}: el mapeo leyo otra cosa", t.nombre);
+        }
+
+        // Un tensor que pide mas alla del final: tiene que avisar, no morir.
+        let mut fuera = g.tensores[0].clone();
+        fuera.dims = vec![1 << 40];
+        let error = p.de(&fuera).unwrap_err();
+        assert!(error.contains("y el archivo mide"), "{error}");
+
+        // Y un offset absurdo, que es el otro camino al mismo desastre.
+        let mut lejos = g.tensores[0].clone();
+        lejos.offset = u64::MAX - 16;
+        assert!(p.de(&lejos).is_err());
     }
 }

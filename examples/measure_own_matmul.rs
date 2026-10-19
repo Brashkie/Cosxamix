@@ -13,7 +13,7 @@
 
 use std::time::Instant;
 
-use cosxamix::gguf::Gguf;
+use cosxamix::gguf::{Gguf, Pesos};
 
 fn mediana(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -68,7 +68,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let info = g.tensor("blk.0.ffn_gate.weight").ok_or("sin ffn_gate")?;
     // En el archivo las dimensiones van [entradas, salidas].
     let (k, n) = (info.dims[0] as usize, info.dims[1] as usize);
-    let pesos = g.datos_de(&ruta, info)?;
+    // Mapeado y sin copias. `datos_de` reabria el archivo por cada tensor y
+    // copiaba sus 12 MB al monticulo; medido, para releer el mismo tensor
+    // miles de veces el mapeo y la copia dan lo mismo dentro del ruido
+    // —1,17x, 0,93x y 1,04x en tres corridas—, asi que la copia no se
+    // justifica. Ver DECISIONES 18.
+    let mapa = Pesos::abrir(&g, &ruta)?;
+    let pesos: &[u8] = mapa.de(info)?;
 
     println!();
     println!(
@@ -79,8 +85,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!();
     println!(
-        "  {:<6}{:>10}{:>10}{:>10}{:>11}{:>10}{:>13}",
-        "filas", "candle", "f32", "i8 rodeo", "i8 directo", "vs candle", "directo/fila"
+        "  {:<6}{:>10}{:>10}{:>11}{:>11}{:>10}{:>13}",
+        "filas", "candle", "f32", "i8 directo", "fusionado", "vs candle", "fusion/fila"
     );
     println!("  {:-<70}", "");
 
@@ -93,21 +99,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut dif_max = 0f32;
 
-    for filas in [1usize, 2, 5, 8] {
+    for filas in [1usize, 2, 4, 8, 16, 32] {
         let x: Vec<f32> = (0..filas * k).map(|i| (i as f32 * 0.007).cos()).collect();
 
         let mut d = vec![0f32; filas * n];
         let t_nuestra = medir(|| {
-            cosxamix::ops::matmul((filas, k, n), &x, &pesos, info.tipo, &mut d).expect("matmul");
+            cosxamix::ops::matmul((filas, k, n), &x, pesos, info.tipo, &mut d).expect("matmul");
         });
 
-        let t_enteros = medir(|| {
-            cosxamix::ops::matmul_i8((filas, k, n), &x, &pesos, info.tipo, &mut d)
-                .expect("matmul_i8");
+        let t_fusion = medir(|| {
+            cosxamix::ops::matmul_i8_fusionado((filas, k, n), &x, pesos, info.tipo, &mut d)
+                .expect("fusionado");
         });
 
         let t_directo = medir(|| {
-            cosxamix::ops::matmul_i8_directo((filas, k, n), &x, &pesos, info.tipo, &mut d)
+            cosxamix::ops::matmul_i8_directo((filas, k, n), &x, pesos, info.tipo, &mut d)
                 .expect("directo");
         });
 
@@ -121,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Cuanto se parecen.
         let mut nuestro = vec![0f32; filas * n];
-        cosxamix::ops::matmul_i8_directo((filas, k, n), &x, &pesos, info.tipo, &mut nuestro)?;
+        cosxamix::ops::matmul_i8_fusionado((filas, k, n), &x, pesos, info.tipo, &mut nuestro)?;
         use candle_core::Module;
         let suyo = mm.forward(&xt)?.flatten_all()?.to_vec1::<f32>()?;
         let d = nuestro
@@ -131,22 +137,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .fold(0f32, f32::max);
         dif_max = dif_max.max(d);
 
+        let mejor = t_directo.min(t_fusion);
         println!(
-            "  {:<6}{:>10}{:>10}{:>10}{:>11}{:>10}{:>13}",
+            "  {:<6}{:>10}{:>10}{:>11}{:>11}{:>10}{:>13}",
             filas,
             format!("{t_candle:.3}"),
             format!("{t_nuestra:.3}"),
-            format!("{t_enteros:.3}"),
             format!("{t_directo:.3}"),
-            format!("{:.2}x", t_candle / t_directo),
-            format!("{:.3}", t_directo / filas as f64)
+            format!("{t_fusion:.3}"),
+            format!("{:.2}x", t_candle / mejor),
+            format!("{:.3}", t_fusion / filas as f64)
         );
     }
 
     let rango = {
         let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.007).cos()).collect();
         let mut d = vec![0f32; n];
-        cosxamix::ops::matmul_i8((1, k, n), &x, &pesos, info.tipo, &mut d)?;
+        cosxamix::ops::matmul_i8_fusionado((1, k, n), &x, pesos, info.tipo, &mut d)?;
         d.iter().cloned().fold(f32::MIN, f32::max) - d.iter().cloned().fold(f32::MAX, f32::min)
     };
 

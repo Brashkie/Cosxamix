@@ -1,6 +1,6 @@
 [package]
 name = "cosxamix"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Runtime de IA que sirve modelos de lenguaje por HTTP, compatible con el dialecto de Ollama"
 license     = "MIT"
@@ -23,6 +23,12 @@ serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Mapear el archivo de pesos en memoria virtual en vez de copiarlo al monticulo.
+# Un crate de 0 dependencias que envuelve `mmap` de POSIX y
+# `CreateFileMapping`/`MapViewOfFile` de Windows; escribirlo a mano seria
+# `unsafe` por plataforma para ahorrar una dependencia que no arrastra nada.
+memmap2            = "0.9"
 
 # ── Motor de inferencia (opcional) ───────────────────────────────────────────
 candle-core         = { version = "0.9", optional = true }
@@ -63,6 +69,13 @@ strip         = true
 #   cargo build --release --features zig
 zig = []
 
+# El kernel fusionado de Q4_K escrito a mano. Apagada por defecto, y no es
+# cosmetico: sin ella `src/kernels/q4k_asm.rs` no se compila y la ausencia de
+# los dos `.s` no rompe nada. Se enciende cuando esos archivos existan.
+#
+#   cargo test --features asm_q4k
+asm_q4k = []
+
 # Motor de inferencia real. Fuera del set por defecto porque son 155 crates y
 # ~85 s de compilacion: quien solo quiera tocar la capa HTTP no deberia pagar
 # eso.
@@ -93,6 +106,14 @@ required-features = ["candle"]
 
 [[example]]
 name = "check_cache"
+required-features = ["candle"]
+
+[[example]]
+name = "generate"
+required-features = ["candle"]
+
+[[example]]
+name = "compare_forward"
 required-features = ["candle"]
 
 [[example]]

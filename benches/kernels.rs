@@ -221,5 +221,190 @@ fn dot_enteros(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, dot, rmsnorm, silu, dot_enteros, ffi);
+/// Lo que cuesta cuantizar la entrada a `i8`.
+///
+/// Se mide porque esta en el camino de CADA multiplicacion: la entrada se
+/// cuantiza una vez por matmul, con los dos anchos que tiene el 3B — 2048,
+/// que es el modelo, y 11008, que es el interior del FFN.
+///
+/// La pregunta original de este bench —si recuantizar los pesos explicaba que
+/// `matmul_i8` fuera mas lenta que la de `f32`— quedo contestada y el rodeo
+/// se elimino: ahora se desempaqueta directo del formato con
+/// `quant::desempaquetar_i8`, sin pasar por `f32`.
+fn cuantizar(c: &mut Criterion) {
+    let mut g = c.benchmark_group("cuantizar_i8");
+    for n in [2_048usize, 11_008] {
+        let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013).sin()).collect();
+        let mut q = vec![0i8; n];
+        let mut e = vec![0f32; n / 32];
+        g.throughput(Throughput::Elements(n as u64));
+        g.bench_with_input(BenchmarkId::new("entrada", n), &n, |t, _| {
+            t.iter(|| {
+                cosxamix::ops::cuantizar_i8(black_box(&x), black_box(&mut q), black_box(&mut e))
+            })
+        });
+    }
+    g.finish();
+}
+
+/// Generar e inicializar pesos, que es el camino de escribir un daiss.
+///
+/// Mide lo que el codigo puede dar sin el disco de por medio: en esta maquina
+/// escribir un modelo va a 30 MB/s en el disco de F:, pero ese disco hace 41
+/// MB/s y punto, asi que el numero que dice si el generador es lento o no es
+/// este y no aquel.
+fn inicializar(c: &mut Criterion) {
+    use cosxamix::daiss::Azar;
+    let mut g = c.benchmark_group("daiss_init");
+    let n = 4_096usize;
+    g.throughput(Throughput::Elements(n as u64));
+    g.bench_function(BenchmarkId::new("normales", n), |t| {
+        t.iter(|| {
+            let mut azar = Azar::con_semilla(black_box(7));
+            let mut suma = 0f32;
+            for _ in 0..n / 2 {
+                let (a, b) = azar.normales(0.02);
+                suma += a + b;
+            }
+            black_box(suma)
+        })
+    });
+    g.finish();
+}
+
+/// El kernel fusionado de Q4_K en sus tres caminos.
+///
+/// Lo que decide si el de Zig vale la pena NO es si le gana a AVX2 —no le
+/// gana, AVX2 tiene 32 carriles contra 8— sino si le gana al **escalar**, que
+/// es lo unico que hay en ARM y en Termux. Ahi el de Rust usa
+/// `core::arch::x86_64` y ni siquiera compila.
+fn fusionado(c: &mut Criterion) {
+    use cosxamix::kernels;
+
+    let mut g = c.benchmark_group("dot_q4k_i8");
+    let n = 2_048usize; // el ancho del 3B
+    let pesos: Vec<u8> = (0..n / 256 * 144)
+        .map(|i| ((i * 131 + 17) % 251) as u8)
+        .collect();
+    let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013).sin()).collect();
+    let mut xq = vec![0i8; n];
+    let mut xe = vec![0f32; n / 32];
+    cosxamix::ops::cuantizar_i8(&x, &mut xq, &mut xe);
+    let xs: Vec<f32> = xq
+        .chunks(32)
+        .map(|c| c.iter().map(|v| *v as i32).sum::<i32>() as f32)
+        .collect();
+
+    g.throughput(Throughput::Elements(n as u64));
+    g.bench_function("escalar", |t| {
+        t.iter(|| kernels::scalar::dot_q4k_i8(black_box(&pesos), black_box(&xq), &xe, &xs))
+    });
+
+    // Q3_K aparte: su sub-bloque es de 16, asi que tiene el doble de escalas,
+    // y es el formato del modelo por defecto.
+    let pesos3: Vec<u8> = (0..n / 256 * 110)
+        .map(|i| ((i * 97 + 31) % 251) as u8)
+        .collect();
+    let mut xq3 = vec![0i8; n];
+    let mut xe3 = vec![0f32; n / 16];
+    cosxamix::ops::cuantizar_i8_en(&x, &mut xq3, &mut xe3, 16);
+    let xs3: Vec<f32> = xq3
+        .chunks(16)
+        .map(|c| c.iter().map(|v| *v as i32).sum::<i32>() as f32)
+        .collect();
+    g.bench_function("q3k escalar", |t| {
+        t.iter(|| kernels::scalar::dot_q3k_i8(black_box(&pesos3), black_box(&xq3), &xe3, &xs3))
+    });
+    #[cfg(target_arch = "x86_64")]
+    g.bench_function("q3k avx2", |t| {
+        t.iter(|| unsafe {
+            kernels::x86::dot_q3k_i8_avx2(black_box(&pesos3), black_box(&xq3), &xe3, &xs3)
+        })
+    });
+    #[cfg(target_arch = "x86_64")]
+    g.bench_function("avx2", |t| {
+        t.iter(|| unsafe {
+            kernels::x86::dot_q4k_i8_avx2(black_box(&pesos), black_box(&xq), &xe, &xs)
+        })
+    });
+    // Los dos bucles de ensamblador AISLADOS, con las escalas calculadas una
+    // vez fuera de lo cronometrado: separan el costo del bucle del de lo que
+    // lo rodea.
+    #[cfg(all(feature = "asm_q4k", hay_q4k_asm, hay_q4k_fila, target_arch = "x86_64"))]
+    {
+        let mut esc = vec![0f32; n / 32];
+        unsafe {
+            let mut d = std::arch::x86_64::_mm256_setzero_ps();
+            for bl in 0..n / 256 {
+                let e = kernels::x86::escalas_q4k(
+                    &pesos[bl * 144..bl * 144 + 144],
+                    &xe[bl * 8..bl * 8 + 8],
+                    &xs[bl * 8..bl * 8 + 8],
+                    &mut d,
+                );
+                esc[bl * 8..bl * 8 + 8].copy_from_slice(&e);
+            }
+        }
+        g.bench_function("solo bucle por bloque", |t| {
+            t.iter(|| unsafe {
+                let mut acc = [0f32; 8];
+                kernels::q4k_asm::bucle_por_bloque(black_box(&pesos), &xq, &esc, &mut acc);
+                acc
+            })
+        });
+        g.bench_function("solo bucle por fila", |t| {
+            t.iter(|| unsafe {
+                let mut acc = [0f32; 8];
+                kernels::q4k_asm::bucle_por_fila(black_box(&pesos), &xq, &esc, &mut acc);
+                acc
+            })
+        });
+    }
+    #[cfg(all(feature = "asm_q4k", hay_q4k_asm, target_arch = "x86_64"))]
+    g.bench_function("ensamblador por bloque", |t| {
+        t.iter(|| unsafe {
+            kernels::q4k_asm::dot_q4k_i8_asm(black_box(&pesos), black_box(&xq), &xe, &xs)
+        })
+    });
+    #[cfg(all(feature = "asm_q4k", hay_q4k_completo, target_arch = "x86_64"))]
+    g.bench_function("ensamblador completo", |t| {
+        t.iter(|| unsafe {
+            kernels::q4k_asm::dot_q4k_i8_asm_completo(black_box(&pesos), black_box(&xq), &xe, &xs)
+        })
+    });
+    #[cfg(all(feature = "asm_q4k", hay_q4k_fila, target_arch = "x86_64"))]
+    g.bench_function("ensamblador por fila", |t| {
+        t.iter(|| unsafe {
+            kernels::q4k_asm::dot_q4k_i8_asm_fila(black_box(&pesos), black_box(&xq), &xe, &xs)
+        })
+    });
+    #[cfg(feature = "zig")]
+    g.bench_function("zig", |t| {
+        t.iter(|| kernels::zig::dot_q4k_i8(black_box(&pesos), black_box(&xq), &xe, &xs))
+    });
+    // En ARM, contra el de Zig de justo arriba: es el camino vectorizado que
+    // hay hoy en esa arquitectura y el que tiene que superar. Sin `dotprod` no
+    // se mide, porque `sdot` seria una instruccion ilegal.
+    #[cfg(all(feature = "asm_q4k", hay_q4k_neon, target_arch = "aarch64"))]
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        g.bench_function("neon con sdot", |t| {
+            t.iter(|| unsafe {
+                kernels::q4k_neon::dot_q4k_i8_neon(black_box(&pesos), black_box(&xq), &xe, &xs)
+            })
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    dot,
+    rmsnorm,
+    silu,
+    dot_enteros,
+    cuantizar,
+    inicializar,
+    fusionado,
+    ffi
+);
 criterion_main!(benches);

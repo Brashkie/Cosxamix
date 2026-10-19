@@ -17,6 +17,21 @@ pub mod gguf;
 /// escribiendo en un buffer que da quien llama.
 pub mod quant;
 
+/// Escribir GGUF, que es lo que hace que un modelo propio exista como archivo.
+pub mod gguf_write;
+
+/// La familia de modelos propia: define, inicializa y escribe.
+pub mod daiss;
+
+/// Tokenizador propio: BPE a nivel de bytes, con entrenamiento.
+pub mod tokenizer;
+
+/// El forward de Qwen2 sobre la pila propia, sin candle.
+pub mod forward;
+
+/// Elegir el siguiente token: temperatura y top-p, sin candle.
+pub mod sampler;
+
 /// Las operaciones del motor propio. Empieza por la multiplicacion de
 /// matrices cuantizadas, que es donde se va el 99% del tiempo.
 pub mod ops;

@@ -19,7 +19,7 @@
 
 use std::time::Instant;
 
-use cosxamix::gguf::Gguf;
+use cosxamix::gguf::{Gguf, Pesos};
 use cosxamix::quant::{desempaquetar_i8, sub_bloque};
 
 fn mediana(mut v: Vec<f64>) -> f64 {
@@ -65,7 +65,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let g = Gguf::abrir(&ruta)?;
         let info = g.tensor("blk.0.ffn_gate.weight").ok_or("sin ffn_gate")?;
         let (k, n) = (info.dims[0] as usize, info.dims[1] as usize);
-        let pesos = g.datos_de(&ruta, info)?;
+        // Mapeado y sin copias. `datos_de` reabria el archivo por cada tensor y
+        // copiaba sus 12 MB al monticulo; medido, para releer el mismo tensor
+        // miles de veces el mapeo y la copia dan lo mismo dentro del ruido
+        // —1,17x, 0,93x y 1,04x en tres corridas—, asi que la copia no se
+        // justifica. Ver DECISIONES 18.
+        let mapa = Pesos::abrir(&g, &ruta)?;
+        let pesos: &[u8] = mapa.de(info)?;
         let tipo = info.tipo;
         let sub = sub_bloque(tipo).ok_or("sin sub-bloque")?;
         let bytes_fila = k / tipo.valores_por_bloque() * tipo.bytes_por_bloque();
@@ -97,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.007).cos()).collect();
         let mut dst = vec![0f32; n];
         let t_total = medir(20, || {
-            cosxamix::ops::matmul_i8_directo((1, k, n), &x, &pesos, tipo, &mut dst)
+            cosxamix::ops::matmul_i8_directo((1, k, n), &x, pesos, tipo, &mut dst)
                 .expect("directo");
         });
 

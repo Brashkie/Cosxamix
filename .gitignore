@@ -38,6 +38,13 @@ perf.data.old
 flamegraph.svg
 *.pdb
 
+# Objetos de ensamblar un `.s` a mano para verlo. Y `nul`: en Git Bash,
+# `-o nul` no descarta la salida como en cmd, crea un archivo con ese nombre, y
+# asi aparecieron dos objetos COFF sueltos en la raiz.
+*.obj
+*.o
+/nul
+
 # Python de los scripts de comprobacion. Son dos archivos sueltos, no un
 # paquete, pero al importarlos para testearlos Python deja su cache al lado.
 __pycache__/
