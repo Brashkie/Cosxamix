@@ -212,7 +212,12 @@ jobs:
       - uses: ./.github/actions/instalar-zig
 
       - name: Que esta CPU tenga sdot
-        run: grep -m1 -o -w asimddp /proc/cpuinfo || echo "SIN dotprod: los tests del kernel NEON se saltan"
+        # En bloque `|` y no en una linea: un `: ` dentro de un `run:` en linea
+        # YAML lo lee como otra clave, y el archivo entero deja de ser valido.
+        # Paso en la 0.4.0: CI no corrio y GitHub no lo muestra como un check
+        # fallido del commit, solo como "workflow file issue" en Actions.
+        run: |
+          grep -m1 -o -w asimddp /proc/cpuinfo || echo "SIN dotprod, los tests del kernel NEON se saltan"
 
       - name: Clippy
         run: cargo clippy --features zig,asm_q4k --all-targets -- -D warnings
