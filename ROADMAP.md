@@ -98,8 +98,9 @@ una expectativa, no un dato, y este proyecto no acepta expectativas:
   kernel propio que escribir con razón: sería *habilitar una plataforma*, el
   segundo brazo de la regla 3.
 - Los fusionados propios de Q4_K y Q3_K con `sdot` ya están, en C
-  (`kernels/neon_dotprod.c`): `cargo bench --features zig,c --bench kernels --
-  dot_q4k_i8` en Termux dice si entran al despachador.
+  (`kernels/neon_dotprod.c`), y desde la 0.5.1 en el despachador: 2,4x y 5,4x
+  en el runner ARM de CI. `cargo bench --features zig,c --bench kernels --
+  dot_q4k_i8` en Termux da la cifra del teléfono.
 - Comprobar cuál es el techo de memoria en un teléfono. Con ancho de banda
   mucho menor, el 3B puede quedar fuera y el 0,5B volver a tener sentido ahí.
 
@@ -346,8 +347,9 @@ porque candle usa una escala cada 256 valores y nosotros una cada 32.
    ([DECISIONES](DECISIONES.md) §11). **Su kernel fusionado pasó de 154 a 91
    ns por fila** con cuatro cambios de algoritmo, y el mismo algoritmo en C y
    en ensamblador no le gana ([DECISIONES](DECISIONES.md) §21). Lo que sigue
-   en lenguajes es ARM: **escrito** —`sdot` desde C, Q4_K y Q3_K
-   ([DECISIONES](DECISIONES.md) §22)—, falta medirlo en un teléfono.
+   en lenguajes es ARM: **hecho en la 0.5.1** —`sdot` desde C, 2,4x sobre
+   Zig en Q4_K y 5,4x sobre la referencia en Q3_K, en el despachador
+   ([DECISIONES](DECISIONES.md) §22)—. Falta la cifra de un teléfono.
 2. ~~**Elegir el camino según el formato**~~ **hecho**: `ops::matmul_auto`
    despacha por formato y por número de filas, con los umbrales medidos — y
    resultó que hay **tres** caminos en juego y ninguno gana siempre. Lo que

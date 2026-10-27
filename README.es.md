@@ -757,7 +757,7 @@ abierta al que gane la medición:
 | **Ensamblador** | el kernel fusionado de Q4_K en x86-64, primero en el despachador con `asm_q4k` (1,04x-1,08x sobre los intrínsecos). El de Q3_K (`asm_q3k`) empata con los intrínsecos, igual bit a bit | el cuerpo NEON, `kernels/q4k_neon.s`, y medirlo en ARM |
 | **Fortran** | arreglos sin aliasing, que es por lo que BLAS y LAPACK siguen siendo Fortran | un compilador en cada plataforma, y Android es justo el problema |
 | **Ada / SPARK** | demostrar que un kernel no desborda, en vez de comprobarlo con tests | un kernel lo bastante crítico como para que valga el toolchain |
-| **C** | dentro con la feature `c`, compilado con `zig cc` y sin libc. Extensiones de CPU por función (`__attribute__((target))`), y en ARM `vdotq_s32` —`sdot`— estable, que Rust no expone y Zig no genera. En x86 su Q3_K pierde un 4% con Rust ([DECISIONES §21](DECISIONES.md)) | medir en ARM los fusionados con `sdot` (`kernels/neon_dotprod.c`), que ya están |
+| **C** | dentro con la feature `c`, compilado con `zig cc` y sin libc. Extensiones de CPU por función (`__attribute__((target))`), y en ARM `vdotq_s32` —`sdot`— estable, que Rust no expone y Zig no genera. En x86 su Q3_K pierde un 4% con Rust ([DECISIONES §21](DECISIONES.md)) | la cifra de un teléfono: en el runner ARM de CI los fusionados con `sdot` ganan 2,4x (Q4_K) y 5,4x (Q3_K), y desde la 0.5.1 están en el despachador |
 
 El riesgo de eso no son los lenguajes: es tener **N sitios distintos** por donde
 cada uno se mete. Por eso hay una sola frontera, en `src/kernels/`, y tres

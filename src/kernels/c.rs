@@ -7,8 +7,9 @@
 //!   algoritmo que [`super::x86::dot_q3k_i8_avx2`], para comparar lenguajes.
 //!   Pierde un 4% con Rust y no está en el despachador (DECISIONES §21);
 //! - **ARM64**, `kernels/neon_dotprod.c`: los fusionados de Q4_K y Q3_K con
-//!   `sdot`, que Rust estable no expone y Zig no genera. Es donde C habilita
-//!   algo (DECISIONES §22).
+//!   `sdot`, que Rust estable no expone y Zig no genera. En el despachador
+//!   desde la 0.5.1, en las CPU con `dotprod`: 2,4x sobre Zig en Q4_K y 5,4x
+//!   sobre la referencia en Q3_K (DECISIONES §22).
 //!
 //! La especificación ejecutable son [`super::scalar::dot_q4k_i8`] y
 //! [`super::scalar::dot_q3k_i8`].
@@ -70,7 +71,9 @@ unsafe extern "C" {
 /// Raspberry Pi 4; sí desde el A55 y el A76, y los Neoverse de los servidores.
 #[cfg(target_arch = "aarch64")]
 pub fn hay_dotprod() -> bool {
-    std::arch::is_aarch64_feature_detected!("dotprod")
+    use std::sync::OnceLock;
+    static SI: OnceLock<bool> = OnceLock::new();
+    *SI.get_or_init(|| std::arch::is_aarch64_feature_detected!("dotprod"))
 }
 
 /// El fusionado de Q4_K con `sdot`.

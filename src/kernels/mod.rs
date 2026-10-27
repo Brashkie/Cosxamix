@@ -369,9 +369,19 @@ pub fn dot_q4k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
         }
     }
 
-    // Fuera de x86-64 el de Zig es el UNICO camino vectorizado: el de arriba
-    // usa `core::arch::x86_64` y ni siquiera compila. Sin esto, ARM y Termux
-    // corren el bucle mas caliente del motor byte a byte.
+    // En ARM64 con `dotprod`, el de C con `sdot` va primero: medido en el
+    // runner ARM de CI (Neoverse N2), 162 ns contra 382 del de Zig, 2,4x
+    // (DECISIONES §22). En un ARM sin la extension —A53, A72— sigue el de Zig.
+    #[cfg(all(feature = "c", target_arch = "aarch64"))]
+    {
+        if usar_sdot() {
+            return unsafe { c::dot_q4k_i8_neon(bloques, xq, xe, xs) };
+        }
+    }
+
+    // Fuera de x86-64 el de Zig es el UNICO camino vectorizado sin `sdot`: el
+    // de arriba usa `core::arch::x86_64` y ni siquiera compila. Sin esto, ARM
+    // y Termux corren el bucle mas caliente del motor byte a byte.
     #[cfg(feature = "zig")]
     {
         if elegido() == Backend::Zig {
@@ -380,6 +390,14 @@ pub fn dot_q4k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
     }
 
     scalar::dot_q4k_i8(bloques, xq, xe, xs)
+}
+
+/// Si se usan los kernels de C con `sdot`: la CPU tiene `dotprod` y no se
+/// forzó la referencia con `COSXAMIX_KERNEL=escalar`, que tiene que seguir
+/// midiendo la referencia y nada más.
+#[cfg(all(feature = "c", target_arch = "aarch64"))]
+fn usar_sdot() -> bool {
+    elegido() != Backend::Escalar && c::hay_dotprod()
 }
 
 /// Igual que [`dot_q4k_i8`] pero para **Q3_K**, que es el formato dominante
@@ -404,6 +422,16 @@ pub fn dot_q3k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
     {
         if usar_avx2() {
             return unsafe { x86::dot_q3k_i8_avx2(bloques, xq, xe, xs) };
+        }
+    }
+
+    // En ARM64 con `dotprod`, el de C con `sdot`: 367 ns contra 1998 de la
+    // referencia en el runner ARM de CI, 5,4x. Es el primer camino
+    // vectorizado de Q3_K en ARM, que es el formato del modelo por defecto.
+    #[cfg(all(feature = "c", target_arch = "aarch64"))]
+    {
+        if usar_sdot() {
+            return unsafe { c::dot_q3k_i8_neon(bloques, xq, xe, xs) };
         }
     }
 

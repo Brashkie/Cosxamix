@@ -773,7 +773,7 @@ open to whichever language wins the measurement:
 | **Assembly** | the fused Q4_K kernel on x86-64, first in the dispatcher with `asm_q4k` (1.04x-1.08x over intrinsics). The Q3_K one (`asm_q3k`) ties with intrinsics, bit for bit | the NEON body, `kernels/q4k_neon.s`, and measuring it on ARM |
 | **Fortran** | arrays without aliasing, which is why BLAS and LAPACK are still Fortran | a compiler on every platform, and Android is exactly the problem |
 | **Ada / SPARK** | proving a kernel cannot overflow, instead of testing that it doesn't | a kernel critical enough to justify the toolchain |
-| **C** | in with the `c` feature, built with `zig cc` and no libc. Per-function CPU extensions (`__attribute__((target))`), and on ARM a stable `vdotq_s32` — `sdot` — which Rust doesn't expose and Zig doesn't emit. On x86 its Q3_K loses 4% to Rust ([DECISIONES §21](DECISIONES.md)) | measuring on ARM the fused kernels with `sdot` (`kernels/neon_dotprod.c`), already written |
+| **C** | in with the `c` feature, built with `zig cc` and no libc. Per-function CPU extensions (`__attribute__((target))`), and on ARM a stable `vdotq_s32` — `sdot` — which Rust doesn't expose and Zig doesn't emit. On x86 its Q3_K loses 4% to Rust ([DECISIONES §21](DECISIONES.md)) | a phone measurement: on the CI ARM runner the `sdot` fused kernels win 2.4x (Q4_K) and 5.4x (Q3_K), and since 0.5.1 they are in the dispatcher |
 
 The risk in that isn't the languages: it's having **N different places** where
 each one gets in. That's why there is a single boundary, in `src/kernels/`, and

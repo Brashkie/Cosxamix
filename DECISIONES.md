@@ -1832,6 +1832,19 @@ Ahí se ve `zig` contra `c con sdot` y `q3k escalar` contra `q3k c con sdot`.
 Si gana, entra al despachador preguntando `dotprod`; en un A53 o un A72, que no
 la tienen, sigue el de Zig.
 
+**Ganó, y entró en la 0.5.1.** Medido en el runner ARM64 de CI, un Neoverse
+N2, fila de 2048:
+
+| | antes | con `sdot` | |
+|---|---:|---:|---:|
+| Q4_K | 382 ns (Zig) | 162 ns | 2,4x |
+| Q3_K | 1998 ns (referencia) | 367 ns | 5,4x |
+
+Q3_K es el número que importa: es el formato del modelo por defecto y en ARM no
+tenía ningún camino vectorizado. Falta la cifra de un teléfono, que con menos
+ancho de banda puede mover el reparto entre cómputo y memoria; con 2,4x y 5,4x
+de margen, no la decisión.
+
 ---
 
 ## Cifras que hubo que corregir

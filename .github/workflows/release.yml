@@ -50,15 +50,19 @@ jobs:
             target: x86_64-apple-darwin
             features: candle
 
-          # ── ARM: con Zig ────────────────────────────────────────────────
+          # ── ARM: con Zig y con C ────────────────────────────────────────
           #
           # Aqui si, y es la razon por la que Zig esta en el proyecto: el
           # camino de Rust usa `core::arch::x86_64`, que en ARM no existe, asi
           # que sin Zig estos binarios caerian a la referencia escalar, 19
           # veces mas lenta.
+          #
+          # Y `c` por `sdot` (kernels/neon_dotprod.c): 2,4x sobre Zig en Q4_K
+          # y 5,4x sobre la referencia en Q3_K, en las CPU con `dotprod`. La
+          # compila el mismo Zig con `zig cc`, sin libc ni SDK.
           - runner: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            features: zig,candle
+            features: zig,candle,c
             zig: true
             apt: gcc-aarch64-linux-gnu
           # Android va aparte de aarch64-unknown-linux-gnu y no es lo mismo:
@@ -67,12 +71,12 @@ jobs:
           # hace falta para Termux.
           - runner: ubuntu-latest
             target: aarch64-linux-android
-            features: zig,candle
+            features: zig,candle,c
             zig: true
             ndk: true
           - runner: macos-latest
             target: aarch64-apple-darwin
-            features: zig,candle
+            features: zig,candle,c
             zig: true
 
     steps:

@@ -9,6 +9,35 @@ acá va qué cambió, no por qué.
 
 ---
 
+## [0.5.1] - 2026-10-26
+
+Los kernels con `sdot` de la 0.5.0 se midieron en ARM de verdad, ganaron, y
+entran al despachador.
+
+### Cambiado
+
+- **`sdot` en el despachador de ARM64.** Con la feature `c` y una CPU con
+  `dotprod`, `kernels::dot_q4k_i8` y `kernels::dot_q3k_i8` usan los de
+  `kernels/neon_dotprod.c`. En un ARM sin la extensión —Cortex-A53, A72— sigue
+  el de Zig en Q4_K y la referencia en Q3_K. `COSXAMIX_KERNEL=escalar` sigue
+  forzando la referencia.
+- **Los binarios de ARM de la release llevan `c`**: Linux, Android (Termux) y
+  macOS. Los compila el mismo Zig que ya llevaban, con `zig cc`.
+
+### Medido
+
+En el runner ARM64 de CI (Neoverse N2), fila de 2048:
+
+| | antes | con `sdot` | |
+|---|---:|---:|---:|
+| Q4_K | 382 ns (Zig) | **162 ns** | **2,4x** |
+| Q3_K | 1998 ns (referencia: no había camino vectorizado) | **367 ns** | **5,4x** |
+
+Un runner compartido no es un teléfono, pero la diferencia es de 2,4x y 5,4x,
+no de un 5%: ningún ruido la explica.
+
+---
+
 ## [0.5.0] - 2026-10-26
 
 La compilación para las CPU sin AVX2 —la que `.cargo/config.toml` dice que hace
@@ -1268,6 +1297,7 @@ agrega una sección a uno y se olvida del otro, CI falla.
 - Verificado en esta versión: **22 tests**, 0 avisos, clippy limpio en las tres
   combinaciones (por defecto, `candle`, `zig,candle`).
 
+[0.5.1]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.3.0
