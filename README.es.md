@@ -146,6 +146,7 @@ Variables de entorno:
 | `COSXAMIX_GGUF` | `qwen2.5-3b-instruct-q3_k_m.gguf` | Cuál se precalienta al arrancar |
 | `COSXAMIX_RAM_MB` | `4096` | Presupuesto de memoria para los modelos cargados |
 | `RAYON_NUM_THREADS` | núcleos físicos | Hilos del cálculo matricial |
+| `COSXAMIX_MOTOR` | `propio` | El motor de la casa y sus kernels: 1,6-1,9x más rápido que candle por mensaje en el uso de WinsiBot, y 11/15 contra 10/15 en la batería ([DECISIONES §23](DECISIONES.md)). `candle` vuelve al de antes |
 
 **Todos los `.gguf` del directorio se registran**, no solo el de
 `COSXAMIX_GGUF`: esa variable dice cuál se precalienta, no cuál es el único

@@ -82,6 +82,27 @@ impl Cache {
         self.largo = 0;
     }
 
+    /// Se queda con los primeros `n` tokens.
+    ///
+    /// Es lo que permite reutilizar el prefijo común entre dos prompts: el
+    /// segundo mensaje de WinsiBot comparte el *system* con el primero y
+    /// después diverge, así que se conserva lo común y se tira el resto. Sin
+    /// recortar, la atención miraría tokens que ya no están en el prompt.
+    ///
+    /// Cada capa guarda `largo * dim_kv` valores, así que el ancho por token
+    /// sale de dividir.
+    pub fn truncar(&mut self, n: usize) {
+        if n >= self.largo {
+            return;
+        }
+        for (k, v) in self.k.iter_mut().zip(self.v.iter_mut()) {
+            let ancho = k.len() / self.largo;
+            k.truncate(n * ancho);
+            v.truncate(n * ancho);
+        }
+        self.largo = n;
+    }
+
     /// Lo que ocupa, en bytes.
     pub fn bytes(&self) -> usize {
         self.k

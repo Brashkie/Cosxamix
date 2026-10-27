@@ -1,6 +1,6 @@
 [package]
 name = "cosxamix"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "Runtime de IA que sirve modelos de lenguaje por HTTP, compatible con el dialecto de Ollama"
 license     = "MIT"

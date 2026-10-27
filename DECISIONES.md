@@ -1847,6 +1847,61 @@ de margen, no la decisión.
 
 ---
 
+## 23. El motor propio en el servidor, y por qué pasó a ser el de por defecto
+
+El forward propio ya generaba texto, pero solo desde un ejemplo. Enchufarlo
+al servidor fue escribir `MotorPropio` —sesiones, prefijo común, texto en
+partes— detrás del mismo trait que candle, y hacer que el gestor de modelos
+sirva cualquiera de los dos.
+
+**La medición que decide es la del uso real, no la del ejemplo.**
+`examples/generate` mide un prompt sin caché y 48 tokens: ahí el propio
+procesa el prompt 1,8x más rápido y escribe un 8% más lento, y la suma no dice
+mucho. WinsiBot manda siempre el mismo *system* y una pregunta distinta, con
+el *system* reaprovechado del caché; cada mensaje es entonces procesar una
+pregunta de ~15 tokens y escribir una respuesta de ~12. Medido así, con el 3B
+Q3_K_M y el servidor de verdad:
+
+| | candle | propio |
+|---|---:|---:|
+| carga del modelo | 2,7 – 3,6 s | **1,1 s** |
+| primer mensaje (nada en caché, ~155 tokens) | 8,3 – 12,9 s | **6,2 – 9,4 s** |
+| mensajes 2 a 8, media por mensaje | 2528 – 3727 ms | **1570 – 1940 ms** |
+| velocidad contando todo | 3,3 – 4,9 tok/s | **5,7 – 7,1 tok/s** |
+| tokens del *system* reaprovechados | 142 – 144 | 142 – 144 |
+
+**1,6 a 1,9 veces más rápido por mensaje**, y la carga en un tercio.
+
+**La calidad, con la batería y no con ocho preguntas.** La regla del
+reemplazo (ROADMAP §9) dice que nada sale de candle hasta que la pieza propia
+dé lo mismo sobre los modelos reales, y sobre un modelo cuantizado no da lo
+mismo token por token: diverge a los 5 tokens en el 3B y a los ~28 en el 0,5B.
+No es un error —sobre el modelo en F32 coinciden enteras, y la diferencia es
+íntegramente cuantización de los dos lados—, pero cambia qué se le contesta a
+la gente. En las ocho preguntas de la tabla cada motor erró un dato distinto,
+y ocho no alcanzan. Decidió la batería de 15 preguntas verificables con la
+que se eligió el 3B (§8), en modo voraz, sobre el mismo archivo:
+
+| | candle | propio |
+|---|---:|---:|
+| aciertos | 10/15 | **11/15** |
+| decode, mediana de 3 | 10,5 tok/s | **11,3 tok/s** |
+| prefill | 1782 ms | **1279 ms** |
+| carga, desde el disco | 43,7 s | **39,2 s** |
+
+candle saca el mismo 10/15 de cuando se eligió el 3B: la batería reproduce.
+En 13 de las 15 responden lo mismo. El propio acierta además la de dos pasos
+("100 menos 37, dividido por 7": 9, y candle dijo 25). Su respuesta del barco
+es confusa y cuenta solo porque nombra el agua, así que con rigor es 10 contra
+10 u 11 contra 10.
+
+**Igual o mejor en calidad, y 1,6-1,9x más rápido en el uso real: desde la
+0.6.0 es el de por defecto.** Candle no sale del proyecto: queda detrás de
+`COSXAMIX_MOTOR=candle` y como vara de los tests, que es lo que la regla del
+reemplazo pide que siga siendo.
+
+---
+
 ## Cifras que hubo que corregir
 
 Se listan porque una cifra mal medida dirige el trabajo hacia el lado

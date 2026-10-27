@@ -6,12 +6,20 @@
 //! opinar sobre si "suena mejor".
 //!
 //!   cargo run --release --features candle --example compare_models
+//!   cargo run --release --features candle --example compare_models -- --cuant
+//!   cargo run --release --features candle --example compare_models -- --motores
+//!
+//! `--motores` corre las mismas preguntas sobre el MISMO modelo —el 3B en
+//! Q3_K_M, el del bot— con candle y con el motor propio: es la batería que
+//! decide si el propio puede ser el de por defecto (DECISIONES §23).
 
 use std::path::Path;
 use std::time::Instant;
 
-use cosxamix::engine::{Mensaje, Motor, Peticion};
+use cosxamix::engine::{Mensaje, Peticion};
 use cosxamix::engine_candle::MotorCandle;
+use cosxamix::engine_manager::{MotorCargable, TipoMotor};
+use cosxamix::engine_own::MotorPropio;
 
 /// Pregunta, y qué tiene que aparecer en la respuesta para darla por buena.
 ///
@@ -60,13 +68,25 @@ const PRUEBAS: &[(&str, &[&str])] = &[
                                                                  &["aguila", "pez", "rana", "serpiente", "pollo", "gallina", "loro", "tiburon", "pinguino", "lagarto", "sapo", "ave", "pajaro", "cocodrilo", "tortuga", "abeja"]),
 ];
 fn medir(nombre: &str, gguf: &str, tok: &str) {
+    medir_con(nombre, gguf, tok, TipoMotor::Candle);
+}
+
+fn medir_con(nombre: &str, gguf: &str, tok: &str, tipo: TipoMotor) {
     let g = Path::new(gguf);
     if !g.exists() {
         println!("\n  {nombre}: no esta {gguf}, lo salteo");
         return;
     }
 
-    let m = match MotorCandle::nuevo(nombre, g, Path::new(tok)) {
+    let construido: Result<Box<dyn MotorCargable>, _> = match tipo {
+        TipoMotor::Candle => {
+            MotorCandle::nuevo(nombre, g, Path::new(tok)).map(|m| Box::new(m) as _)
+        }
+        TipoMotor::Propio => {
+            MotorPropio::nuevo(nombre, g, Path::new(tok)).map(|m| Box::new(m) as _)
+        }
+    };
+    let m = match construido {
         Ok(m) => m,
         Err(e) => {
             println!("\n  {nombre}: no se pudo construir ({e})");
@@ -176,6 +196,21 @@ fn main() {
     // cuantizaciones del 3B, que es otra pregunta: ahí el modelo es el mismo y
     // lo único que cambia es cuántos bytes pesa cada peso.
     let cuant = std::env::args().any(|a| a == "--cuant");
+
+    if std::env::args().any(|a| a == "--motores") {
+        for (nombre, tipo) in [
+            ("3b-q3_k_m candle", TipoMotor::Candle),
+            ("3b-q3_k_m propio", TipoMotor::Propio),
+        ] {
+            medir_con(
+                nombre,
+                "modelos/qwen2.5-3b-instruct-q3_k_m.gguf",
+                "modelos/tokenizer-3b.json",
+                tipo,
+            );
+        }
+        return;
+    }
 
     if cuant {
         // candle NO soporta los formatos IQ (IQ3_M, IQ2_XXS): su enumeración

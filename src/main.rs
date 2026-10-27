@@ -337,7 +337,7 @@ async fn salud() -> impl IntoResponse {
 /// Decide con qué motor arrancar.
 #[cfg(feature = "candle")]
 fn elegir_motor() -> (Arc<dyn Motor>, bool) {
-    use cosxamix::engine_manager::{GestorModelos, PRESUPUESTO_MB_POR_DEFECTO};
+    use cosxamix::engine_manager::{GestorModelos, TipoMotor, PRESUPUESTO_MB_POR_DEFECTO};
     use std::path::PathBuf;
 
     let dir = PathBuf::from(env("COSXAMIX_MODELOS", "./modelos"));
@@ -381,6 +381,7 @@ fn elegir_motor() -> (Arc<dyn Motor>, bool) {
             tracing::info!(
                 modelos = g.modelos().len(),
                 presupuesto_mb = presupuesto,
+                motor = ?TipoMotor::del_entorno(),
                 "catalogo listo"
             );
             // Precalentar al arrancar es la razón de ser de Cosxamix: el usuario

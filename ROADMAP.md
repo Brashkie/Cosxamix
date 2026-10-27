@@ -303,7 +303,7 @@ se usa es estrecha.
 | **1** | lector de GGUF propio | **hecho**: coincide con candle en los 5 modelos, incluidos bytes crudos y offsets |
 | 1b | descuantización de los k-quants y de Q5_0/Q8_0 | **hecho**: los 8 formatos, **valor por valor idénticos** a candle en 21 tensores de los 5 modelos. El desempaquetado directo a `i8` cubre los 7 cuantizados, con sub-bloque de 16 y de 32 |
 | **2** | las operaciones: matmul cuantizada, RoPE, softmax | **hecha**: la matmul le gana a candle en lote, y con una fila —el decode— quedó **pareja** desde que los `f16` se convierten con `vcvtph2ps`; RoPE y softmax coinciden con candle **valor por valor** |
-| **3** | el forward de Qwen2 sobre la pila propia | **anda y genera texto**: idéntico a candle token por token, prefill 2,8x más rápido, decode a la par y 1,26x de punta a punta. Falta enchufarlo al servidor |
+| **3** | el forward de Qwen2 sobre la pila propia | **anda y genera texto**: idéntico a candle token por token, prefill 2,8x más rápido, decode a la par y 1,26x de punta a punta. **Enchufado al servidor y el de por defecto desde la 0.6.0**: 1,6-1,9x más rápido que candle por mensaje usado como lo usa WinsiBot, y 11/15 contra 10/15 en la batería ([DECISIONES](DECISIONES.md) §23). `COSXAMIX_MOTOR=candle` vuelve al de antes |
 | 4 | el backward cuantizado | es lo que candle no tiene y lo que desbloquea entrenar el 3B |
 
 **La matmul propia ya le gana a candle en lote.** Medida sobre el `ffn_gate`

@@ -152,6 +152,7 @@ Environment variables:
 | `COSXAMIX_GGUF` | `qwen2.5-3b-instruct-q3_k_m.gguf` | Which one gets pre-warmed at startup |
 | `COSXAMIX_RAM_MB` | `4096` | Memory budget for loaded models |
 | `RAYON_NUM_THREADS` | physical cores | Threads for the matrix math |
+| `COSXAMIX_MOTOR` | `propio` | The in-house engine and its kernels: 1.6-1.9x faster than candle per message as WinsiBot uses it, and 11/15 vs 10/15 on the battery ([DECISIONES §23](DECISIONES.md)). `candle` goes back to the old one |
 
 **Every `.gguf` in the directory is registered**, not only the one in
 `COSXAMIX_GGUF`: that variable says which one is pre-warmed, not which one

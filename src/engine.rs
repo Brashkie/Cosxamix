@@ -20,6 +20,30 @@ pub struct Mensaje {
     pub contenido: String,
 }
 
+/// Arma el prompt con las marcas de turno que Qwen espera.
+///
+/// El formato **no** es decorativo: un modelo afinado para instrucciones se
+/// entrenó viendo estas marcas, y pasarle el texto pelado da respuestas
+/// notablemente peores sin que nada falle de forma visible. Es el error de
+/// integración más fácil de cometer y el más difícil de diagnosticar, porque
+/// el modelo contesta igual, solo que mal.
+///
+/// Acá y no en un motor: los dos —candle y el propio— tienen que armar
+/// exactamente el mismo prompt, o comparar uno contra otro no dice nada.
+pub fn formatear(mensajes: &[Mensaje]) -> String {
+    let mut p = String::new();
+    for m in mensajes {
+        let rol = match m.rol.as_str() {
+            "system" => "system",
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        p.push_str(&format!("<|im_start|>{rol}\n{}<|im_end|>\n", m.contenido));
+    }
+    p.push_str("<|im_start|>assistant\n");
+    p
+}
+
 /// Lo que se le pide a un motor para una generación.
 #[derive(Debug, Clone)]
 pub struct Peticion {

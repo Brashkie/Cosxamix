@@ -45,5 +45,10 @@ pub mod engine_candle;
 #[cfg(feature = "candle")]
 pub mod engine_manager;
 
+/// El motor propio detrás del trait `Motor`, para el servidor. Va con la
+/// feature `candle` solo por el tokenizador de Qwen (`tokenizers`).
+#[cfg(feature = "candle")]
+pub mod engine_own;
+
 #[cfg(feature = "training")]
 pub mod training;

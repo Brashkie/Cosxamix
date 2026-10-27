@@ -9,6 +9,81 @@ acá va qué cambió, no por qué.
 
 ---
 
+## [0.6.0] - 2026-10-27
+
+El motor propio llega al servidor, y es el de por defecto. El forward de la
+casa —y con él todos los kernels de `src/kernels/`: Zig, C, ensamblador—
+sirve las peticiones de verdad, con sesiones y caché de atención. Usado como
+lo usa WinsiBot, responde **1,6 a 1,9 veces más rápido** que candle por
+mensaje, y en la batería de 15 preguntas acierta **11 contra 10**.
+`COSXAMIX_MOTOR=candle` vuelve al de antes.
+
+### Añadido
+
+- **`MotorPropio`** (`src/engine_own.rs`): el motor propio detrás del mismo
+  trait `Motor` que candle. Copia del de candle lo que decide el resultado —la
+  plantilla de chat, el muestreo (semilla 42, top-p 0,9), el tope de 16
+  sesiones y 4096 tokens por sesión—, para que elegir uno u otro sea cambiar
+  una variable y no de comportamiento. Reaprovecha el **prefijo común** entre
+  dos prompts de la misma sesión, transmite el texto en partes y para en
+  `<|im_end|>`. Es más simple que el de candle en una cosa: el caché es un
+  valor aparte que `forward` recibe, así que cada sesión tiene el suyo en vez
+  de turnarse el único que tiene el modelo adentro. Al cargar hace un forward
+  de un token, porque los pesos van mapeados y sin eso la primera pregunta
+  pagaría leer el modelo del disco.
+- **`COSXAMIX_MOTOR=propio|candle`, con el propio por defecto.** El log de
+  arranque dice cuál se usa.
+- `examples/compare_models -- --motores`: la batería de 15 preguntas sobre el
+  mismo modelo con los dos motores.
+- **`forward::Cache::truncar`**, para quedarse con el prefijo común.
+- El gestor de modelos sirve cualquiera de los dos, por el trait
+  `MotorCargable` (precalentar, descargar, si está caliente).
+
+### Cambiado
+
+- La plantilla de chat de Qwen pasa a `engine::formatear`, una sola copia para
+  los dos motores: si armaran prompts distintos, compararlos no diría nada.
+
+### Medido
+
+Qwen2.5-3B Q3_K_M —el modelo del bot—, el servidor de verdad y como lo usa
+WinsiBot: el mismo *system* de ~145 tokens, una pregunta distinta por mensaje,
+la misma sesión, temperatura 0,7. Dos tandas de ocho mensajes por motor:
+
+| | candle | propio |
+|---|---:|---:|
+| carga del modelo | 2,7 – 3,6 s | **1,1 s** |
+| primer mensaje (nada en caché, ~155 tokens) | 8,3 – 12,9 s | **6,2 – 9,4 s** |
+| mensajes 2 a 8, media por mensaje | 2528 – 3727 ms | **1570 – 1940 ms** |
+| velocidad contando todo | 3,3 – 4,9 tok/s | **5,7 – 7,1 tok/s** |
+| tokens del *system* reaprovechados | 142 – 144 | 142 – 144 |
+
+En `examples/generate`, que mide un prompt sin caché y 48 tokens, el propio
+procesa el prompt **1,8x más rápido** (1907 contra 3405 ms) y escribe **un 8%
+más lento** (6,9 contra 7,5 tok/s). En el bot pesa lo primero: con el
+*system* en caché, cada mensaje es procesar la pregunta y escribir una
+respuesta corta.
+
+Las respuestas no salen idénticas: los dos cuantizan la entrada distinto y un
+empate cercano cae de otro lado —sobre el modelo en F32 coinciden enteras,
+ROADMAP §9—. Por eso decidió la batería de 15 preguntas verificables con la que
+se eligió el 3B, en modo voraz, sobre el mismo archivo:
+
+| | candle | propio |
+|---|---:|---:|
+| aciertos | 10/15 | **11/15** |
+| decode, mediana de 3 | 10,5 tok/s | **11,3 tok/s** |
+| prefill | 1782 ms | **1279 ms** |
+| carga, desde el disco | 43,7 s | **39,2 s** |
+
+candle saca otra vez el 10/15 con el que se eligió el 3B, así que la batería
+reproduce. En 13 de las 15 los dos responden lo mismo; el propio acierta además
+"100 menos 37, dividido por 7" (9; candle dijo 25). Su respuesta del barco es
+confusa y cuenta solo porque nombra el agua —la de candle tampoco era buena—, así
+que con rigor es 10 contra 10 u 11 contra 10: igual o mejor, nunca peor.
+
+---
+
 ## [0.5.1] - 2026-10-26
 
 Los kernels con `sdot` de la 0.5.0 se midieron en ARM de verdad, ganaron, y
@@ -1297,6 +1372,7 @@ agrega una sección a uno y se olvida del otro, CI falla.
 - Verificado en esta versión: **22 tests**, 0 avisos, clippy limpio en las tres
   combinaciones (por defecto, `candle`, `zig,candle`).
 
+[0.6.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.6.0
 [0.5.1]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.4.0

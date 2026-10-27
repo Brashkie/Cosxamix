@@ -41,7 +41,7 @@ use candle_transformers::generation::LogitsProcessor;
 use crate::model::qwen2::{CacheAtencion, ModelWeights};
 use tokenizers::Tokenizer;
 
-use crate::engine::{ErrorMotor, Mensaje, ModeloDisponible, Motor, Peticion, Respuesta};
+use crate::engine::{formatear, ErrorMotor, ModeloDisponible, Motor, Peticion, Respuesta};
 
 /// Tope de tokens que se conservan en el caché de atención entre peticiones.
 ///
@@ -483,27 +483,6 @@ impl MotorCandle {
     }
 }
 
-/// Arma el prompt con las marcas de turno que Qwen espera.
-///
-/// El formato **no** es decorativo: un modelo afinado para instrucciones se
-/// entrenó viendo estas marcas, y pasarle el texto pelado da respuestas
-/// notablemente peores sin que nada falle de forma visible. Es el error de
-/// integración más fácil de cometer y el más difícil de diagnosticar, porque
-/// el modelo contesta igual, solo que mal.
-fn formatear(mensajes: &[Mensaje]) -> String {
-    let mut p = String::new();
-    for m in mensajes {
-        let rol = match m.rol.as_str() {
-            "system" => "system",
-            "assistant" => "assistant",
-            _ => "user",
-        };
-        p.push_str(&format!("<|im_start|>{rol}\n{}<|im_end|>\n", m.contenido));
-    }
-    p.push_str("<|im_start|>assistant\n");
-    p
-}
-
 impl Motor for MotorCandle {
     fn modelos(&self) -> Vec<ModeloDisponible> {
         let g = self.estado.lock().expect("mutex envenenado");
@@ -745,6 +724,7 @@ impl Motor for MotorCandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Mensaje;
 
     #[test]
     fn el_formato_lleva_las_marcas_de_turno_de_qwen() {

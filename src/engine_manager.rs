@@ -33,6 +33,60 @@ use std::sync::{Arc, Mutex};
 
 use crate::engine::{ErrorMotor, ModeloDisponible, Motor, Peticion, Respuesta};
 use crate::engine_candle::MotorCandle;
+use crate::engine_own::MotorPropio;
+
+/// Lo que el gestor necesita de un motor además de generar: poder cargarlo y
+/// sacarlo de la RAM, y saber si está adentro.
+pub trait MotorCargable: Motor {
+    fn precalentar(&self) -> Result<(), ErrorMotor>;
+    fn descargar(&self);
+    fn esta_caliente(&self) -> bool;
+}
+
+impl MotorCargable for MotorCandle {
+    fn precalentar(&self) -> Result<(), ErrorMotor> {
+        MotorCandle::precalentar(self)
+    }
+    fn descargar(&self) {
+        MotorCandle::descargar(self)
+    }
+    fn esta_caliente(&self) -> bool {
+        MotorCandle::esta_caliente(self)
+    }
+}
+
+impl MotorCargable for MotorPropio {
+    fn precalentar(&self) -> Result<(), ErrorMotor> {
+        MotorPropio::precalentar(self)
+    }
+    fn descargar(&self) {
+        MotorPropio::descargar(self)
+    }
+    fn esta_caliente(&self) -> bool {
+        MotorPropio::esta_caliente(self)
+    }
+}
+
+/// Con qué motor se sirven los modelos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TipoMotor {
+    Candle,
+    /// El de la casa: `forward.rs` y los kernels de `src/kernels/`.
+    Propio,
+}
+
+impl TipoMotor {
+    /// `COSXAMIX_MOTOR=propio|candle`. Sin la variable, el propio: desde la
+    /// 0.6.0, cuando acertó 11 de 15 en la batería con la que se eligió el 3B,
+    /// contra 10 de candle, y respondió 1,6-1,9x más rápido por mensaje
+    /// (DECISIONES §23). `candle` vuelve al de antes.
+    pub fn del_entorno() -> Self {
+        match std::env::var("COSXAMIX_MOTOR").as_deref() {
+            Ok("candle") => Self::Candle,
+            _ => Self::Propio,
+        }
+    }
+}
 
 /// Presupuesto por defecto si no se fija `COSXAMIX_RAM_MB`.
 ///
@@ -42,7 +96,7 @@ use crate::engine_candle::MotorCandle;
 pub const PRESUPUESTO_MB_POR_DEFECTO: u64 = 4096;
 
 struct Entrada {
-    motor: Arc<MotorCandle>,
+    motor: Arc<dyn MotorCargable>,
     bytes: u64,
 }
 
@@ -97,6 +151,15 @@ impl GestorModelos {
     /// No carga ninguno: igual que `MotorCandle`, descubrir es barato y cargar
     /// no.
     pub fn descubrir(dir: &Path, presupuesto_mb: u64) -> Result<Self, ErrorMotor> {
+        Self::descubrir_con(dir, presupuesto_mb, TipoMotor::del_entorno())
+    }
+
+    /// Lo mismo, eligiendo el motor.
+    pub fn descubrir_con(
+        dir: &Path,
+        presupuesto_mb: u64,
+        tipo: TipoMotor,
+    ) -> Result<Self, ErrorMotor> {
         let mut entradas = HashMap::new();
 
         let leidos = std::fs::read_dir(dir)
@@ -116,7 +179,15 @@ impl GestorModelos {
             };
             let bytes = item.metadata().map(|m| m.len()).unwrap_or(0);
 
-            match MotorCandle::nuevo(&nombre, &ruta, &tok) {
+            let motor: Result<Arc<dyn MotorCargable>, ErrorMotor> = match tipo {
+                TipoMotor::Candle => {
+                    MotorCandle::nuevo(&nombre, &ruta, &tok).map(|m| Arc::new(m) as _)
+                }
+                TipoMotor::Propio => {
+                    MotorPropio::nuevo(&nombre, &ruta, &tok).map(|m| Arc::new(m) as _)
+                }
+            };
+            match motor {
                 Ok(m) => {
                     tracing::info!(
                         modelo = %nombre,
@@ -124,13 +195,7 @@ impl GestorModelos {
                         tokenizador = %tok.file_name().unwrap_or_default().to_string_lossy(),
                         "modelo registrado"
                     );
-                    entradas.insert(
-                        nombre,
-                        Entrada {
-                            motor: Arc::new(m),
-                            bytes,
-                        },
-                    );
+                    entradas.insert(nombre, Entrada { motor: m, bytes });
                 }
                 Err(e) => tracing::warn!(modelo = %nombre, error = %e, "no se pudo registrar"),
             }
@@ -176,7 +241,7 @@ impl GestorModelos {
     }
 
     /// Deja el modelo en RAM, desalojando los menos usados si hace falta.
-    fn asegurar(&self, nombre: &str) -> Result<Arc<MotorCandle>, ErrorMotor> {
+    fn asegurar(&self, nombre: &str) -> Result<Arc<dyn MotorCargable>, ErrorMotor> {
         let entrada = self
             .entradas
             .get(nombre)
@@ -230,7 +295,7 @@ impl GestorModelos {
             .map(|(n, _)| n.clone())
     }
 
-    fn elegir(&self, pedido: &str) -> Result<Arc<MotorCandle>, ErrorMotor> {
+    fn elegir(&self, pedido: &str) -> Result<Arc<dyn MotorCargable>, ErrorMotor> {
         let nombre = if pedido.is_empty() {
             self.por_defecto()
                 .ok_or_else(|| ErrorMotor::NoCargado("no hay modelos".into()))?
