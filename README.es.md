@@ -320,6 +320,15 @@ rendimiento.
 esos hace falta compilar sin esa línea, y correrá 4 veces más lento. Los kernels
 de `src/kernels/` sí eligen en tiempo de ejecución, pero el interior de candle no.
 
+```bash
+# Para una CPU sin AVX2 (Celeron, Pentium, Atom...). RUSTFLAGS reemplaza al config.
+RUSTFLAGS="-C target-cpu=x86-64" cargo build --release --features candle,zig
+```
+
+Con `zig`, esa compilación lleva los kernels de Zig dos veces —en SSE2 y en
+AVX2— y elige al arrancar: en una CPU vieja el motor propio usa la de SSE2, de
+**2,4x a 12x** más rápida que la referencia escalar ([DECISIONES §20](DECISIONES.md)).
+
 ### Medido de punta a punta
 
 Qwen2.5-0.5B-Instruct Q4_K_M (491 MB), CPU, sin GPU:
@@ -745,10 +754,10 @@ abierta al que gane la medición:
 | | qué aporta | qué falta |
 |---|---|---|
 | **Zig** | una sola fuente que cubre x86-64, ARM64 y Android | nada: ya está dentro |
-| **Ensamblador** | el kernel fusionado de Q4_K en x86-64, primero en el despachador con `asm_q4k` (1,04x-1,08x sobre los intrínsecos); en ARM64, la única forma de usar `sdot` | el cuerpo NEON, `kernels/q4k_neon.s`, y medirlo en ARM |
+| **Ensamblador** | el kernel fusionado de Q4_K en x86-64, primero en el despachador con `asm_q4k` (1,04x-1,08x sobre los intrínsecos). El de Q3_K (`asm_q3k`) empata con los intrínsecos, igual bit a bit | el cuerpo NEON, `kernels/q4k_neon.s`, y medirlo en ARM |
 | **Fortran** | arreglos sin aliasing, que es por lo que BLAS y LAPACK siguen siendo Fortran | un compilador en cada plataforma, y Android es justo el problema |
 | **Ada / SPARK** | demostrar que un kernel no desborda, en vez de comprobarlo con tests | un kernel lo bastante crítico como para que valga el toolchain |
-| **C** | el denominador común, y lo que candle ya usa por debajo | nada que no cubran los otros |
+| **C** | dentro con la feature `c`, compilado con `zig cc` y sin libc. Extensiones de CPU por función (`__attribute__((target))`), y en ARM `vdotq_s32` —`sdot`— estable, que Rust no expone y Zig no genera. En x86 su Q3_K pierde un 4% con Rust ([DECISIONES §21](DECISIONES.md)) | medir en ARM los fusionados con `sdot` (`kernels/neon_dotprod.c`), que ya están |
 
 El riesgo de eso no son los lenguajes: es tener **N sitios distintos** por donde
 cada uno se mete. Por eso hay una sola frontera, en `src/kernels/`, y tres
@@ -775,6 +784,8 @@ cargo test                      # referencia y AVX2
 cargo test  --features zig      # y además Zig
 cargo bench --features zig      # la regla 3, ejecutable
 cargo test  --features asm_q4k  # los kernels escritos en ensamblador
+cargo test  --features asm_q3k  # el Q3_K en ensamblador
+cargo test  --features c        # los kernels en C (pide Zig, por `zig cc`)
 ```
 
 ### Lo que midió el primer kernel

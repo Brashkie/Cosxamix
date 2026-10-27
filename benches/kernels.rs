@@ -321,6 +321,18 @@ fn fusionado(c: &mut Criterion) {
             kernels::x86::dot_q3k_i8_avx2(black_box(&pesos3), black_box(&xq3), &xe3, &xs3)
         })
     });
+    #[cfg(all(feature = "asm_q3k", target_arch = "x86_64"))]
+    g.bench_function("q3k ensamblador", |t| {
+        t.iter(|| unsafe {
+            kernels::q3k_asm::dot_q3k_i8(black_box(&pesos3), black_box(&xq3), &xe3, &xs3)
+        })
+    });
+    #[cfg(all(feature = "c", target_arch = "x86_64"))]
+    g.bench_function("q3k c", |t| {
+        t.iter(|| unsafe {
+            kernels::c::dot_q3k_i8(black_box(&pesos3), black_box(&xq3), &xe3, &xs3)
+        })
+    });
     #[cfg(target_arch = "x86_64")]
     g.bench_function("avx2", |t| {
         t.iter(|| unsafe {
@@ -382,6 +394,20 @@ fn fusionado(c: &mut Criterion) {
     g.bench_function("zig", |t| {
         t.iter(|| kernels::zig::dot_q4k_i8(black_box(&pesos), black_box(&xq), &xe, &xs))
     });
+    // Los de C con `sdot`, en ARM: contra el escalar y el de Zig de arriba.
+    #[cfg(all(feature = "c", target_arch = "aarch64"))]
+    if kernels::c::hay_dotprod() {
+        g.bench_function("c con sdot", |t| {
+            t.iter(|| unsafe {
+                kernels::c::dot_q4k_i8_neon(black_box(&pesos), black_box(&xq), &xe, &xs)
+            })
+        });
+        g.bench_function("q3k c con sdot", |t| {
+            t.iter(|| unsafe {
+                kernels::c::dot_q3k_i8_neon(black_box(&pesos3), black_box(&xq3), &xe3, &xs3)
+            })
+        });
+    }
     // En ARM, contra el de Zig de justo arriba: es el camino vectorizado que
     // hay hoy en esa arquitectura y el que tiene que superar. Sin `dotprod` no
     // se mide, porque `sdot` seria una instruccion ilegal.

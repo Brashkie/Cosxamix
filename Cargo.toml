@@ -1,6 +1,6 @@
 [package]
 name = "cosxamix"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Runtime de IA que sirve modelos de lenguaje por HTTP, compatible con el dialecto de Ollama"
 license     = "MIT"
@@ -69,12 +69,24 @@ strip         = true
 #   cargo build --release --features zig
 zig = []
 
+# Kernels en C, compilados con `zig cc`: piden Zig instalado y nada más. Hoy,
+# el fusionado de Q3_K para x86-64 (kernels/q3k_avx2.c).
+#
+#   cargo bench --features c --bench kernels -- q3k
+c = []
+
 # El kernel fusionado de Q4_K escrito a mano. Apagada por defecto, y no es
 # cosmetico: sin ella `src/kernels/q4k_asm.rs` no se compila y la ausencia de
 # los dos `.s` no rompe nada. Se enciende cuando esos archivos existan.
 #
 #   cargo test --features asm_q4k
 asm_q4k = []
+
+# El kernel fusionado de Q3_K en ensamblador (kernels/q3k_avx2_*.s), para
+# medirlo contra los intrinsecos y contra el de C.
+#
+#   cargo bench --features asm_q3k --bench kernels -- q3k
+asm_q3k = []
 
 # Motor de inferencia real. Fuera del set por defecto porque son 155 crates y
 # ~85 s de compilacion: quien solo quiera tocar la capa HTTP no deberia pagar

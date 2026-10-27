@@ -13,6 +13,9 @@
 //!     registro desde una sola fuente, sin macros ni copias.
 //!
 //! Se compila con `zig build-lib` desde `build.rs`, solo con la feature `zig`.
+//! No exporta nada por sí mismo: los nombres que ve Rust los pone
+//! `exports.zig`, una vez sin sufijo (`lib.zig`) y en x86-64 otra con `_v3`
+//! (`lib_v3.zig`).
 
 const std = @import("std");
 
@@ -25,7 +28,7 @@ const V = @Vector(ANCHO, f32);
 /// Recibe punteros y longitud en vez de un slice porque el otro lado es Rust y
 /// los slices no cruzan la frontera: un `*const f32` y un `usize` sí son lo
 /// mismo en los dos lenguajes.
-export fn cosxamix_dot_f32(a: [*]const f32, b: [*]const f32, n: usize) f32 {
+pub fn cosxamix_dot_f32(a: [*]const f32, b: [*]const f32, n: usize) callconv(.C) f32 {
     // Cuatro acumuladores por el mismo motivo que la versión de Rust: la
     // latencia de la multiplicación-suma es de varios ciclos y con una sola
     // cadena cada iteración espera a la anterior.
@@ -76,13 +79,13 @@ inline fn cargar(p: [*]const f32, i: usize) V {
 /// forma es distinta a la de `dot` —dos pasadas, una raíz, y escribe en un
 /// buffer de salida en vez de devolver un escalar— y aun así cruza la FFI con
 /// punteros y longitud, sin nada nuevo.
-export fn cosxamix_rmsnorm_f32(
+pub fn cosxamix_rmsnorm_f32(
     salida: [*]f32,
     entrada: [*]const f32,
     peso: [*]const f32,
     n: usize,
     eps: f32,
-) void {
+) callconv(.C) void {
     if (n == 0) return;
 
     // Primera pasada: suma de cuadrados.
@@ -129,7 +132,7 @@ export fn cosxamix_rmsnorm_f32(
 /// documento dice que en Cosxamix nada se decide sin medir. Esto permite
 /// comprobarlo: el banco llama a esto y a una función de Rust igual de vacía,
 /// y la diferencia es el coste real de la frontera.
-export fn cosxamix_noop(x: f32) f32 {
+pub fn cosxamix_noop(x: f32) callconv(.C) f32 {
     return x;
 }
 
@@ -152,7 +155,7 @@ export fn cosxamix_noop(x: f32) f32 {
 /// O sea que para esta operacion Zig da gratis lo que en Rust hay que ganarse.
 /// Es la primera vez en este proyecto que la ventaja de Zig no es "corre en
 /// ARM" sino "el lenguaje trae la herramienta".
-export fn cosxamix_silu_f32(salida: [*]f32, entrada: [*]const f32, n: usize) void {
+pub fn cosxamix_silu_f32(salida: [*]f32, entrada: [*]const f32, n: usize) callconv(.C) void {
     const uno: V = @splat(1.0);
     var i: usize = 0;
 
@@ -194,14 +197,14 @@ export fn cosxamix_silu_f32(salida: [*]f32, entrada: [*]const f32, n: usize) voi
 /// f32 vectorial, y la suma horizontal va al final de todo. Reducir por bloque
 /// es lo que hizo que la primera version de esto saliera mas lenta que el
 /// camino de f32 pese a usar instrucciones mas rapidas.
-export fn cosxamix_dot_i8_escalado_f32(
+pub fn cosxamix_dot_i8_escalado_f32(
     a: [*]const i8,
     b: [*]const i8,
     esc_a: [*]const f32,
     esc_b: [*]const f32,
     n: usize,
     bloque: usize,
-) f32 {
+) callconv(.C) f32 {
     const VI8 = @Vector(8, i8);
     const VI32 = @Vector(8, i32);
     const VF = @Vector(8, f32);
@@ -283,13 +286,13 @@ fn escalaYMinimo(j: usize, q: [*]const u8) struct { u8, u8 } {
 ///
 /// `n` son los valores de la fila, multiplo de 256. `xe` y `xs` tienen un
 /// valor por cada 32.
-export fn cosxamix_dot_q4k_i8_f32(
+pub fn cosxamix_dot_q4k_i8_f32(
     bloques: [*]const u8,
     xq: [*]const i8,
     xe: [*]const f32,
     xs: [*]const f32,
     n: usize,
-) f32 {
+) callconv(.C) f32 {
     const VU8 = @Vector(ANCHO, u8);
     const VI8 = @Vector(ANCHO, i8);
     const VI32 = @Vector(ANCHO, i32);

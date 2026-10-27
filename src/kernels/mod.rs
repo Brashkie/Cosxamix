@@ -69,6 +69,14 @@ pub mod q4k_neon;
 #[cfg(feature = "zig")]
 pub mod zig;
 
+/// El fusionado de Q3_K en ensamblador. Ver la cabecera del módulo.
+#[cfg(all(feature = "asm_q3k", target_arch = "x86_64"))]
+pub mod q3k_asm;
+
+/// Kernels en C, compilados con `zig cc`. Ver la cabecera del módulo.
+#[cfg(all(feature = "c", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub mod c;
+
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,10 +114,7 @@ pub fn disponibles() -> Vec<Backend> {
     // la practica no excluye a nadie; se pregunta igual porque una maquina
     // virtual puede esconder una extension y dejar la otra.
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2")
-        && is_x86_feature_detected!("fma")
-        && is_x86_feature_detected!("f16c")
-    {
+    if cpu_avx2() {
         v.push(Backend::Avx2);
     }
 
@@ -148,6 +153,45 @@ pub fn elegido() -> Backend {
         // El último de la lista es el más específico.
         *disp.last().unwrap()
     })
+}
+
+/// Si la CPU tiene AVX2, FMA y F16C. Se pregunta una vez.
+///
+/// `COSXAMIX_SIN_AVX2` hace como si no los tuviera, para probar en una
+/// máquina moderna el camino de las que no los tienen. Solo tiene sentido en
+/// la compilación sin `target-cpu=x86-64-v3`: en la de siempre el compilador
+/// ya usó AVX2 en todo el binario.
+pub fn cpu_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::sync::OnceLock;
+        static AVX2: OnceLock<bool> = OnceLock::new();
+        *AVX2.get_or_init(|| {
+            std::env::var_os("COSXAMIX_SIN_AVX2").is_none()
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+                && is_x86_feature_detected!("f16c")
+        })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Si los kernels de Rust con AVX2 se pueden usar.
+///
+/// No alcanza con mirar el backend. Con `zig`, el elegido es Zig también en
+/// una CPU sin AVX2 —en la compilación sin `target-cpu`, sus kernels tienen
+/// una copia baseline—, y los kernels que Zig no tiene o pierde (`dot_i8`, el
+/// Q4_K de AVX2) se tomaban de Rust con AVX2 dando por hecho que "Zig" quería
+/// decir "x86-64 con AVX2": en una CPU sin AVX2, una instrucción ilegal.
+pub fn usar_avx2() -> bool {
+    match elegido() {
+        Backend::Escalar => false,
+        Backend::Avx2 => true,
+        Backend::Zig => cpu_avx2(),
+    }
 }
 
 // ─── Kernels ─────────────────────────────────────────────────────────────────
@@ -227,7 +271,7 @@ pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if matches!(elegido(), Backend::Avx2 | Backend::Zig) {
+        if usar_avx2() {
             return unsafe { x86::dot_i8_avx2(a, b) };
         }
     }
@@ -262,13 +306,16 @@ pub fn dot_i8_escalado(a: &[i8], b: &[i8], esc_a: &[f32], esc_b: &[f32], bloque:
     {
         if (bloque == 16 || bloque.is_multiple_of(32))
             && a.len().is_multiple_of(bloque.max(32))
-            && matches!(elegido(), Backend::Avx2 | Backend::Zig)
+            && usar_avx2()
         {
             return unsafe { x86::dot_i8_escalado_avx2(a, b, esc_a, esc_b, bloque) };
         }
     }
 
-    #[cfg(all(feature = "zig", not(target_arch = "x86_64")))]
+    // En ARM es el único camino vectorizado; en x86-64 se llega acá sin AVX2
+    // (la copia baseline de Zig, en SSE2) o con un bloque que el de AVX2 no
+    // acepta.
+    #[cfg(feature = "zig")]
     {
         if bloque.is_multiple_of(8) && a.len().is_multiple_of(bloque) && elegido() == Backend::Zig {
             return zig::dot_i8_escalado(a, b, esc_a, esc_b, bloque);
@@ -310,14 +357,14 @@ pub fn dot_q4k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
     // dos pierden contra los intrinsecos —ver DECISIONES §5—.
     #[cfg(all(feature = "asm_q4k", hay_q4k_completo, target_arch = "x86_64"))]
     {
-        if matches!(elegido(), Backend::Avx2 | Backend::Zig) {
+        if usar_avx2() {
             return unsafe { q4k_asm::dot_q4k_i8_asm_completo(bloques, xq, xe, xs) };
         }
     }
 
     #[cfg(target_arch = "x86_64")]
     {
-        if matches!(elegido(), Backend::Avx2 | Backend::Zig) {
+        if usar_avx2() {
             return unsafe { x86::dot_q4k_i8_avx2(bloques, xq, xe, xs) };
         }
     }
@@ -355,7 +402,7 @@ pub fn dot_q3k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if matches!(elegido(), Backend::Avx2 | Backend::Zig) {
+        if usar_avx2() {
             return unsafe { x86::dot_q3k_i8_avx2(bloques, xq, xe, xs) };
         }
     }
@@ -722,6 +769,18 @@ mod tests {
                 )
             };
 
+            #[cfg(target_arch = "x86_64")]
+            if tipo != TipoGgml::Q4K && cpu_avx2() {
+                #[cfg(feature = "c")]
+                {
+                    let en_c = unsafe { c::dot_q3k_i8(&pesos, &xq, &xe, &xs) };
+                    assert!(
+                        (en_c - escalar).abs() / esperado.abs().max(1.0) < 1e-5,
+                        "q3k en C dio {en_c} y la referencia {escalar}"
+                    );
+                }
+            }
+
             // El de Zig se comprueba aparte, porque en x86-64 el despachador
             // elige AVX2 y nunca lo llamaria: sin esto, el unico camino que
             // tiene ARM se quedaria sin test en la maquina donde se desarrolla.
@@ -763,7 +822,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn las_escalas_sin_ramas_coinciden_con_las_legibles() {
-        if !matches!(elegido(), Backend::Avx2 | Backend::Zig) {
+        if !usar_avx2() {
             return;
         }
         let mut estado = 0x9E37_79B9_7F4A_7C15u64;

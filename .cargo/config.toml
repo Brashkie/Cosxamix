@@ -22,6 +22,11 @@
 # que funcionará 4 veces más lenta. Los kernels de `src/kernels/` sí eligen en
 # tiempo de ejecución, pero el interior de candle no, y reescribirlo no está
 # sobre la mesa.
+#
+#   RUSTFLAGS="-C target-cpu=x86-64" cargo build --release --features candle,zig
+#
+# build.rs lee lo que se le pidió a Rust y compila Zig para lo mismo: aquí una
+# copia en v3; en esa compilación, dos (SSE2 y AVX2) que se eligen al arrancar.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-cpu=x86-64-v3"]
 

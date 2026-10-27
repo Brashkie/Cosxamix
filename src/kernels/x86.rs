@@ -553,89 +553,112 @@ pub unsafe fn dot_q4k_i8_avx2(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32])
 /// Tampoco satura: el valor sin signo llega a 7, por 127 son 889, `maddubs`
 /// suma dos y da 1778 contra los 32.767 del `i16`.
 ///
-/// ## Las dieciséis escalas, de una, y el vector por permutación
+/// ## Lo que lo llevó de 152 a 91 ns por fila de 2048
 ///
-/// Igual que en Q4_K, el ensamblador generado mostraba más trabajo escalar
-/// que vectorial. Acá era peor: además de calcular las escalas de a dos,
-/// armaba el vector de ocho con `_mm256_setr_ps` de valores sueltos, que son
-/// ocho inserciones por grupo y ocho grupos por bloque.
+/// Cuatro cosas, ninguna de lenguaje, y por eso están acá y en el C y en el
+/// ensamblador por igual:
 ///
-/// Ahora las dieciséis se calculan juntas —`cvtepi8_epi32` y `cvtepi32_ps`,
-/// con `xe[bl*16 + j]` contiguo— y el vector de cada grupo sale de **una
-/// carga y una permutación**: `permutevar8x32_ps` con el patrón
-/// `[0 0 0 0 1 1 1 1]` toma los dos primeros de los ocho leídos y los reparte
-/// por mitades, que es exactamente la forma que el reparto de carriles pide.
+/// 1. **Las dieciséis escalas de 6 bits, en vector.** `escalas_q3k` las
+///    rearma en escalar, unas treinta operaciones de bytes por bloque. En
+///    vector son ocho: los nibbles bajos con un `and` y un corrimiento, y los
+///    dos bits altos de las cuatro palabras con **un** `vpsrlvd` de
+///    corrimientos `[0 2 4 6]`.
+/// 2. **Las escalas no pasan por la pila.** Antes se guardaban dieciséis `f32`
+///    y se leían de a ocho por grupo; ahora viven en dos registros y cada
+///    grupo saca las suyas con una permutación de un patrón constante.
+/// 3. **El tercer bit, con dos operaciones y no cuatro.** El bit g de cada
+///    byte de `hmask` se lleva al bit 2 con un corrimiento inmediato de 16
+///    bits y se aísla con un `and`; lo que arrastra del byte vecino cae fuera.
+///    Antes eran una constante por grupo, `and`, `cmpeq` y otro `and`. Con el
+///    bucle desenrollado a mano, todos los corrimientos son inmediatos.
+/// 4. **Dos acumuladores.** Las ocho FMA de un bloque iban en una sola cadena,
+///    y cada una esperaba a la anterior.
 ///
-/// El arreglo de escalas va con ocho de relleno al final: el último grupo lee
-/// ocho desde la posición 14, y sin el relleno se saldría.
+/// El `d` en f16 se convierte con `vcvtph2ps`, como en Q4_K.
 ///
 /// # Safety
 ///
-/// Pide AVX2 y FMA. El que llama lo garantiza.
-#[target_feature(enable = "avx2,fma")]
+/// Pide AVX2, FMA y F16C. El que llama lo garantiza.
+#[target_feature(enable = "avx2,fma,f16c")]
 pub unsafe fn dot_q3k_i8_avx2(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
     debug_assert!(xq.len().is_multiple_of(256));
 
     let unos = _mm256_set1_epi16(1);
     let dos_bits = _mm256_set1_epi8(0x03);
     let cuatro = _mm256_set1_epi8(4);
-    let treinta_y_dos = _mm256_set1_ps(32.0);
-    // El patron que reparte dos escalas en las dos mitades de los carriles.
-    let reparto = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
+    let nibble = _mm_set1_epi8(0x0F);
+    let tres = _mm_set1_epi8(3);
+    let treinta_y_dos = _mm_set1_epi8(32);
+    let corrimientos = _mm_setr_epi32(0, 2, 4, 6);
+    // Los cuatro repartos de dos escalas en las dos mitades de los carriles.
+    let r0 = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
+    let r1 = _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3);
+    let r2 = _mm256_setr_epi32(4, 4, 4, 4, 5, 5, 5, 5);
+    let r3 = _mm256_setr_epi32(6, 6, 6, 6, 7, 7, 7, 7);
 
-    let mut acc = _mm256_setzero_ps();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
     let mut correccion = _mm256_setzero_ps();
 
     for bl in 0..xq.len() / 256 {
-        let o = bl * 110;
-        let hmask = bloques.as_ptr().add(o);
-        let qs = bloques.as_ptr().add(o + 32);
-        let d = _mm256_set1_ps(crate::quant::leer_f16(bloques, o + 108));
-        let esc = crate::quant::escalas_q3k(bloques, o);
-        // Los mismos 32 bytes de mascara para los ocho grupos: se cargan una
-        // vez por bloque y no ocho.
-        let hm = _mm256_loadu_si256(hmask as *const __m256i);
+        let b = bloques.as_ptr().add(bl * 110);
+        let base = bl * 256;
 
-        // Las dieciseis escalas de una, en dos mitades de ocho.
-        let mut escalas = [0f32; 24];
-        for mitad in 0..2 {
-            let crudas = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
-                esc.as_ptr().add(mitad * 8) as *const __m128i,
-            )));
-            let xe_v = _mm256_loadu_ps(xe.as_ptr().add(bl * 16 + mitad * 8));
-            let v = _mm256_mul_ps(_mm256_mul_ps(d, _mm256_sub_ps(crudas, treinta_y_dos)), xe_v);
-            _mm256_storeu_ps(escalas.as_mut_ptr().add(mitad * 8), v);
-            // La correccion del +4 se acumula vectorial: es la suma de
-            // escala por la suma de la entrada, por cuatro.
-            let xs_v = _mm256_loadu_ps(xs.as_ptr().add(bl * 16 + mitad * 8));
-            correccion = _mm256_fmadd_ps(v, xs_v, correccion);
+        // Las dieciséis escalas de 6 bits, en vector. Los cuatro bits bajos:
+        // los nibbles bajos de los bytes 96-103 son las escalas 0-7, y los
+        // altos, las 8-15. Los dos bits altos de la escala j están en el byte
+        // 104 + j%4, corridos 2*(j/4): un `srlv` por palabra de 32 bits los
+        // pone en su sitio de a cuatro.
+        let lo8 = _mm_loadl_epi64(b.add(96) as *const __m128i);
+        let bajos = _mm_unpacklo_epi64(
+            _mm_and_si128(lo8, nibble),
+            _mm_and_si128(_mm_srli_epi16(lo8, 4), nibble),
+        );
+        let t = (b.add(104) as *const i32).read_unaligned();
+        let altos = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32(t), corrimientos), tres);
+        let esc8 = _mm_sub_epi8(_mm_or_si128(bajos, _mm_slli_epi16(altos, 4)), treinta_y_dos);
+
+        let h = (b.add(108) as *const u16).read_unaligned();
+        let d = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128(h as i32)));
+
+        let xe_p = xe.as_ptr().add(bl * 16);
+        let xs_p = xs.as_ptr().add(bl * 16);
+        let e0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(esc8));
+        let e1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(esc8, 8)));
+        let v0 = _mm256_mul_ps(_mm256_mul_ps(d, e0), _mm256_loadu_ps(xe_p));
+        let v1 = _mm256_mul_ps(_mm256_mul_ps(d, e1), _mm256_loadu_ps(xe_p.add(8)));
+        correccion = _mm256_fmadd_ps(v0, _mm256_loadu_ps(xs_p), correccion);
+        correccion = _mm256_fmadd_ps(v1, _mm256_loadu_ps(xs_p.add(8)), correccion);
+
+        let hm = _mm256_loadu_si256(b as *const __m256i);
+        let qs0 = _mm256_loadu_si256(b.add(32) as *const __m256i);
+        let qs1 = _mm256_loadu_si256(b.add(64) as *const __m256i);
+
+        // Un grupo de 32 valores. Todos los corrimientos son inmediatos: con
+        // el bucle desenrollado a mano no queda ninguno variable.
+        //
+        // El tercer bit: el bit g de cada byte de `hm`, llevado al bit 2 con
+        // un corrimiento de 16 bits y aislado con un `and`. Lo que el
+        // corrimiento arrastra del byte vecino cae fuera del bit 2.
+        macro_rules! grupo {
+            ($acc:ident, $g:literal, $qs:ident, $lo:literal, $alto:expr, $v:ident, $r:ident) => {{
+                let bajos = _mm256_and_si256(_mm256_srli_epi16($qs, $lo), dos_bits);
+                let q = _mm256_or_si256(bajos, _mm256_and_si256($alto, cuatro));
+                let x = _mm256_loadu_si256(xq.as_ptr().add(base + $g * 32) as *const __m256i);
+                let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(q, x), unos);
+                let escala = _mm256_permutevar8x32_ps($v, $r);
+                $acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), escala, $acc);
+            }};
         }
-
-        for g in 0..8 {
-            let bytes = _mm256_loadu_si256(qs.add((g / 4) * 32) as *const __m256i);
-            // `srl_epi16` y no `srli_epi16`: el corrimiento cambia con el
-            // grupo y la version con `i` lo exige constante. Corre de a 16
-            // bits y arrastra bits del byte vecino; la mascara de dos bits de
-            // despues lo limpia.
-            let cuenta = _mm_cvtsi32_si128(2 * (g % 4) as i32);
-            let bajos = _mm256_and_si256(_mm256_srl_epi16(bytes, cuenta), dos_bits);
-
-            // El tercer bit: donde `hmask` tiene el bit del grupo puesto, se
-            // suma 4. `cmpeq` contra la propia mascara da 0xFF o 0x00, y el
-            // `and` lo convierte en 4 o 0 sin ninguna rama.
-            let bit = _mm256_set1_epi8(1i8 << g);
-            let puesto = _mm256_cmpeq_epi8(_mm256_and_si256(hm, bit), bit);
-            let q = _mm256_add_epi8(bajos, _mm256_and_si256(puesto, cuatro));
-
-            let x = _mm256_loadu_si256(xq.as_ptr().add(bl * 256 + g * 32) as *const __m256i);
-            let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(q, x), unos);
-
-            // Una carga y una permutacion donde habia ocho inserciones.
-            let escala =
-                _mm256_permutevar8x32_ps(_mm256_loadu_ps(escalas.as_ptr().add(g * 2)), reparto);
-            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), escala, acc);
-        }
+        grupo!(acc0, 0, qs0, 0, _mm256_slli_epi16(hm, 2), v0, r0);
+        grupo!(acc1, 1, qs0, 2, _mm256_slli_epi16(hm, 1), v0, r1);
+        grupo!(acc0, 2, qs0, 4, hm, v0, r2);
+        grupo!(acc1, 3, qs0, 6, _mm256_srli_epi16(hm, 1), v0, r3);
+        grupo!(acc0, 4, qs1, 0, _mm256_srli_epi16(hm, 2), v1, r0);
+        grupo!(acc1, 5, qs1, 2, _mm256_srli_epi16(hm, 3), v1, r1);
+        grupo!(acc0, 6, qs1, 4, _mm256_srli_epi16(hm, 4), v1, r2);
+        grupo!(acc1, 7, qs1, 6, _mm256_srli_epi16(hm, 5), v1, r3);
     }
 
-    reducir_f32(acc) - 4.0 * reducir_f32(correccion)
+    reducir_f32(_mm256_add_ps(acc0, acc1)) - 4.0 * reducir_f32(correccion)
 }

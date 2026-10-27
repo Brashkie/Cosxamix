@@ -325,6 +325,15 @@ without it. `x86-64-v3` is AVX2+FMA — any CPU from 2015 onward — and deliver
 2015. Those need a build without that line, and it will run 4 times slower. The
 kernels in `src/kernels/` do choose at runtime, but candle's internals do not.
 
+```bash
+# For a CPU without AVX2 (Celeron, Pentium, Atom...). RUSTFLAGS replaces the config.
+RUSTFLAGS="-C target-cpu=x86-64" cargo build --release --features candle,zig
+```
+
+With `zig`, that build carries the Zig kernels twice — SSE2 and AVX2 — and picks
+one at startup: on an old CPU the in-house engine uses the SSE2 copy, **2.4x to
+12x** faster than the scalar reference ([DECISIONES §20](DECISIONES.md)).
+
 ### Measured end to end
 
 Qwen2.5-0.5B-Instruct Q4_K_M (491 MB), CPU, no GPU:
@@ -761,10 +770,10 @@ open to whichever language wins the measurement:
 | | what it brings | what's missing |
 |---|---|---|
 | **Zig** | one source covering x86-64, ARM64 and Android | nothing: it's already in |
-| **Assembly** | the fused Q4_K kernel on x86-64, first in the dispatcher with `asm_q4k` (1.04x-1.08x over intrinsics); on ARM64, the only way to use `sdot` | the NEON body, `kernels/q4k_neon.s`, and measuring it on ARM |
+| **Assembly** | the fused Q4_K kernel on x86-64, first in the dispatcher with `asm_q4k` (1.04x-1.08x over intrinsics). The Q3_K one (`asm_q3k`) ties with intrinsics, bit for bit | the NEON body, `kernels/q4k_neon.s`, and measuring it on ARM |
 | **Fortran** | arrays without aliasing, which is why BLAS and LAPACK are still Fortran | a compiler on every platform, and Android is exactly the problem |
 | **Ada / SPARK** | proving a kernel cannot overflow, instead of testing that it doesn't | a kernel critical enough to justify the toolchain |
-| **C** | the common denominator, and what candle already uses underneath | nothing the others don't cover |
+| **C** | in with the `c` feature, built with `zig cc` and no libc. Per-function CPU extensions (`__attribute__((target))`), and on ARM a stable `vdotq_s32` — `sdot` — which Rust doesn't expose and Zig doesn't emit. On x86 its Q3_K loses 4% to Rust ([DECISIONES §21](DECISIONES.md)) | measuring on ARM the fused kernels with `sdot` (`kernels/neon_dotprod.c`), already written |
 
 The risk in that isn't the languages: it's having **N different places** where
 each one gets in. That's why there is a single boundary, in `src/kernels/`, and
@@ -793,6 +802,8 @@ cargo test                      # reference and AVX2
 cargo test  --features zig      # and Zig as well
 cargo bench --features zig      # rule 3, executable
 cargo test  --features asm_q4k  # the hand-written assembly kernels
+cargo test  --features asm_q3k  # the Q3_K kernel in assembly
+cargo test  --features c        # the C kernels (needs Zig, for `zig cc`)
 ```
 
 ### What the first kernel measured

@@ -9,6 +9,116 @@ acá va qué cambió, no por qué.
 
 ---
 
+## [0.5.0] - 2026-10-26
+
+La compilación para las CPU sin AVX2 —la que `.cargo/config.toml` dice que hace
+falta para un x86 anterior a 2015— por fin anda con la feature `zig`, y con los
+kernels de Zig vectorizados en SSE2 en vez de caer a la referencia escalar. El
+kernel de Q3_K, el formato del modelo por defecto, pasa de 154 a 91 ns por fila.
+Y entra C, el sexto lenguaje: en x86 con el mismo kernel escrito también en
+ensamblador para comparar los tres, y en ARM64 con lo que ningún otro lenguaje
+del proyecto alcanzaba, `sdot`, en los fusionados de Q4_K y Q3_K.
+
+### Corregido
+
+- **Con `zig`, la compilación sin `target-cpu` moría con "instrucción ilegal"
+  en una CPU sin AVX2, por dos lados.** `build.rs` compilaba Zig siempre para
+  `x86_64_v3`, aunque Rust fuera para el x86-64 básico; y seis caminos de
+  `src/kernels/mod.rs` llamaban a los kernels de Rust con AVX2 cuando el
+  backend era Zig, dando por hecho que "Zig" quería decir "CPU con AVX2". Ahora
+  lo pregunta `usar_avx2()`, que mira la CPU una vez y lo guarda.
+
+### Añadido
+
+- **Zig sigue a lo que se le pidió a Rust.** Con Rust en `x86-64-v3` —lo de
+  siempre— hay una sola copia de los kernels de Zig, también en v3: el binario
+  igual no arranca sin AVX2 y una segunda copia sería peso muerto. Con Rust en
+  el x86-64 básico, la librería lleva **dos copias** del mismo fuente: en
+  baseline (SSE2) y en `x86_64_v3` con sufijo `_v3`
+  (`kernels/exports.zig`, `lib.zig`, `lib_v3.zig`), y se elige una al primer
+  uso. Así ese binario anda en un Celeron de 2012 y rinde en un i5 de 2020.
+- **Tres variables para medir y probar:** `COSXAMIX_ZIG=baseline` fuerza la
+  copia baseline, `COSXAMIX_SIN_AVX2=1` hace como si la CPU no tuviera AVX2
+  —para correr en una máquina moderna el camino de una vieja— y
+  `COSXAMIX_SIN_V3=1` compila sin la copia `_v3`.
+- **El log de arranque dice qué copia de Zig se usa** (`kernels de Zig
+  copia=...`).
+- **CI prueba el camino de una CPU sin AVX2**: compila sin `target-cpu` y corre
+  los tests con `COSXAMIX_SIN_AVX2=1`.
+
+- **El kernel fusionado de Q3_K, 1,65x: de 154 a 91 ns por fila de 2048.**
+  Cuatro cambios de algoritmo, ninguno de lenguaje: las dieciséis escalas de 6
+  bits se desempaquetan en vector (un `vpsrlvd` con corrimientos `[0 2 4 6]`
+  hace el trabajo de treinta operaciones escalares), viven en registros en vez
+  de ir y volver de la pila, el tercer bit de cada valor sale con un
+  corrimiento inmediato y un `and` en vez de cuatro operaciones, y las FMA van
+  en dos cadenas y no en una. Es el que usa el despachador.
+- **C entra al proyecto, compilado con `zig cc`.** Feature `c`, sin otro
+  compilador que Zig y sin libc (`-ffreestanding`), así que cruza a Linux y
+  macOS sin el SDK del otro lado. El primer kernel es el mismo Q3_K, línea por
+  línea (`kernels/q3k_avx2.c`). Lo que C trae que Zig no: las extensiones de
+  CPU **por función**, con `__attribute__((target))`, así que el objeto se
+  compila en baseline y es seguro en cualquier x86-64.
+- **El mismo Q3_K en ensamblador**, `kernels/q3k_avx2_win64.s` y
+  `_sysv.s`, detrás de la feature `asm_q3k`. Usa los dieciséis `ymm`, con las
+  siete constantes del bucle fijas en registros, y devuelve el resultado ya
+  reducido. Da **igual bit a bit** que los intrínsecos en 1, 2, 8, 17 y 43
+  bloques: mismo algoritmo, mismo orden.
+- CI corre el ensamblador de Q3_K en Linux y Windows, lo ensambla para Mach-O, y
+  prueba el de C con el job de Zig.
+- **`sdot` en ARM64, desde C: los fusionados de Q4_K y Q3_K**
+  (`kernels/neon_dotprod.c`). Dieciséis productos de `i8` por instrucción, que
+  ni Rust estable ni Zig pueden emitir desde este proyecto; `zig cc` los saca
+  tal cual —seis `sdot` y ningún `smull` en el código generado—. En Q3_K
+  sobra el rodeo del +4 que pide x86: `sdot` multiplica con signo los dos
+  operandos y los valores de −4 a 3 entran como son. Con
+  `__attribute__((target("dotprod")))` por función, el objeto va para
+  ARMv8.0 y quien llama pregunta `is_aarch64_feature_detected!("dotprod")`.
+  Cruza a Linux, Android y macOS. **Fuera del despachador hasta medirlo en
+  ARM**: esta máquina no puede ejecutarlo, y lo corren los tests y el bench del
+  runner ARM64 de CI.
+
+### Medido
+
+**Rust, C y ensamblador con el mismo algoritmo de Q3_K**, tres tandas, fila de
+2048 (8 bloques):
+
+| | ns |
+|---|---:|
+| Rust, intrínsecos | 90,1 – 91,5 |
+| ensamblador | 90,1 – 92,2 |
+| C | 94,4 – 95,4 |
+| (Rust, el algoritmo de antes) | 150 – 157 |
+
+El ensamblador **empata** y C **pierde un 4%**: por la regla 3 ninguno entra al
+despachador, y quedan detrás de sus features para el bench, como los contratos
+de Q4_K que perdieron. Probado también con **cuatro acumuladores** en vez de
+dos: 3-4% más lento en Rust, porque el compilador se queda sin registros. Se
+sacó.
+
+En la compilación sin `target-cpu`, lo que corre una CPU sin AVX2 contra lo que
+corría antes (la referencia en Rust, o el cuelgue). i5-10400 ejecutando código
+SSE2: en una CPU vieja de verdad los tiempos son otros, las proporciones dan
+una idea.
+
+| kernel | Rust escalar | Zig baseline (SSE2) | |
+|---|---:|---:|---:|
+| `dot` n=1024 | 994 ns | 85 ns | **11,7x** |
+| `dot` n=4096 | 4,07 µs | 331 ns | **12,3x** |
+| `dot` n=1.000.003 | 1,00 ms | 162 µs | **6,2x** |
+| `rmsnorm` n=2048 | 2,56 µs | 401 ns | **6,4x** |
+| `rmsnorm` n=8192 | 10,3 µs | 1,91 µs | **5,4x** |
+| `dot_q4k_i8` (fila de 256) | 746 ns | 308 ns | **2,4x** |
+| `dot_i8_escalado` n=2048 | 576 ns | 382 ns | **1,5x** |
+| `silu` n=11008 | 37,2 µs | 35,2 µs | 1,06x |
+
+La copia `_v3` en ese mismo binario, sobre la baseline: `rmsnorm` 401 → 349 ns,
+`dot_i8_escalado` 382 → 243 ns. Por eso viaja también.
+
+En la compilación de siempre no cambia nada: una copia, la misma que antes.
+
+---
+
 ## [0.4.0] - 2026-10-19
 
 El motor propio genera texto de punta a punta sin candle, con su propio
@@ -1158,6 +1268,7 @@ agrega una sección a uno y se olvida del otro, CI falla.
 - Verificado en esta versión: **22 tests**, 0 avisos, clippy limpio en las tres
   combinaciones (por defecto, `candle`, `zig,candle`).
 
+[0.5.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.3.0
 [0.1.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.1.0

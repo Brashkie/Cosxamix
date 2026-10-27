@@ -7,9 +7,14 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=kernels/");
+    // La copia de los kernels de Zig para x86-64-v3 (ver compilar_zig).
+    println!("cargo:rustc-check-cfg=cfg(cosxamix_v3)");
 
     #[cfg(feature = "zig")]
     compilar_zig();
+
+    #[cfg(feature = "c")]
+    compilar_c();
 
     comprobar_asm_q4k();
 }
@@ -106,25 +111,27 @@ fn define_etiqueta(texto: &str, nombre: &str) -> bool {
 /// kernel pierde contra el de Rust por motivos que no tienen nada que ver con
 /// el lenguaje. Medido: así perdía entre un 3% y un 26%.
 ///
-/// `x86_64_v3` es exactamente AVX2 + FMA, que es lo que habilita el camino de
-/// Rust con `#[target_feature]`. Comparar contra otra cosa sería comparar dos
-/// targets, no dos lenguajes. No se usa `native`: ataría el binario a la CPU
-/// que lo compiló, y la idea es publicar uno que ande en todas y elija en
-/// tiempo de ejecución.
+/// En x86-64 Zig sigue a lo que se le pidió a Rust (ver compilar_zig): si
+/// Rust se compila para `x86-64-v3` —lo de siempre, por `.cargo/config.toml`—,
+/// Zig también, porque el binario igual no arranca sin AVX2. Si Rust se
+/// compila para el x86-64 básico —la compilación aparte para las CPU de antes
+/// de 2015—, Zig va en `baseline` y lleva una segunda copia para `x86_64_v3`
+/// que se elige al arrancar. No se usa `native`: ataría el binario a la CPU
+/// que lo compiló.
 ///
 /// En aarch64 va `baseline` **a propósito**: NEON es obligatorio en ARMv8-A,
 /// así que la línea base ya trae los 128 bits de SIMD. No hay un `v3` que
 /// pedir, y nombrar una microarquitectura concreta (`apple_m1`, `cortex_a76`)
 /// ataría el binario a un teléfono.
-#[cfg(feature = "zig")]
+#[cfg(any(feature = "zig", feature = "c"))]
 fn zig_target(rust_target: &str) -> (&'static str, &'static str) {
     match rust_target {
-        "x86_64-unknown-linux-gnu" => ("x86_64-linux-gnu", "x86_64_v3"),
+        "x86_64-unknown-linux-gnu" => ("x86_64-linux-gnu", "baseline"),
         "aarch64-unknown-linux-gnu" => ("aarch64-linux-gnu", "baseline"),
         "aarch64-linux-android" => ("aarch64-linux-android", "baseline"),
-        "x86_64-pc-windows-msvc" => ("x86_64-windows-msvc", "x86_64_v3"),
+        "x86_64-pc-windows-msvc" => ("x86_64-windows-msvc", "baseline"),
         "aarch64-apple-darwin" => ("aarch64-macos", "baseline"),
-        "x86_64-apple-darwin" => ("x86_64-macos", "x86_64_v3"),
+        "x86_64-apple-darwin" => ("x86_64-macos", "baseline"),
         otro => panic!(
             "no sé traducir el target {otro} al de Zig.\n\
              Agregalo en `zig_target()` de build.rs, o compilá sin la feature:\n\
@@ -151,8 +158,62 @@ fn compilar_zig() {
     let target = std::env::var("TARGET").expect("TARGET");
     let host = std::env::var("HOST").expect("HOST");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS");
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH");
 
-    let (zig_tgt, mcpu) = zig_target(&target);
+    let (zig_tgt, mcpu_base) = zig_target(&target);
+
+    // Lo que Rust ya da por hecho en este binario. `CARGO_CFG_TARGET_FEATURE`
+    // trae lo que sale de `target-cpu`, del target y no del host.
+    let rasgos = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    let rust_v3 = ["avx2", "fma"]
+        .iter()
+        .all(|f| rasgos.split(',').any(|r| r == *f));
+    let x86 = target_arch == "x86_64";
+
+    // Con Rust en x86-64-v3, una sola copia de Zig y también en v3: el
+    // binario igual no arranca sin AVX2, así que una copia baseline sería peso
+    // muerto. Hasta la 0.4.0 Zig iba SIEMPRE en v3, y la compilación aparte
+    // para las CPU sin AVX2 —sin el `target-cpu` del config— moría con
+    // "instrucción ilegal" en el primer kernel de Zig.
+    let mcpu = if x86 && rust_v3 {
+        "x86_64_v3"
+    } else {
+        mcpu_base
+    };
+
+    // Con Rust en el x86-64 básico, los mismos kernels otra vez para x86-64-v3
+    // (AVX2 + FMA), con sufijo `_v3` (`kernels/lib_v3.zig`): un objeto aparte
+    // que entra en la misma librería, para que ese binario también rinda en
+    // una CPU moderna. `COSXAMIX_SIN_V3` lo saltea, para comprobar que la
+    // copia baseline sola compila y pasa los tests.
+    println!("cargo:rerun-if-env-changed=COSXAMIX_SIN_V3");
+    let objeto_v3 = (x86 && !rust_v3 && std::env::var_os("COSXAMIX_SIN_V3").is_none()).then(|| {
+        let obj = salida.join(if target_os == "windows" {
+            "cosxamix_v3.obj"
+        } else {
+            "cosxamix_v3.o"
+        });
+        let mut c = Command::new("zig");
+        c.args([
+            "build-obj",
+            "kernels/lib_v3.zig",
+            "-OReleaseFast",
+            "-fPIC",
+            "-mcpu=x86_64_v3",
+        ]);
+        if target != host {
+            c.arg("-target").arg(zig_tgt);
+        }
+        c.arg(format!("-femit-bin={}", obj.display()));
+        match c.status() {
+            Ok(st) if st.success() => obj,
+            Ok(st) => panic!("zig build-obj (x86-64-v3) falló con código {st:?} para {target}"),
+            Err(e) => panic!(
+                "no pude ejecutar `zig`: {e}\n\
+                 Instalalo, o compilá sin la feature: cargo build --release"
+            ),
+        }
+    });
 
     // `build-lib -static` deja una librería estática que el linker de Rust
     // mete en el binario final. Nada de .dll ni .so al lado: Cosxamix sigue
@@ -165,8 +226,17 @@ fn compilar_zig() {
     let destino = salida.join(nombre_lib("cosxamix_kernels", &target_os));
 
     let mut cmd = Command::new("zig");
-    cmd.args(["build-lib", "kernels/dot.zig", "-static", "-OReleaseFast"]);
+    cmd.args([
+        "build-lib",
+        "kernels/lib.zig",
+        "-static",
+        "-OReleaseFast",
+        "-fPIC",
+    ]);
     cmd.arg(format!("-mcpu={mcpu}"));
+    if let Some(obj) = &objeto_v3 {
+        cmd.arg(obj);
+    }
 
     // Compilando para la propia máquina no se pasa `-target`, que es el camino
     // de todos los días y el que está probado. Al cruzar sí, y ahí Zig hace el
@@ -202,6 +272,76 @@ fn compilar_zig() {
 
     println!("cargo:rustc-link-search=native={}", salida.display());
     println!("cargo:rustc-link-lib=static=cosxamix_kernels");
+    if objeto_v3.is_some() {
+        println!("cargo:rustc-cfg=cosxamix_v3");
+    }
+}
+
+/// Compila los kernels de C con `zig cc`, en una librería aparte.
+///
+/// Sin libc (`-ffreestanding`): no usan nada de ella, y así cruzar de un
+/// sistema a otro no pide el SDK del otro lado. En baseline: cada kernel pide
+/// sus extensiones con `__attribute__((target))` —AVX2 en x86-64, `dotprod` en
+/// ARM64—, así que el objeto es seguro en cualquier CPU de su arquitectura y el
+/// que lo llama decide si la CPU sirve.
+///
+/// `-ffp-contract=off` porque clang fusiona `a*b + c` en una FMA por su
+/// cuenta, y eso redondea distinto que Rust, que nunca fusiona. Los kernels
+/// piden sus FMA explícitas con intrínsecos.
+///
+/// Un archivo por arquitectura: `q3k_avx2.c` en x86-64 y `neon_dotprod.c` en
+/// ARM64. En otra no se compila nada.
+#[cfg(feature = "c")]
+fn compilar_c() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let fuente = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86_64") => "kernels/q3k_avx2.c",
+        Ok("aarch64") => "kernels/neon_dotprod.c",
+        _ => return,
+    };
+    let salida = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let target = std::env::var("TARGET").expect("TARGET");
+    let host = std::env::var("HOST").expect("HOST");
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS");
+    let destino = salida.join(nombre_lib("cosxamix_c", &target_os));
+
+    let mut cmd = Command::new("zig");
+    cmd.args([
+        "build-lib",
+        "-static",
+        "-OReleaseFast",
+        "-fPIC",
+        "-mcpu=baseline",
+    ]);
+    if target != host {
+        cmd.arg("-target").arg(zig_target(&target).0);
+    }
+    // Las banderas de C van entre `-cflags` y `--`, y valen para los .c que
+    // siguen: puestas después del archivo, Zig las ignora sin avisar.
+    cmd.args([
+        "-cflags",
+        "-std=c11",
+        "-ffreestanding",
+        "-ffp-contract=off",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "--",
+        fuente,
+    ]);
+    cmd.arg(format!("-femit-bin={}", destino.display()));
+    match cmd.status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => panic!("zig build-lib (C) falló con código {s:?} para {target}"),
+        Err(e) => panic!(
+            "no pude ejecutar `zig`: {e}\n\
+             La feature `c` compila con `zig cc`: instalá Zig, o compilá sin ella."
+        ),
+    }
+    println!("cargo:rustc-link-search=native={}", salida.display());
+    println!("cargo:rustc-link-lib=static=cosxamix_c");
 }
 
 /// Cada plataforma nombra sus librerías estáticas a su manera, y `zig
@@ -209,7 +349,7 @@ fn compilar_zig() {
 /// desnudo, pero el archivo en disco tiene que llamarse como toca.
 ///
 /// Toma el sistema del **target**, no del host, por lo dicho arriba.
-#[cfg(feature = "zig")]
+#[cfg(any(feature = "zig", feature = "c"))]
 fn nombre_lib(base: &str, target_os: &str) -> String {
     if target_os == "windows" {
         format!("{base}.lib")

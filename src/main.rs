@@ -494,6 +494,8 @@ async fn main() {
         disponibles = ?kernels::disponibles(),
         "backend de kernels",
     );
+    #[cfg(feature = "zig")]
+    tracing::info!(copia = kernels::zig::copia(), "kernels de Zig");
     tracing::info!("cosxamix escuchando en http://{dir}");
     // El aviso tiene que depender del motor que de verdad se cargó, no de una
     // constante: decía "motor de prueba" con el modelo real cargado, que es

@@ -1682,6 +1682,158 @@ aparece.
 
 ------
 
+## 20. Zig se compila para lo mismo que Rust
+
+`.cargo/config.toml` fija `target-cpu=x86-64-v3` y lo dice claro: el binario no
+arranca en un x86 anterior a 2015, y para esos hace falta compilar sin esa
+línea. Esa compilación existía en el papel y no andaba con `zig`, por dos
+motivos que se tapaban uno al otro:
+
+1. `build.rs` compilaba Zig **siempre** para `x86_64_v3`. Rust sin AVX2, Zig con
+   AVX2: primer kernel, instrucción ilegal.
+2. Seis caminos de `kernels/mod.rs` preguntaban `matches!(elegido(),
+   Backend::Avx2 | Backend::Zig)` antes de llamar a los kernels de Rust con
+   AVX2. Con Zig elegido en una CPU sin AVX2, otra instrucción ilegal, aunque
+   se arreglara lo primero.
+
+**La regla ahora: Zig asume lo mismo que Rust, nunca más.** `build.rs` lee
+`CARGO_CFG_TARGET_FEATURE`. Si Rust ya tiene AVX2 y FMA, Zig va en v3 y una
+sola copia, porque una baseline no correría nunca. Si no, dos copias del mismo
+fuente —baseline y `_v3`— y se elige al arrancar, como en WinsiBot 8.18.0,
+donde se resolvió lo mismo para los kernels de imagen.
+
+Se pensó primero en llevar siempre las dos copias. No: en la compilación de
+siempre la baseline es peso muerto, y en un proyecto que mide cada MB no se
+carga lo que no puede ejecutarse.
+
+**Lo que se gana, medido** (Rust sin `target-cpu`, en este i5-10400 ejecutando
+código SSE2):
+
+| kernel | Rust escalar | Zig baseline (SSE2) | |
+|---|---:|---:|---:|
+| `dot` n=1024 | 994 ns | 85 ns | **11,7x** |
+| `dot` n=4096 | 4,07 µs | 331 ns | **12,3x** |
+| `dot` n=1.000.003 | 1,00 ms | 162 µs | **6,2x** |
+| `rmsnorm` n=2048 | 2,56 µs | 401 ns | **6,4x** |
+| `rmsnorm` n=8192 | 10,3 µs | 1,91 µs | **5,4x** |
+| `dot_q4k_i8` (fila de 256) | 746 ns | 308 ns | **2,4x** |
+| `dot_i8_escalado` n=2048 | 576 ns | 382 ns | **1,5x** |
+| `silu` n=11008 | 37,2 µs | 35,2 µs | 1,06x |
+
+Una primera medición, hecha en la compilación de siempre, daba números
+parecidos y estaba mal: el "escalar" de Rust ya estaba compilado para v3 y el
+compilador lo había vectorizado con AVX2 donde pudo. Se tiró y se midió de
+nuevo con un binario de verdad sin `target-cpu`.
+
+`dot_i8_escalado` en Zig se usaba solo fuera de x86-64. En un x86-64 sin AVX2
+gana 1,5x a la referencia, así que ahora se usa también ahí. Y `silu` queda
+como estaba, en Zig: el 6% está cerca del ruido, pero no pierde.
+
+**Lo que esto no arregla:** candle sigue sin elegir en tiempo de ejecución, y
+en esa compilación corre 4 veces más lento. Lo que sí cambia es que el motor
+propio, que usa estos kernels, deja de pagar la referencia escalar.
+
+---
+
+## 21. Q3_K en tres lenguajes: el algoritmo dio 1,65x, el lenguaje nada
+
+Q3_K es el formato del modelo por defecto y era el kernel fusionado más lento:
+~19 ns por bloque contra ~10 de Q4_K, moviendo **menos** bytes (110 contra
+144). O sea que no era la memoria: era trabajo de más.
+
+Leyendo el kernel aparecieron cuatro cosas, y ninguna era de lenguaje:
+
+| qué | antes | después |
+|---|---|---|
+| las 16 escalas de 6 bits | ~30 operaciones escalares (`escalas_q3k`) | 8 en vector: un `vpsrlvd` con `[0 2 4 6]` pone los dos bits altos de las cuatro palabras de una vez |
+| dónde viven | 16 `f32` a la pila y 8 lecturas por bloque | dos registros y una permutación de patrón constante por grupo |
+| el tercer bit | constante por grupo, `and`, `cmpeq`, `and` | corrimiento inmediato de 16 bits y `and`: lo que arrastra del byte vecino cae fuera del bit 2 |
+| las FMA | una cadena | dos |
+
+En Rust, **154 → 91 ns** por fila de 2048. Ese es el que usa el despachador.
+
+**Después, el mismo algoritmo en C y en ensamblador**, para saber si el
+lenguaje aporta algo encima. Mismas instrucciones, mismo orden; el de
+ensamblador da **igual bit a bit** que los intrínsecos.
+
+| | ns, tres tandas |
+|---|---:|
+| Rust | 90,1 – 91,5 |
+| ensamblador | 90,1 – 92,2 |
+| C (`zig cc`) | 94,4 – 95,4 |
+
+**El ensamblador empata.** En Q4_K había ganado 4-8%, y se averiguó que la
+mayor parte era una instrucción (`vcvtph2ps`) que los intrínsecos no usaban
+(§5). Acá los intrínsecos ya la usan, y lo que le queda a la mano es el reparto
+de registros: el compilador lo hace igual de bien. Un indicio de que el kernel
+ya está contra el límite de los puertos 0 y 1, por donde pasan los
+corrimientos, `vpmaddubsw`, `vpmaddwd`, la conversión y la FMA: probar **cuatro
+acumuladores** en vez de dos lo hizo 3-4% más lento —el compilador se quedó sin
+registros— en vez de más rápido.
+
+**C pierde un 4%** con el mismo LLVM por debajo. No se buscó la causa: con
+Rust a la par del ensamblador, un 4% de C en x86 no cambia ninguna decisión.
+
+**Lo que C sí trae**, y por eso entra igual con su feature:
+
+- las extensiones de CPU **por función**, `__attribute__((target))`, como
+  `#[target_feature]` y a diferencia de Zig, que las fija por archivo con
+  `-mcpu`. El objeto va en baseline y es seguro en cualquier x86-64;
+- en ARM, **`vdotq_s32`** —la instrucción `sdot`— en `arm_neon.h`, estable. Rust
+  estable no la expone (`stdarch_neon_dotprod`) y Zig no la genera (§5). Es el
+  sitio donde C habilita una plataforma, el segundo brazo de la regla 3, y el
+  siguiente paso: el kernel NEON de Q4_K y Q3_K en C, ejecutado en el runner
+  ARM de CI.
+
+**Por la regla 3, ni el de C ni el de ensamblador entran al despachador.**
+Quedan detrás de `c` y `asm_q3k`, fuera del binario de siempre, con sus tests y
+en el bench, como los contratos de Q4_K que perdieron: sirven de vara cuando
+cambie el hardware. En una CPU con **AVX-VNNI** (`vpdpbusd` hace `vpmaddubsw` y
+`vpmaddwd` en una instrucción, y libera justo los puertos que acá están
+llenos), la comparación se repite.
+
+---
+
+## 22. `sdot` desde C: lo que ningún otro lenguaje del proyecto alcanzaba
+
+En ARM el camino vectorizado de los fusionados era el de Zig, que ensancha
+`i8` a `i32` y multiplica de a 8 carriles: 2,25x sobre el escalar pero 1,7x
+por debajo de AVX2. `sdot` hace 16 productos de `i8` por instrucción, y estaba
+fuera de alcance por tres lados (§5): Rust estable no expone `vdotq_s32`, Zig
+no la genera, y el andamio en ensamblador seguía sin cuerpo.
+
+En C es `arm_neon.h`. Comprobado antes de escribir el kernel: `zig cc -target
+aarch64-linux-gnu` emite `sdot v0.4s, v1.16b, v2.16b` con
+`__attribute__((target("dotprod")))` en la función, y el f16 se convierte con
+un solo `fcvt`. Compila igual para Android y macOS, sin libc.
+
+Lo que hace distinto del de x86:
+
+- **Q3_K sin el rodeo del +4.** `vpmaddubsw` quiere un operando sin signo y
+  obliga a subir los valores a 0-7 y descontar `4·Σx` después; `sdot`
+  multiplica con signo los dos, así que se resta 4 en el byte y listo. El `xs`
+  de Q3_K ni se lee.
+- **Un `sdot` por sub-bloque de 16** en Q3_K y dos por cada uno de 32 en Q4_K,
+  con la conversión a `f32` y una FMA por sub-bloque, en dos cadenas.
+
+**Lo que no se sabe todavía es cuánto gana**, y por eso no está en el
+despachador: esta máquina es x86-64 y no tiene cómo ejecutarlo, ni QEMU ni WSL.
+Los tests —contra la referencia escalar en 1, 2, 8, 17 y 43 bloques, y contra
+Zig— y el bench corren en el runner ARM64 de CI, un Neoverse N2 con `dotprod`.
+La medición que decide es la de un teléfono con Termux, que es la plataforma
+objetivo:
+
+```bash
+pkg install zig rust
+cargo bench --features zig,c --bench kernels -- dot_q4k_i8
+```
+
+Ahí se ve `zig` contra `c con sdot` y `q3k escalar` contra `q3k c con sdot`.
+Si gana, entra al despachador preguntando `dotprod`; en un A53 o un A72, que no
+la tienen, sigue el de Zig.
+
+---
+
 ## Cifras que hubo que corregir
 
 Se listan porque una cifra mal medida dirige el trabajo hacia el lado

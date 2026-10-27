@@ -46,7 +46,10 @@ jobs:
         # `ubuntu-latest` corre el de ELF y en `windows-latest` el de COFF; en
         # `macos-latest`, que es ARM, el modulo no existe y no se prueba —el de
         # Mach-O x86-64 solo lo ensambla el job `ensamblador`, no lo ejecuta—.
-        features: ['', 'candle', 'training', 'asm_q4k']
+        #
+        # `asm_q3k` hace lo mismo con el de Q3_K, que ademas se compara bit a bit
+        # contra los intrinsecos: es el mismo algoritmo en el mismo orden.
+        features: ['', 'candle', 'training', 'asm_q4k', 'asm_q3k']
     steps:
       - uses: actions/checkout@v4
 
@@ -117,14 +120,34 @@ jobs:
       - uses: ./.github/actions/instalar-zig
 
       - name: Clippy
-        run: cargo clippy --features zig,candle --all-targets -- -D warnings
+        run: cargo clippy --features zig,candle,c --all-targets -- -D warnings
 
       # Entre los 22 hay seis que comparan cada backend contra la referencia
       # escalar con la misma entrada. Son los que demuestran que el kernel de
       # Zig calcula lo mismo que el de Rust, que es lo unico que justifica
       # tenerlo.
+      # Con `c`, tambien el kernel de C (`zig cc`, el mismo Zig de arriba).
       - name: Tests
-        run: cargo test --features zig,candle
+        run: cargo test --features zig,candle,c
+
+      # La compilación para las CPU sin AVX2: Rust en el x86-64 básico, y Zig
+      # con sus dos copias. Aquí SÍ va RUSTFLAGS, a propósito: es la forma de
+      # sacar el `target-cpu` del config. COSXAMIX_SIN_AVX2 hace que el runner,
+      # que tiene AVX2, corra el camino de una CPU que no lo tiene. Sin candle:
+      # recompilarlo sin target-cpu son minutos, y lo que se prueba son los
+      # kernels.
+      - name: Tests sin AVX2 (Rust y Zig en baseline)
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64
+          CARGO_TARGET_DIR: target/baseline
+          COSXAMIX_SIN_AVX2: "1"
+        run: cargo test --features zig
+
+      - name: Tests sin AVX2, copia v3 de Zig elegida
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64
+          CARGO_TARGET_DIR: target/baseline
+        run: cargo test --features zig
 
       - name: Que el kernel compilado sea x86-64
         run: python3 scripts/check_kernel_arch.py "" x86_64
@@ -219,17 +242,19 @@ jobs:
         run: |
           grep -m1 -o -w asimddp /proc/cpuinfo || echo "SIN dotprod, los tests del kernel NEON se saltan"
 
+      # Con `c`: los kernels de `kernels/neon_dotprod.c`, con `sdot`. Este es
+      # el UNICO lugar donde corren: la maquina de desarrollo es x86-64.
       - name: Clippy
-        run: cargo clippy --features zig,asm_q4k --all-targets -- -D warnings
+        run: cargo clippy --features zig,asm_q4k,c --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --features zig,asm_q4k
+        run: cargo test --features zig,asm_q4k,c
 
       # No decide nada —un runner compartido mide con ruido y no es el telefono—,
       # pero deja en el log el orden de magnitud de escalar, Zig y NEON en la
       # misma maquina, que es la comparacion que importa.
       - name: Bench del fusionado
-        run: cargo bench --features zig,asm_q4k --bench kernels -- dot_q4k_i8 --warm-up-time 1 --measurement-time 3
+        run: cargo bench --features zig,asm_q4k,c --bench kernels -- dot_q4k_i8 --warm-up-time 1 --measurement-time 3
 
   # -- Que el ensamblador ensamble en los tres formatos de objeto ----------
   #
@@ -253,15 +278,17 @@ jobs:
       # Con `asm_q4k`: sin la feature los `.s` de Q4_K no entran al build y
       # este job no los veria.
       - name: ELF
-        run: cargo build --lib --features asm_q4k --target x86_64-unknown-linux-gnu
+        run: cargo build --lib --features asm_q4k,asm_q3k --target x86_64-unknown-linux-gnu
       - name: Mach-O
-        run: cargo build --lib --features asm_q4k --target x86_64-apple-darwin
+        run: cargo build --lib --features asm_q4k,asm_q3k --target x86_64-apple-darwin
       # El NEON es un solo archivo para ELF y Mach-O, y Mach-O es el que
       # rechaza directivas: aca se ve antes que en un Mac.
+      # Con `c`: el `neon_dotprod.c` cruzado por `zig cc` a los dos formatos.
+      - uses: ./.github/actions/instalar-zig
       - name: ARM64 ELF
-        run: cargo build --lib --features asm_q4k --target aarch64-unknown-linux-gnu
+        run: cargo build --lib --features asm_q4k,c --target aarch64-unknown-linux-gnu
       - name: ARM64 Mach-O
-        run: cargo build --lib --features asm_q4k --target aarch64-apple-darwin
+        run: cargo build --lib --features asm_q4k,c --target aarch64-apple-darwin
       # COFF lo cubre la matriz de Windows, que compila el binario entero.
 
 

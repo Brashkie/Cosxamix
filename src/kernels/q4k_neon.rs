@@ -18,6 +18,11 @@
 //! con 8 carriles: 2,25x sobre el escalar pero 1,7x por debajo de AVX2.
 //! `sdot` hace 16 productos de 8 bits por instrucción.
 //!
+//! **Hoy hay otra forma: C.** `arm_neon.h` trae `vdotq_s32` estable, y
+//! `kernels/neon_dotprod.c` (feature `c`, ver `src/kernels/c.rs`) tiene los
+//! fusionados de Q4_K y Q3_K con `sdot`. Este andamio queda para el día en que
+//! haga falta ganarle al compilador de C a mano, como pasó en x86 con Q4_K.
+//!
 //! ## Detrás de qué, y cuándo
 //!
 //! Va detrás de la feature `asm_q4k`, la misma que el de x86, y solo se compila

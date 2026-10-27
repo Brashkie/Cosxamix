@@ -5,6 +5,69 @@
 //! a propósito: que el proyecto use varios lenguajes no debe significar que
 //! haya que instalarlos todos para compilarlo.
 
+// ─── Qué copia usar ──────────────────────────────────────────────────────────
+//
+// En x86-64, Zig va compilado para lo mismo que Rust (ver build.rs). En la
+// compilación de siempre —Rust en x86-64-v3— hay una sola copia, en v3. En la
+// compilación sin `target-cpu`, para las CPU de antes de 2015, la librería trae
+// cada kernel dos veces (`kernels/exports.zig`): en baseline, y para
+// x86-64-v3 con sufijo `_v3`, y se elige una al primer uso. En ARM no hay nada
+// que elegir: NEON es parte de la base.
+
+/// `true` si se usan los kernels `_v3` de la librería doble.
+/// `COSXAMIX_ZIG=baseline` fuerza la copia baseline, para medirla en una
+/// máquina que tiene AVX2.
+pub fn v3() -> bool {
+    #[cfg(cosxamix_v3)]
+    {
+        use std::sync::OnceLock;
+        static V3: OnceLock<bool> = OnceLock::new();
+        *V3.get_or_init(|| {
+            std::env::var("COSXAMIX_ZIG")
+                .map(|v| v.to_lowercase())
+                .as_deref()
+                != Ok("baseline")
+                && super::cpu_avx2()
+        })
+    }
+    #[cfg(not(cosxamix_v3))]
+    {
+        false
+    }
+}
+
+/// Si los kernels de Zig que se están usando tienen AVX2: la copia `_v3`, o
+/// la única copia de un binario que ya es todo x86-64-v3.
+pub fn con_avx2() -> bool {
+    cfg!(all(target_arch = "x86_64", target_feature = "avx2")) || v3()
+}
+
+/// Qué copia se está usando, para el log de arranque y los ejemplos.
+pub fn copia() -> &'static str {
+    if con_avx2() {
+        "x86-64-v3 (AVX2)"
+    } else if cfg!(target_arch = "x86_64") {
+        "baseline (SSE2)"
+    } else {
+        "baseline"
+    }
+}
+
+/// Llama a la versión `_v3` de un kernel si toca, o a la de siempre. Sin
+/// `cosxamix_v3`, la rama `_v3` ni se compila.
+macro_rules! zig {
+    ($base:ident, $v3:ident, $($arg:expr),* $(,)?) => {{
+        #[cfg(cosxamix_v3)]
+        {
+            if v3() { $v3($($arg),*) } else { $base($($arg),*) }
+        }
+        #[cfg(not(cosxamix_v3))]
+        {
+            $base($($arg),*)
+        }
+    }};
+}
+
 // La función que exporta `kernels/dot.zig`, con ABI de C.
 //
 // Los slices no cruzan la frontera: de este lado se descomponen en puntero y
@@ -12,6 +75,11 @@
 // de documentación: rustdoc no documenta un bloque `extern`.)
 unsafe extern "C" {
     fn cosxamix_dot_f32(a: *const f32, b: *const f32, n: usize) -> f32;
+}
+
+#[cfg(cosxamix_v3)]
+unsafe extern "C" {
+    fn cosxamix_dot_f32_v3(a: *const f32, b: *const f32, n: usize) -> f32;
 }
 
 /// Producto punto.
@@ -31,11 +99,30 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
 
-    unsafe { cosxamix_dot_f32(a.as_ptr(), b.as_ptr(), a.len()) }
+    unsafe {
+        zig!(
+            cosxamix_dot_f32,
+            cosxamix_dot_f32_v3,
+            a.as_ptr(),
+            b.as_ptr(),
+            a.len()
+        )
+    }
 }
 
 unsafe extern "C" {
     fn cosxamix_rmsnorm_f32(
+        salida: *mut f32,
+        entrada: *const f32,
+        peso: *const f32,
+        n: usize,
+        eps: f32,
+    );
+}
+
+#[cfg(cosxamix_v3)]
+unsafe extern "C" {
+    fn cosxamix_rmsnorm_f32_v3(
         salida: *mut f32,
         entrada: *const f32,
         peso: *const f32,
@@ -54,7 +141,9 @@ pub fn rmsnorm(salida: &mut [f32], entrada: &[f32], peso: &[f32], eps: f32) {
     }
 
     unsafe {
-        cosxamix_rmsnorm_f32(
+        zig!(
+            cosxamix_rmsnorm_f32,
+            cosxamix_rmsnorm_f32_v3,
             salida.as_mut_ptr(),
             entrada.as_ptr(),
             peso.as_ptr(),
@@ -68,6 +157,11 @@ unsafe extern "C" {
     fn cosxamix_silu_f32(salida: *mut f32, entrada: *const f32, n: usize);
 }
 
+#[cfg(cosxamix_v3)]
+unsafe extern "C" {
+    fn cosxamix_silu_f32_v3(salida: *mut f32, entrada: *const f32, n: usize);
+}
+
 /// SiLU vectorizada.
 ///
 /// Es el unico kernel de la frontera donde Zig aporta algo que no es cobertura
@@ -77,11 +171,31 @@ unsafe extern "C" {
 /// aproximacion polinomica con su reduccion de rango.
 pub fn silu(salida: &mut [f32], entrada: &[f32]) {
     debug_assert_eq!(salida.len(), entrada.len());
-    unsafe { cosxamix_silu_f32(salida.as_mut_ptr(), entrada.as_ptr(), entrada.len()) }
+    unsafe {
+        zig!(
+            cosxamix_silu_f32,
+            cosxamix_silu_f32_v3,
+            salida.as_mut_ptr(),
+            entrada.as_ptr(),
+            entrada.len()
+        )
+    }
 }
 
 unsafe extern "C" {
     fn cosxamix_dot_i8_escalado_f32(
+        a: *const i8,
+        b: *const i8,
+        esc_a: *const f32,
+        esc_b: *const f32,
+        n: usize,
+        bloque: usize,
+    ) -> f32;
+}
+
+#[cfg(cosxamix_v3)]
+unsafe extern "C" {
+    fn cosxamix_dot_i8_escalado_f32_v3(
         a: *const i8,
         b: *const i8,
         esc_a: *const f32,
@@ -104,7 +218,9 @@ unsafe extern "C" {
 pub fn dot_i8_escalado(a: &[i8], b: &[i8], esc_a: &[f32], esc_b: &[f32], bloque: usize) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     unsafe {
-        cosxamix_dot_i8_escalado_f32(
+        zig!(
+            cosxamix_dot_i8_escalado_f32,
+            cosxamix_dot_i8_escalado_f32_v3,
             a.as_ptr(),
             b.as_ptr(),
             esc_a.as_ptr(),
@@ -117,6 +233,17 @@ pub fn dot_i8_escalado(a: &[i8], b: &[i8], esc_a: &[f32], esc_b: &[f32], bloque:
 
 unsafe extern "C" {
     fn cosxamix_dot_q4k_i8_f32(
+        bloques: *const u8,
+        xq: *const i8,
+        xe: *const f32,
+        xs: *const f32,
+        n: usize,
+    ) -> f32;
+}
+
+#[cfg(cosxamix_v3)]
+unsafe extern "C" {
+    fn cosxamix_dot_q4k_i8_f32_v3(
         bloques: *const u8,
         xq: *const i8,
         xe: *const f32,
@@ -144,7 +271,9 @@ pub fn dot_q4k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
     debug_assert_eq!(xs.len(), xe.len());
     debug_assert!(bloques.len() >= xq.len() / 256 * 144);
     unsafe {
-        cosxamix_dot_q4k_i8_f32(
+        zig!(
+            cosxamix_dot_q4k_i8_f32,
+            cosxamix_dot_q4k_i8_f32_v3,
             bloques.as_ptr(),
             xq.as_ptr(),
             xe.as_ptr(),
@@ -158,7 +287,12 @@ unsafe extern "C" {
     fn cosxamix_noop(x: f32) -> f32;
 }
 
+#[cfg(cosxamix_v3)]
+unsafe extern "C" {
+    fn cosxamix_noop_v3(x: f32) -> f32;
+}
+
 /// Cruza la FFI sin hacer trabajo. Solo para medir el coste de la frontera.
 pub fn noop(x: f32) -> f32 {
-    unsafe { cosxamix_noop(x) }
+    unsafe { zig!(cosxamix_noop, cosxamix_noop_v3, x) }
 }
