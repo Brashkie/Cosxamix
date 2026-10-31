@@ -147,6 +147,7 @@ Variables de entorno:
 | `COSXAMIX_RAM_MB` | `4096` | Presupuesto de memoria para los modelos cargados |
 | `RAYON_NUM_THREADS` | núcleos físicos | Hilos del cálculo matricial |
 | `COSXAMIX_MOTOR` | `propio` | El motor de la casa y sus kernels: 1,6-1,9x más rápido que candle por mensaje en el uso de WinsiBot, y 11/15 contra 10/15 en la batería ([DECISIONES §23](DECISIONES.md)). `candle` vuelve al de antes |
+| `COSXAMIX_SIN_BLOQUES`, `COSXAMIX_SIN_Q6K_FUSIONADO`, `COSXAMIX_SIN_VARIAS`, `COSXAMIX_SIN_PRESTAMO` | sin definir | Cada una apaga una optimización de la 0.7.0 —la matmul por bloques del prefill, el kernel de Q6_K, q-k-v en una pasada, el prefijo entre conversaciones—, para medir con y sin ella ([DECISIONES §24-26](DECISIONES.md)) |
 
 **Todos los `.gguf` del directorio se registran**, no solo el de
 `COSXAMIX_GGUF`: esa variable dice cuál se precalienta, no cuál es el único
@@ -224,8 +225,12 @@ otro baja bien y falla al ejecutarse.
 Está en **[ROADMAP.md](ROADMAP.md)**, con el estado medido arriba y el orden
 puesto por cuánto mueve la latencia, no por cuán interesante es de programar.
 
-En resumen: el motor está al **51% del techo de ancho de banda** de esta
-máquina, o sea que queda menos de 2x por ganar acá. Que de 6 núcleos salgan
+En resumen: **leer el prompt** ya va 1,7x más rápido que en la 0.6.0, y el
+comienzo del *system* se lee una sola vez para todos los chats (0.7.0).
+**Generar** va a ~66% de lo que da la RAM recorriendo los mismos bytes, y lo
+que queda ahí es casi tanto de cálculo como de memoria ([DECISIONES
+§25](DECISIONES.md)). En la medición de referencia, el motor estaba al **51%
+del techo de ancho de banda**, o sea que queda menos de 2x por ganar acá. Que de 6 núcleos salgan
 2,6x en vez de 6x **ya tiene explicación**: las matrices que no entran en los
 12 MB de L3 no escalan, y son el 89% de los pesos. Es el muro de memoria, y
 más hilos no lo arreglan — que es exactamente lo que mató a la decodificación

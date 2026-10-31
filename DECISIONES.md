@@ -1902,6 +1902,91 @@ reemplazo pide que siga siendo.
 
 ---
 
+## 24. La matmul por bloques, y lo que el freno resultó ser
+
+`examples/measure_response` midió una respuesta como la de WinsiBot: en el
+primer mensaje de un chat, **el 72% del tiempo era leer el prompt** (333
+tokens, 11,2 s) y el decode ya usaba el 67% de la RAM. El aire estaba en el
+prefill, que es una multiplicación de matrices de verdad y no de un vector.
+
+**Primera hipótesis: la caché.** `matmul_i8_directo` hacía un producto punto
+por llamada y, por cada columna, recorría la entrada entera: 680 KB con 333
+filas, que no entran en L2. `matmul_i8_bloques` desempaqueta el tramo de
+columnas una vez, recorre la entrada en franjas y calcula teselas de 4 filas
+× 2 columnas en registros. Ganó 1,53x. Pasar los pesos a sin signo y las
+escalas a una por carril, que quitaban instrucciones, casi no movió nada.
+
+**Segunda hipótesis: las cuentas.** Las escalas enteras de llama.cpp dejan 3
+instrucciones por trozo en vez de 5. Ganaron solo un 8 a 12%, y con una
+escala cada 32 valores, nada. **Y partir `k` en tajadas que entraran en L2
+tampoco ganó.** Si ni menos instrucciones ni mejor caché mueven el número,
+el freno estaba en otro lado.
+
+**Lo que era: dos etapas en un solo hilo.** Medido por etapas dentro de una
+llamada: cuantizar la entrada y transponer la salida —las dos en un hilo,
+con los otros once esperando— eran entre el 24% (`ffn_gate`) y el 64%
+(`attn_k`) de cada multiplicación. En paralelo, la mejora pasó de 1,65x a
+**2x**, y de punta a punta el prompt de 333 tokens bajó a **6,6 s (1,70x)**.
+
+La lección, para la próxima: **medir por etapas antes de optimizar un
+kernel.** Dos de los tres intentos atacaron algo que no era el freno.
+
+**Las escalas enteras se sacaron, aunque ya con el freno resuelto ganaban un
+15%.** `examples/measure_precision` compara la distribución entera del
+próximo token contra el camino que no cuantiza la entrada: el que quedó
+pierde KL 0,0011 —lo mismo que el camino de antes, 0,0010—, y las enteras
+entre 0,0027 y 0,0071 según cada cuánto lleva escala la entrada. En la
+batería, 10 de 15 contra 11. Un 15% de prefill no paga 3 a 7 veces más
+error, y el que lo ve es el usuario del bot.
+
+## 25. El decode: medir dentro del forward
+
+Con el prefill resuelto, el decode quedó como lo que más pesa en una
+respuesta larga, al 66% de lo que da la RAM. `examples/measure_decode`
+recorrió todas las matrices en orden y señaló la de salida —Q6_K, sin kernel
+fusionado— como el 25% del token a 12,9 GB/s. Se le escribió el kernel, y la
+matmul suelta bajó a la mitad... y el forward no se movió.
+
+**La medición aislada mentía.** Medida dentro del forward —con un cronómetro
+temporal por etapa—, la salida por el camino con buffer costaba 11,3 ms y no
+19,7, y el kernel nuevo la dejó en 9,7: un 2%, no un 12%. Lo que sí mostró la
+medición en contexto fue otra cosa: **q, k y v iban a 12 GB/s** contra 21 de
+las ffn. Tres llamadas paralelas seguidas, dos de ellas a matrices de 0,2 MB
+donde el costo fijo de repartir los hilos (~10 µs) era casi todo. Juntarlas
+en una pasada, y gate con up, bajó el token un 3 a 5%.
+
+Lo que queda: las ffn van a 21-22 GB/s de 28. Con los pesos en caché el
+kernel de Q3_K hace 33 GB/s, solo 1,2 veces lo que da la RAM, así que ahí el
+límite es casi tanto de cálculo como de memoria, y las escalas enteras que lo
+aliviarían ya se descartaron por precisión (§24).
+
+## 26. El prefijo entre conversaciones
+
+El caché de atención se guarda por sesión, y WinsiBot usa una sesión por
+chat. Desde que su *system* dejó de cambiar con cada mensaje (WinsiBot 9.1.0),
+dentro de un chat solo se lee lo nuevo. Quedaba el primer mensaje de cada
+chat, y el de cada grupo cada media hora, cuando se renueva la foto de su
+perfil: ahí se leía el *system* entero, aunque su comienzo —quién es el bot,
+su personalidad, las reglas— fuera el mismo en todos los grupos.
+
+**Copiar es exacto.** El caché de un token depende solo de los tokens
+anteriores, así que si dos prompts empiezan igual, el tramo común es el mismo
+en los dos. Se busca entre las sesiones guardadas —16 como mucho, comparar
+prefijos no cuesta nada— la que comparte más, y se copia ese tramo. Copiar
+130 tokens del 3B son ~10 MB; leerlos, unos 2,5 s.
+
+**La otra mitad del arreglo estaba en WinsiBot.** Sus dos instrucciones fijas
+del final ("responde como un miembro del grupo", "no recicles los ejemplos")
+iban después del perfil del grupo, fuera del tramo común. Pasarlas arriba
+llevó el tramo de 68 a 130 tokens, y el primer mensaje de 4,9 a 3,5 s (6,0
+sin préstamo).
+
+**No es bit a bit idéntico a leerlo**: el tramo copiado puede haberse
+calculado en un lote de otro tamaño —y desde 24 filas va por la matmul por
+bloques—, así que puede diferir en el redondeo. En las pruebas, la respuesta
+sale igual; y `check_sessions` confirma que la conversación de la que se
+copia no cambia.
+
 ## Cifras que hubo que corregir
 
 Se listan porque una cifra mal medida dirige el trabajo hacia el lado

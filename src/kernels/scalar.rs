@@ -227,6 +227,55 @@ pub fn dot_q3k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
     total
 }
 
+/// Producto de una fila Q6_K contra una entrada cuantizada en sub-bloques de
+/// 16, sin desempaquetar a ningún buffer. Referencia de
+/// [`super::x86::dot_q6k_i8_avx2`].
+///
+/// Un bloque de 256 son 128 bytes de nibbles bajos (`ql`), 64 de pares de
+/// bits altos (`qh`), 16 escalas `i8` y una `d`. Cada mitad de 128 valores
+/// son cuatro grupos de 32 seguidos; el grupo `g` de la mitad toma:
+///
+/// | `g` | 4 bits bajos | 2 bits altos |
+/// |---|---|---|
+/// | 0 | nibble bajo de `ql[0..32]` | bits 0-1 de `qh` |
+/// | 1 | nibble bajo de `ql[32..64]` | bits 2-3 |
+/// | 2 | nibble alto de `ql[0..32]` | bits 4-5 |
+/// | 3 | nibble alto de `ql[32..64]` | bits 6-7 |
+///
+/// El valor va de 0 a 63 y se le resta 32, que acá se descuenta con la suma
+/// de la entrada, igual que el 4 de Q3_K.
+pub fn dot_q6k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
+    debug_assert!(xq.len().is_multiple_of(256));
+    debug_assert_eq!(xe.len(), xq.len() / 16);
+    debug_assert_eq!(xs.len(), xe.len());
+
+    let mut total = 0f32;
+    for bl in 0..xq.len() / 256 {
+        let o = bl * 210;
+        let esc = &bloques[o + 192..o + 208];
+        let d = crate::quant::leer_f16(bloques, o + 208);
+        for g in 0..8 {
+            let (mitad, gi) = (g / 4, g % 4);
+            let ql = &bloques[o + 64 * mitad + 32 * (gi % 2)..][..32];
+            let qh = &bloques[o + 128 + 32 * mitad..][..32];
+            let x = &xq[bl * 256 + g * 32..][..32];
+            for medio in 0..2 {
+                let sub = bl * 16 + g * 2 + medio;
+                let escala = d * esc[g * 2 + medio] as i8 as f32;
+                let mut entero = 0i32;
+                for l in 0..16 {
+                    let i = medio * 16 + l;
+                    let nib = if gi < 2 { ql[i] & 0x0F } else { ql[i] >> 4 };
+                    let q = (nib | (((qh[i] >> (2 * gi)) & 3) << 4)) as i32;
+                    entero += x[i] as i32 * q;
+                }
+                total += xe[sub] * escala * (entero as f32 - 32.0 * xs[sub]);
+            }
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

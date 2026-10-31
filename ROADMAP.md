@@ -20,6 +20,7 @@ canal, **~37,5 GB/s** reales. Sin GPU en el camino.
 | modelo | Qwen2.5-3B-Instruct Q3_K_M, 1644 MB |
 | residente | 1687 MB (x1,03 del archivo) |
 | generación | ~11,9 tok/s |
+| lectura del prompt | ~50 tok/s (333 tokens en 6,6 s, matmul por bloques) |
 | **del techo de memoria** | **51%** |
 | calidad | 10/15 preguntas verificables |
 | sesiones concurrentes | 16, caché LRU, intercalar no cuesta nada |
@@ -114,6 +115,10 @@ Trabajo sin misterio, pendiente:
 - ~~Carga de más de un modelo a la vez~~ **hecho en la 0.3.0**: registra todos
   los `.gguf` del directorio, carga bajo demanda y desaloja el menos usado
   cuando no entra en `COSXAMIX_RAM_MB`.
+- ~~Reaprovechar el prefijo entre conversaciones distintas~~ **hecho en la
+  0.7.0**: un chat nuevo copia de otro el comienzo que comparten, y el primer
+  mensaje de un grupo de WinsiBot baja de 6,0 a 3,5 s ([DECISIONES](DECISIONES.md)
+  §26).
 - ~~Persistir el caché de sesión en disco~~ **medido y descartado**. Lo que
   ahorra es el prefill del *system prompt* en el primer mensaje de cada
   conversación tras reiniciar: medido contra WinsiBot, **~1 s** (4905 ms a
@@ -128,6 +133,12 @@ Trabajo sin misterio, pendiente:
   **Vuelve a tener sentido** si alguna vez reiniciar deja de costar 45 s —por
   ejemplo con carga por `mmap`—, porque ahí el segundo del prefill pasaría a
   ser una parte grande del total. Antes, no.
+
+  *Revisado en la 0.7.0:* el motor propio ya carga por `mmap` en ~0,5 s, así
+  que la condición se cumplió. Pero sigue sin convenir por otro lado:
+  WinsiBot renueva el perfil de cada grupo en su *system* cada media hora,
+  así que un caché guardado vencería enseguida, y el préstamo de prefijo ya
+  cubre el tramo fijo, que es lo único que sobrevive.
 
 ---
 

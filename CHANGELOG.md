@@ -9,6 +9,144 @@ acá va qué cambió, no por qué.
 
 ---
 
+## [0.7.0] - 2026-10-30
+
+Responder un mensaje cuesta mucho menos donde más se notaba: **leer el
+prompt**, que en el primer mensaje de un chat era el 72% del tiempo.
+
+- Leer el prompt es **1,70 veces más rápido** de punta a punta: con el 3B,
+  333 tokens pasan de 11,2 s a 6,6 s, con la misma precisión y el mismo texto
+  generado.
+- Un chat nuevo **copia de otra conversación el comienzo que comparten**: el
+  primer mensaje de un grupo, como lo usa WinsiBot desde su 9.1.0, baja de
+  6,0 a 3,5 s.
+- Cada token generado, **3 a 5% más rápido**, con el resultado idéntico bit a
+  bit.
+
+Todo con el texto generado igual que antes, y cada mejora con su variable
+`COSXAMIX_SIN_*` para apagarla y comparar.
+
+### Añadido
+
+- **`ops::matmul_i8_bloques`, la matmul por bloques del prefill.** Hace las
+  mismas cuentas que `matmul_i8_directo` en otro orden. Allá cada producto
+  punto era una llamada, y por cada columna se recorría la entrada entera:
+  con 333 filas son 680 KB por columna, que no entran en L2, así que la
+  multiplicación esperaba a la caché. Acá cada hilo desempaqueta su tramo de
+  columnas una vez, recorre la entrada en franjas que entran en L2 junto con
+  el tramo, y adentro calcula una **tesela de 4 filas × 2 columnas en
+  registros** (`kernels::x86::tesela_u8_avx2` y `tesela_i8_avx2`): cada
+  trozo de columna se usa 4 veces y cada trozo de fila 2. Las escalas vienen
+  ya expandidas a una por carril, en vez de armarse con `setr` en cada trozo,
+  y los pesos se corren para quedar **sin signo** —todos los k-quants entran
+  en `0..=129`— con el corrimiento descontado en el término del
+  desplazamiento; Q8_0, que puede ir de -127 a 127, sigue con signo.
+  Cuantizar la entrada y transponer la salida van **en paralelo**: medido
+  por etapas, en un hilo eran entre el 24% y el 64% de cada multiplicación,
+  y eran el freno de verdad. `matmul_auto` lo usa desde 24 filas
+  (`BLOQUES_DESDE`). Medido sobre todas las matrices de dos capas del 3B
+  Q3_K_M (`examples/measure_blocked_matmul`):
+
+  | Filas | Antes | Por bloques | |
+  |---:|---:|---:|---:|
+  | 8 | 19,1 ms | 24,2 ms | 0,79x |
+  | 16 | 32,5 ms | 30,2 ms | 1,07x |
+  | 24 | 47,6 ms | 35,4 ms | 1,34x |
+  | 32 | 61,4 ms | 41,6 ms | 1,48x |
+  | 128 | 249 ms | 127 ms | 1,95x |
+  | 333 | 643 ms | 323 ms | 1,99x |
+
+  La diferencia con el camino de antes es el redondeo de sumar en otro
+  orden, y en los logits del modelo entero la pérdida es la misma (KL
+  0,00109 contra 0,00102). 2 tests, y el del despacho prueba ahora los dos
+  lados del umbral.
+- **`examples/measure_precision`**: cuánto se aparta un camino de la matmul
+  de la referencia que no cuantiza la entrada, en la distribución entera del
+  próximo token (divergencia KL) sobre diez prompts de 32 a 320 tokens. Una
+  batería de 15 preguntas no alcanza para decidir entre caminos que difieren
+  en el redondeo: un acierto de más o de menos puede ser una pregunta en el
+  límite.
+- **Kernel fusionado de Q6_K** (`kernels::dot_q6k_i8`, en AVX2 y con su
+  referencia escalar). En el Q3_K_M del bot la matriz de salida —255 MB— va
+  en Q6_K, y sin kernel propio pasaba por el camino con buffer. Medida dentro
+  del forward, la proyección de salida baja de 11,3 a 9,7 ms por token (26
+  GB/s, casi lo que da la RAM). Solo con AVX2: en otras arquitecturas sigue
+  el camino con buffer. `COSXAMIX_SIN_Q6K_FUSIONADO` lo apaga. 1 test.
+- **`ops::matmul_varias_una_fila`: q, k y v —y gate y up— en una sola
+  pasada paralela** en el decode. Medido dentro del forward, q, k y v iban a
+  12 GB/s contra 21 de las ffn: `attn_k` y `attn_v` son tan chicas (0,2 MB)
+  que los ~10 µs fijos de repartir y juntar los hilos en cada llamada eran
+  casi todo su costo, y había 252 llamadas por token. Ahora son 144. Mismos
+  kernels y misma entrada, así que el resultado es **idéntico bit a bit**
+  (lo comprueba un test, mezclando formatos). `COSXAMIX_SIN_VARIAS` lo apaga.
+  Con las dos cosas, en 8 corridas alternadas el token baja de 124,3 a 120,3
+  ms de mediana (3 a 5%, con la máquina cargada por otros programas).
+- **`examples/measure_decode`**: el decode por formato y forma de matriz,
+  en GB/s contra lo que da la RAM. Ojo con una trampa que encontró: aislada,
+  la matriz de salida por el camino con buffer parecía costar 19,7 ms, y
+  dentro del forward cuesta 11,3. **Las mejoras del decode se confirman
+  midiendo el forward**, no la matmul suelta.
+- **El prefijo común entre conversaciones distintas.** Hasta acá el caché
+  de atención se reaprovechaba solo dentro de una misma sesión, así que un
+  chat nuevo —o un grupo cuyo *system* cambió— leía todo desde cero aunque
+  empezara igual que otro. Ahora, si otra sesión comparte un prefijo más
+  largo, se copia ese tramo (`Cache::prefijo`): el caché de un token depende
+  solo de los anteriores, así que es el mismo. Copiar 130 tokens del 3B son
+  ~10 MB y unos milisegundos. Medido con `examples/measure_shared_prefix`,
+  el primer mensaje del grupo B después del A:
+
+  | | Tokens copiados | Primer mensaje |
+  |---|---:|---:|
+  | Antes | 0 | 6,0 s |
+  | Con el préstamo | 68 | 4,9 s |
+  | Con el préstamo y el *system* de WinsiBot 9.1.0 | 130 | **3,5 s** |
+
+  La respuesta sale igual en los tres. WinsiBot 9.1.0 pasó sus instrucciones
+  fijas antes del perfil del grupo, que es lo que alarga el tramo común.
+  `COSXAMIX_SIN_PRESTAMO` lo apaga. 1 test.
+- **`examples/check_sessions` prueba los dos motores**: que intercalar dos
+  conversaciones no cambie ni una respuesta, ahora también en el propio y con
+  el préstamo de prefijo.
+- **`COSXAMIX_SIN_BLOQUES`** apaga la matmul por bloques, para comparar.
+  Con y sin ella, `examples/generate` da el mismo texto.
+
+- **`examples/measure_response`**: dónde se va el tiempo de una respuesta,
+  usada como la usa WinsiBot (un *system* largo, el primer mensaje, la
+  respuesta y un segundo mensaje), y qué tan lejos está del límite de la
+  máquina. Separa leer el prompt (GFLOP/s) de generar (GB/s), y compara el
+  decode con lo que da la RAM recorriendo los mismos bytes con todos los
+  núcleos. Con el 3B Q3_K_M en la PC de desarrollo (12 hilos):
+
+  | Parte | Tokens | Tiempo | Ritmo |
+  |---|---|---|---|
+  | Leer el prompt, sin caché | 333 | 11,2 s | 29,7 tok/s, 183 GFLOP/s |
+  | … con la matmul por bloques | 333 | 6,6 s | 50,5 tok/s, 312 GFLOP/s |
+  | Generar | 48 | 4,4 s | 10,8 tok/s, 18,6 GB/s |
+  | Segundo mensaje, *system* en caché | 18 | 0,6 s | |
+  | Segundo mensaje, *system* cambiado al principio | 286 | 10,2 s | |
+
+  La RAM da 27,7 GB/s: el decode usa el **67%**, y su techo es ~16 tok/s.
+  En el primer mensaje, **72% del tiempo es leer el prompt**. La última fila
+  era el caso normal de WinsiBot hasta su 9.1.0 —su *system* cambiaba con
+  cada mensaje del grupo—, y se arregló allá, sin tocar el motor.
+
+### Probado y descartado
+
+- **Escalas enteras en los k-quants**, como llama.cpp: la entrada con una
+  escala cada 256 valores (el Q8_K de candle) y el producto de un bloque
+  entero acumulado en enteros, con la escala del sub-bloque dentro del
+  `vpmaddwd`. Son 3 instrucciones por trozo en vez de 5, pero el freno no
+  eran las cuentas. Medido, con escala cada 256 / 128 / 64 / 32 valores:
+  2,04x / 1,82x / 1,76x / 1,62x contra el camino de antes, y KL 0,0071 /
+  0,0034 / 0,0027 / 0,0015 contra 0,0011 del camino que quedó. Ganaba un 15%
+  y perdía de 3 a 7 veces más información; en la batería, 10 de 15 contra
+  11. Se sacó.
+- **Tajadas a lo largo de `k`** para que la franja y el tramo de columnas
+  entraran juntos en los 256 KB de L2: con 512, 1024 y 2048 valores, 1,67x,
+  1,93x y 2,11x contra 2,05x sin partir. Se sacó.
+
+---
+
 ## [0.6.0] - 2026-10-27
 
 El motor propio llega al servidor, y es el de por defecto. El forward de la
@@ -1372,6 +1510,7 @@ agrega una sección a uno y se olvida del otro, CI falla.
 - Verificado en esta versión: **22 tests**, 0 avisos, clippy limpio en las tres
   combinaciones (por defecto, `candle`, `zig,candle`).
 
+[0.7.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.7.0
 [0.6.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.6.0
 [0.5.1]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.5.0

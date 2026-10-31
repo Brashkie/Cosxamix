@@ -153,6 +153,7 @@ Environment variables:
 | `COSXAMIX_RAM_MB` | `4096` | Memory budget for loaded models |
 | `RAYON_NUM_THREADS` | physical cores | Threads for the matrix math |
 | `COSXAMIX_MOTOR` | `propio` | The in-house engine and its kernels: 1.6-1.9x faster than candle per message as WinsiBot uses it, and 11/15 vs 10/15 on the battery ([DECISIONES §23](DECISIONES.md)). `candle` goes back to the old one |
+| `COSXAMIX_SIN_BLOQUES`, `COSXAMIX_SIN_Q6K_FUSIONADO`, `COSXAMIX_SIN_VARIAS`, `COSXAMIX_SIN_PRESTAMO` | unset | Each one turns off a 0.7.0 optimization —the blocked prefill matmul, the Q6_K kernel, q-k-v in one pass, the prefix shared across conversations— to measure with and without it ([DECISIONES §24-26](DECISIONES.md)) |
 
 **Every `.gguf` in the directory is registered**, not only the one in
 `COSXAMIX_GGUF`: that variable says which one is pre-warmed, not which one
@@ -230,8 +231,13 @@ binary of the latter downloads fine and fails to run.
 It's in **[ROADMAP.md](ROADMAP.md)**, with the measured state up top and the
 order set by how much it moves latency, not by how interesting it is to write.
 
-In short: the engine is at **51% of this machine's memory-bandwidth ceiling**,
-meaning there's less than 2x left to win here. Why 6 cores yield 2.6x instead
+In short: **reading the prompt** is now 1.7x faster than in 0.6.0, and the
+start of the *system* prompt is read once for every chat (0.7.0).
+**Generation** runs at ~66% of what RAM delivers streaming the same bytes, and
+what's left there is as much compute as memory ([DECISIONES
+§25](DECISIONES.md)). In the reference measurement the engine was at **51% of
+this machine's memory-bandwidth ceiling**, meaning there's less than 2x left
+to win here. Why 6 cores yield 2.6x instead
 of 6x **is now explained**: the matrices that don't fit in the 12 MB of L3
 don't scale, and they are 89% of the weights. It's the memory wall, and more
 threads won't fix it — which is exactly what killed speculative decoding.

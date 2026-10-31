@@ -438,6 +438,33 @@ pub fn dot_q3k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
     scalar::dot_q3k_i8(bloques, xq, xe, xs)
 }
 
+/// Producto de una fila Q6_K contra la entrada cuantizada en sub-bloques de
+/// 16, fundido con el desempaquetado. Ver [`x86::dot_q6k_i8_avx2`].
+///
+/// Solo hay versión vectorizada en x86-64 con AVX2; en lo demás va la
+/// escalar, y por eso `ops::matmul_auto` lo elige solo con AVX2.
+pub fn dot_q6k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
+    assert!(
+        xq.len().is_multiple_of(256),
+        "dot_q6k_i8: la fila tiene que ser multiplo de 256"
+    );
+    assert_eq!(xe.len(), xq.len() / 16, "dot_q6k_i8: faltan escalas");
+    assert_eq!(xs.len(), xe.len(), "dot_q6k_i8: faltan sumas");
+    assert!(
+        bloques.len() >= xq.len() / 256 * 210,
+        "dot_q6k_i8: faltan bytes de pesos"
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if usar_avx2() {
+            return unsafe { x86::dot_q6k_i8_avx2(bloques, xq, xe, xs) };
+        }
+    }
+
+    scalar::dot_q6k_i8(bloques, xq, xe, xs)
+}
+
 pub fn silu(salida: &mut [f32], entrada: &[f32]) {
     assert_eq!(
         salida.len(),

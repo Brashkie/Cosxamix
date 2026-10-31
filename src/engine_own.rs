@@ -211,12 +211,38 @@ impl Motor for MotorPropio {
         // El prefijo común más largo, dejando al menos un token por procesar:
         // sin uno no hay logits. Es lo que reaprovecha el *system* de WinsiBot
         // —cientos de tokens— entre un mensaje y el siguiente.
-        let comun = cacheados
-            .iter()
-            .zip(&entrada)
-            .take_while(|(a, b)| a == b)
-            .count()
-            .min(entrada.len() - 1);
+        let prefijo_comun = |tokens: &[u32]| {
+            tokens
+                .iter()
+                .zip(&entrada)
+                .take_while(|(a, b)| a == b)
+                .count()
+                .min(entrada.len() - 1)
+        };
+        let mut comun = prefijo_comun(&cacheados);
+
+        // Si otra conversación comparte un prefijo más largo, se copia el
+        // suyo. Es el caso de un chat nuevo —o de un grupo cuyo *system*
+        // cambió—: los *system* de WinsiBot empiezan igual en todos los
+        // grupos, y sin esto cada chat nuevo los leía desde cero. Copiar 60
+        // tokens del 3B son ~4 MB, contra ~1 s de leerlos.
+        // `COSXAMIX_SIN_PRESTAMO` lo apaga, para comparar.
+        static PRESTAMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let prestamo =
+            *PRESTAMO.get_or_init(|| std::env::var_os("COSXAMIX_SIN_PRESTAMO").is_none());
+        if prestamo {
+            let mejor = c
+                .sesiones
+                .values()
+                .map(|s| (s, prefijo_comun(&s.tokens)))
+                .max_by_key(|(_, n)| *n);
+            if let Some((otra, n)) = mejor {
+                if n > comun {
+                    cache = otra.cache.prefijo(n);
+                    comun = n;
+                }
+            }
+        }
         cache.truncar(comun);
         if comun == 0 {
             cache.limpiar();

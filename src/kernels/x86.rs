@@ -662,3 +662,212 @@ pub unsafe fn dot_q3k_i8_avx2(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32])
 
     reducir_f32(_mm256_add_ps(acc0, acc1)) - 4.0 * reducir_f32(correccion)
 }
+
+/// Producto de una fila Q6_K contra la entrada cuantizada, fundido con el
+/// desempaquetado: el kernel del decode para la matriz de salida.
+///
+/// En el Q3_K_M del bot la matriz de salida —151.936 × 2048, 255 MB— va en
+/// Q6_K, y sin kernel fusionado pasaba por el camino con buffer: desempaquetar
+/// la fila entera a `i8` y después multiplicar. Medido con
+/// `examples/measure_decode`, iba a 12,9 GB/s contra 18,6 del Q3_K y era el
+/// 25% de cada token.
+///
+/// Misma forma que [`dot_q3k_i8_avx2`]: ocho grupos de 32 valores por bloque,
+/// cada uno con dos escalas, que se reparten en las dos mitades de los
+/// carriles con un `permutevar`. Los valores se arman sin signo (0 a 63) y el
+/// 32 que hay que restarles se descuenta con la suma de la entrada. El layout
+/// está en [`super::scalar::dot_q6k_i8`].
+///
+/// # Safety
+///
+/// AVX2, FMA y F16C, y `bloques` con `xq.len() / 256 · 210` bytes.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+pub unsafe fn dot_q6k_i8_avx2(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
+    debug_assert!(xq.len().is_multiple_of(256));
+
+    let unos = _mm256_set1_epi16(1);
+    let nibble = _mm256_set1_epi8(0x0F);
+    let altos = _mm256_set1_epi8(0x30);
+    let r0 = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
+    let r1 = _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3);
+    let r2 = _mm256_setr_epi32(4, 4, 4, 4, 5, 5, 5, 5);
+    let r3 = _mm256_setr_epi32(6, 6, 6, 6, 7, 7, 7, 7);
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut correccion = _mm256_setzero_ps();
+
+    for bl in 0..xq.len() / 256 {
+        let b = bloques.as_ptr().add(bl * 210);
+        let base = bl * 256;
+
+        // Las dieciséis escalas son `i8` seguidos: sin el armado de bits de
+        // Q3_K.
+        let esc8 = _mm_loadu_si128(b.add(192) as *const __m128i);
+        let h = (b.add(208) as *const u16).read_unaligned();
+        let d = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128(h as i32)));
+
+        let xe_p = xe.as_ptr().add(bl * 16);
+        let xs_p = xs.as_ptr().add(bl * 16);
+        let e0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(esc8));
+        let e1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(esc8, 8)));
+        let v0 = _mm256_mul_ps(_mm256_mul_ps(d, e0), _mm256_loadu_ps(xe_p));
+        let v1 = _mm256_mul_ps(_mm256_mul_ps(d, e1), _mm256_loadu_ps(xe_p.add(8)));
+        correccion = _mm256_fmadd_ps(v0, _mm256_loadu_ps(xs_p), correccion);
+        correccion = _mm256_fmadd_ps(v1, _mm256_loadu_ps(xs_p.add(8)), correccion);
+
+        // Un grupo de 32: 4 bits de `ql` y 2 de `qh` llevados a los bits 4-5.
+        // Los corrimientos de 16 bits arrastran bits del byte vecino, pero
+        // caen fuera de la máscara.
+        macro_rules! grupo {
+            ($acc:ident, $g:literal, $bajos:expr, $alto:expr, $v:ident, $r:ident) => {{
+                let q = _mm256_or_si256(
+                    _mm256_and_si256($bajos, nibble),
+                    _mm256_and_si256($alto, altos),
+                );
+                let x = _mm256_loadu_si256(xq.as_ptr().add(base + $g * 32) as *const __m256i);
+                let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(q, x), unos);
+                let escala = _mm256_permutevar8x32_ps($v, $r);
+                $acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), escala, $acc);
+            }};
+        }
+        let ql0 = _mm256_loadu_si256(b as *const __m256i);
+        let ql1 = _mm256_loadu_si256(b.add(32) as *const __m256i);
+        let qh = _mm256_loadu_si256(b.add(128) as *const __m256i);
+        grupo!(acc0, 0, ql0, _mm256_slli_epi16(qh, 4), v0, r0);
+        grupo!(acc1, 1, ql1, _mm256_slli_epi16(qh, 2), v0, r1);
+        grupo!(acc0, 2, _mm256_srli_epi16(ql0, 4), qh, v0, r2);
+        grupo!(
+            acc1,
+            3,
+            _mm256_srli_epi16(ql1, 4),
+            _mm256_srli_epi16(qh, 2),
+            v0,
+            r3
+        );
+
+        let ql0 = _mm256_loadu_si256(b.add(64) as *const __m256i);
+        let ql1 = _mm256_loadu_si256(b.add(96) as *const __m256i);
+        let qh = _mm256_loadu_si256(b.add(160) as *const __m256i);
+        grupo!(acc0, 4, ql0, _mm256_slli_epi16(qh, 4), v1, r0);
+        grupo!(acc1, 5, ql1, _mm256_slli_epi16(qh, 2), v1, r1);
+        grupo!(acc0, 6, _mm256_srli_epi16(ql0, 4), qh, v1, r2);
+        grupo!(
+            acc1,
+            7,
+            _mm256_srli_epi16(ql1, 4),
+            _mm256_srli_epi16(qh, 2),
+            v1,
+            r3
+        );
+    }
+
+    reducir_f32(_mm256_add_ps(acc0, acc1)) - 32.0 * reducir_f32(correccion)
+}
+
+/// Una **tesela** de la matmul por bloques: `R` filas de la entrada contra
+/// `C` columnas de pesos, todas a la vez, con los `R·C` acumuladores en
+/// registros.
+///
+/// Es lo que cambia frente a [`dot_i8_escalado_avx2`], que hace un producto
+/// por llamada: ahí cada trozo de 32 bytes que se trae se usa **una** vez. Acá
+/// la columna cargada sirve para las `R` filas y la fila para las `C`
+/// columnas, así que por cada byte traído de la caché se hacen `R` o `C`
+/// veces más cuentas. Y la escala deja de armarse con `setr` en cada trozo
+/// —que costaba más que el producto—: las dos vienen ya expandidas, un `f32`
+/// por carril (ver `ops::expandir_escalas`).
+///
+/// `filas[r]` y `cols[c]` apuntan a `32·trozos` valores `i8`; `esc_filas[r]` y
+/// `esc_cols[c]` a `8·trozos` escalas expandidas.
+///
+/// # Safety
+///
+/// La CPU tiene que tener AVX2 y FMA, y los punteros tienen que cubrir lo que
+/// dice arriba. Los valores de `filas` tienen que estar en `-127..=127`: es
+/// el rodeo de signo de `vpmaddubsw`, igual que en `dot_i8_escalado_avx2`.
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn tesela_i8_avx2<const R: usize, const C: usize>(
+    filas: &[*const i8; R],
+    esc_filas: &[*const f32; R],
+    cols: &[*const i8; C],
+    esc_cols: &[*const f32; C],
+    trozos: usize,
+) -> [[f32; C]; R] {
+    let unos = _mm256_set1_epi16(1);
+    let mut acc = [[_mm256_setzero_ps(); C]; R];
+    for t in 0..trozos {
+        let mut crudo = [_mm256_setzero_si256(); C];
+        let mut abs = [_mm256_setzero_si256(); C];
+        let mut ec = [_mm256_setzero_ps(); C];
+        for c in 0..C {
+            crudo[c] = _mm256_loadu_si256(cols[c].add(32 * t) as *const __m256i);
+            abs[c] = _mm256_sign_epi8(crudo[c], crudo[c]);
+            ec[c] = _mm256_loadu_ps(esc_cols[c].add(8 * t));
+        }
+        for r in 0..R {
+            let x = _mm256_loadu_si256(filas[r].add(32 * t) as *const __m256i);
+            let ef = _mm256_loadu_ps(esc_filas[r].add(8 * t));
+            for c in 0..C {
+                let p16 = _mm256_maddubs_epi16(abs[c], _mm256_sign_epi8(x, crudo[c]));
+                let p32 = _mm256_madd_epi16(p16, unos);
+                let v = _mm256_mul_ps(_mm256_cvtepi32_ps(p32), ec[c]);
+                acc[r][c] = _mm256_fmadd_ps(v, ef, acc[r][c]);
+            }
+        }
+    }
+    let mut salida = [[0f32; C]; R];
+    for r in 0..R {
+        for c in 0..C {
+            salida[r][c] = reducir_f32(acc[r][c]);
+        }
+    }
+    salida
+}
+
+/// La misma tesela con los pesos **sin signo** (`0..=129`): ya no hace falta
+/// el rodeo del signo, y por cada producto se ahorran dos instrucciones —el
+/// valor absoluto de la columna y el signo pasado a la fila—.
+///
+/// Quien llama corre los pesos para que queden sin signo y descuenta el
+/// corrimiento aparte (ver `ops::matmul_i8_bloques`). El tope de 129 es el de
+/// `vpmaddubsw`, que suma dos productos en 16 bits con saturación:
+/// `2 · 129 · 127 = 32766` todavía entra.
+///
+/// # Safety
+///
+/// Lo mismo que [`tesela_i8_avx2`], con `cols` en `0..=129`.
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn tesela_u8_avx2<const R: usize, const C: usize>(
+    filas: &[*const i8; R],
+    esc_filas: &[*const f32; R],
+    cols: &[*const i8; C],
+    esc_cols: &[*const f32; C],
+    trozos: usize,
+) -> [[f32; C]; R] {
+    let unos = _mm256_set1_epi16(1);
+    let mut acc = [[_mm256_setzero_ps(); C]; R];
+    for t in 0..trozos {
+        let mut col = [_mm256_setzero_si256(); C];
+        let mut ec = [_mm256_setzero_ps(); C];
+        for c in 0..C {
+            col[c] = _mm256_loadu_si256(cols[c].add(32 * t) as *const __m256i);
+            ec[c] = _mm256_loadu_ps(esc_cols[c].add(8 * t));
+        }
+        for r in 0..R {
+            let x = _mm256_loadu_si256(filas[r].add(32 * t) as *const __m256i);
+            let ef = _mm256_loadu_ps(esc_filas[r].add(8 * t));
+            for c in 0..C {
+                let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(col[c], x), unos);
+                let v = _mm256_mul_ps(_mm256_cvtepi32_ps(p32), ec[c]);
+                acc[r][c] = _mm256_fmadd_ps(v, ef, acc[r][c]);
+            }
+        }
+    }
+    let mut salida = [[0f32; C]; R];
+    for r in 0..R {
+        for c in 0..C {
+            salida[r][c] = reducir_f32(acc[r][c]);
+        }
+    }
+    salida
+}

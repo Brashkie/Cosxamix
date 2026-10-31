@@ -13,23 +13,33 @@
 //! Esto SÍ admite comparación exacta de texto, a diferencia de `check_cache`:
 //! allá se comparaban dos caminos de cálculo distintos (en bloque contra de a
 //! un token) y la diferencia numérica era esperable. Acá el camino es el mismo.
+//!
+//! Se prueban **los dos motores**. El propio, además, copia de otra sesión el
+//! prefijo que comparten (desde la 0.7.0): B arranca con el *system* que leyó
+//! A. Eso no puede cambiar a A, que es lo que se comprueba.
 
 use std::path::Path;
 
 use cosxamix::engine::{Mensaje, Motor, Peticion};
 use cosxamix::engine_candle::MotorCandle;
+use cosxamix::engine_own::MotorPropio;
 
 const SIS: &str = "Eres WinsiBot, un bot de WhatsApp. Responde corto, en espanol.";
 
-fn motor() -> MotorCandle {
-    let m = MotorCandle::nuevo(
-        "qwen2.5-0.5b",
+fn motor(propio: bool) -> Box<dyn Motor> {
+    let (gguf, tok) = (
         Path::new("modelos/qwen2.5-0.5b-instruct-q4_k_m.gguf"),
         Path::new("modelos/tokenizer.json"),
-    )
-    .expect("construir");
-    m.precalentar().expect("precalentar");
-    m
+    );
+    if propio {
+        let m = MotorPropio::nuevo("qwen2.5-0.5b", gguf, tok).expect("construir");
+        m.precalentar().expect("precalentar");
+        Box::new(m)
+    } else {
+        let m = MotorCandle::nuevo("qwen2.5-0.5b", gguf, tok).expect("construir");
+        m.precalentar().expect("precalentar");
+        Box::new(m)
+    }
 }
 
 fn turno(sesion: &str, hist: &[(String, String)], usuario: &str) -> Peticion {
@@ -59,7 +69,7 @@ fn turno(sesion: &str, hist: &[(String, String)], usuario: &str) -> Peticion {
 
 /// Avanza una conversación un turno y guarda la respuesta en su historial.
 fn avanzar(
-    m: &MotorCandle,
+    m: &dyn Motor,
     sesion: &str,
     hist: &mut Vec<(String, String)>,
     pregunta: &str,
@@ -72,6 +82,19 @@ fn avanzar(
 }
 
 fn main() {
+    let mal: usize = [("candle", false), ("propio", true)]
+        .into_iter()
+        .map(|(nombre, propio)| probar(nombre, propio))
+        .sum();
+    if mal > 0 {
+        eprintln!("\n  {mal} turnos cambian al intercalar: las sesiones se contaminan.");
+        std::process::exit(1);
+    }
+    println!("\n  Las sesiones estan aisladas en los dos motores: intercalar no cambia ni una respuesta.");
+}
+
+/// Corre la prueba con un motor y devuelve cuántos turnos de A cambiaron.
+fn probar(nombre: &str, propio: bool) -> usize {
     const A: [&str; 3] = ["como te llamas?", "y que sabes hacer?", "dame un ejemplo"];
     const B: [&str; 3] = [
         "cuanto es dos mas dos?",
@@ -80,30 +103,30 @@ fn main() {
     ];
 
     // ── A sola ──────────────────────────────────────────────────────────────
-    println!("\n  === A sola ===");
-    let m = motor();
+    println!("\n  === {nombre}: A sola ===");
+    let m = motor(propio);
     let mut ha = Vec::new();
     let solas: Vec<String> = A
         .iter()
         .map(|q| {
-            let r = avanzar(&m, "A", &mut ha, q);
+            let r = avanzar(m.as_ref(), "A", &mut ha, q);
             println!("    {}", r.replace('\n', " "));
             r
         })
         .collect();
 
     // ── A intercalada con B ─────────────────────────────────────────────────
-    println!("\n  === A intercalada con B ===");
-    let m2 = motor();
+    println!("\n  === {nombre}: A intercalada con B ===");
+    let m2 = motor(propio);
     let (mut ha2, mut hb2) = (Vec::new(), Vec::new());
     let mut intercaladas = Vec::new();
 
     for i in 0..3 {
-        let ra = avanzar(&m2, "A", &mut ha2, A[i]);
+        let ra = avanzar(m2.as_ref(), "A", &mut ha2, A[i]);
         println!("    A: {}", ra.replace('\n', " "));
         intercaladas.push(ra);
 
-        let rb = avanzar(&m2, "B", &mut hb2, B[i]);
+        let rb = avanzar(m2.as_ref(), "B", &mut hb2, B[i]);
         println!("    B: {}", rb.replace('\n', " "));
     }
 
@@ -123,11 +146,5 @@ fn main() {
             mal += 1;
         }
     }
-
-    if mal > 0 {
-        eprintln!("\n  {mal} de 3 turnos cambian al intercalar: las sesiones se contaminan.");
-        std::process::exit(1);
-    }
-
-    println!("\n  Las sesiones estan aisladas: intercalar no cambia ni una respuesta.");
+    mal
 }

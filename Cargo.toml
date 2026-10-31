@@ -1,6 +1,6 @@
 [package]
 name = "cosxamix"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Runtime de IA que sirve modelos de lenguaje por HTTP, compatible con el dialecto de Ollama"
 license     = "MIT"
@@ -196,3 +196,19 @@ required-features = ["training"]
 name = "train_lora"
 required-features = ["training"]
 
+
+[[example]]
+name = "measure_response"
+required-features = ["candle"]
+
+[[example]]
+name = "measure_precision"
+required-features = ["candle"]
+
+[[example]]
+name = "measure_decode"
+required-features = ["candle"]
+
+[[example]]
+name = "measure_shared_prefix"
+required-features = ["candle"]

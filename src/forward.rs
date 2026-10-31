@@ -27,6 +27,10 @@ use crate::ops;
 
 type Resultado<T> = Result<T, String>;
 
+/// Una proyección para [`Modelo::proyectar_varias`]: los pesos, el sesgo si
+/// lo hay, y dónde va el resultado.
+type Proyeccion<'a> = (&'a Peso, Option<&'a Vec<f32>>, &'a mut Vec<f32>);
+
 /// La configuración, leída del archivo.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -101,6 +105,25 @@ impl Cache {
             v.truncate(n * ancho);
         }
         self.largo = n;
+    }
+
+    /// Una copia de los primeros `n` tokens.
+    ///
+    /// Es lo que deja que una conversación nueva arranque con el prefijo de
+    /// otra: el caché de un token depende solo de los tokens anteriores, así
+    /// que si dos prompts empiezan igual, ese tramo es el mismo en las dos.
+    pub fn prefijo(&self, n: usize) -> Cache {
+        let n = n.min(self.largo);
+        let ancho = if self.largo == 0 {
+            0
+        } else {
+            self.k.first().map_or(0, |k| k.len() / self.largo)
+        };
+        Cache {
+            k: self.k.iter().map(|k| k[..n * ancho].to_vec()).collect(),
+            v: self.v.iter().map(|v| v[..n * ancho].to_vec()).collect(),
+            largo: n,
+        }
     }
 
     /// Lo que ocupa, en bytes.
@@ -300,6 +323,50 @@ impl Modelo {
         Ok(())
     }
 
+    /// Varias proyecciones del mismo `x` —q, k y v, o gate y up—.
+    ///
+    /// Con un solo token van en **una** pasada paralela
+    /// ([`ops::matmul_varias_una_fila`]): medido dentro del forward, q, k y v
+    /// por separado iban a 12 GB/s, porque `attn_k` y `attn_v` son tan chicas
+    /// que el costo fijo de cada llamada paralela era casi todo. Con más
+    /// tokens, o con `COSXAMIX_MATMUL=f32`, una por una.
+    fn proyectar_varias(
+        &self,
+        x: &[f32],
+        tokens: usize,
+        trabajos: &mut [Proyeccion<'_>],
+    ) -> Resultado<()> {
+        // `COSXAMIX_SIN_VARIAS` vuelve a una llamada por matriz, para comparar.
+        static VARIAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let varias = *VARIAS.get_or_init(|| std::env::var_os("COSXAMIX_SIN_VARIAS").is_none());
+        if tokens != 1 || self.forzar_f32 || !varias {
+            for (w, sesgo, destino) in trabajos.iter_mut() {
+                self.proyectar(x, tokens, w, sesgo.map(|v| v.as_slice()), destino)?;
+            }
+            return Ok(());
+        }
+        let mut pesos = Vec::with_capacity(trabajos.len());
+        for (w, _, destino) in trabajos.iter_mut() {
+            let (_, n) = w.forma();
+            destino.clear();
+            destino.resize(n, 0.0);
+            pesos.push((self.bytes_de(w)?, w.info.tipo));
+        }
+        let mut destinos: Vec<&mut [f32]> = trabajos
+            .iter_mut()
+            .map(|(_, _, d)| d.as_mut_slice())
+            .collect();
+        ops::matmul_varias_una_fila(x, &pesos, &mut destinos)?;
+        for (_, sesgo, destino) in trabajos.iter_mut() {
+            if let Some(b) = sesgo {
+                for (d, s) in destino.iter_mut().zip(b.iter()) {
+                    *d += s;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Los logits del **último** token de `tokens`.
     ///
     /// `cache` se extiende con los tokens nuevos, así que llamar dos veces
@@ -343,7 +410,7 @@ impl Modelo {
         // son 36 capas y no una llamada suelta.
         let mut xn = vec![0f32; t * cfg.dim];
         let mut peso = Vec::new();
-        let mut sesgo = Vec::new();
+        let (mut sesgo_q, mut sesgo_k, mut sesgo_v) = (Vec::new(), Vec::new(), Vec::new());
         let (mut q, mut kk, mut vv) = (Vec::new(), Vec::new(), Vec::new());
         let mut att = vec![0f32; t * cfg.dim];
         let mut proy = Vec::new();
@@ -357,12 +424,18 @@ impl Modelo {
                 crate::kernels::rmsnorm(dst, src, &peso, cfg.eps);
             }
 
-            self.vector(&capa.q_bias, &mut sesgo)?;
-            self.proyectar(&xn, t, &capa.q, Some(&sesgo), &mut q)?;
-            self.vector(&capa.k_bias, &mut sesgo)?;
-            self.proyectar(&xn, t, &capa.k, Some(&sesgo), &mut kk)?;
-            self.vector(&capa.v_bias, &mut sesgo)?;
-            self.proyectar(&xn, t, &capa.v, Some(&sesgo), &mut vv)?;
+            self.vector(&capa.q_bias, &mut sesgo_q)?;
+            self.vector(&capa.k_bias, &mut sesgo_k)?;
+            self.vector(&capa.v_bias, &mut sesgo_v)?;
+            self.proyectar_varias(
+                &xn,
+                t,
+                &mut [
+                    (&capa.q, Some(&sesgo_q), &mut q),
+                    (&capa.k, Some(&sesgo_k), &mut kk),
+                    (&capa.v, Some(&sesgo_v), &mut vv),
+                ],
+            )?;
 
             ops::rope(
                 &mut q,
@@ -401,8 +474,11 @@ impl Modelo {
                 crate::kernels::rmsnorm(dst, src, &peso, cfg.eps);
             }
 
-            self.proyectar(&xn, t, &capa.gate, None, &mut gate)?;
-            self.proyectar(&xn, t, &capa.up, None, &mut up)?;
+            self.proyectar_varias(
+                &xn,
+                t,
+                &mut [(&capa.gate, None, &mut gate), (&capa.up, None, &mut up)],
+            )?;
             // SwiGLU: silu(gate) * up, en su sitio sobre `gate`.
             let mut activado = vec![0f32; gate.len()];
             crate::kernels::silu(&mut activado, &gate);
@@ -500,4 +576,29 @@ pub fn tipo_dominante(g: &Gguf) -> TipoGgml {
         .max_by_key(|(_, b)| *b)
         .map(|(t, _)| t)
         .unwrap_or(TipoGgml::F32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// El prefijo es una copia: los primeros `n` tokens de cada capa, sin
+    /// tocar el original, y lo mismo que truncar.
+    #[test]
+    fn el_prefijo_copia_los_primeros_tokens_de_cada_capa() {
+        // Dos capas, 4 tokens de 3 valores cada uno.
+        let mut c = Cache {
+            k: vec![(0..12).map(|v| v as f32).collect(); 2],
+            v: vec![(100..112).map(|v| v as f32).collect(); 2],
+            largo: 4,
+        };
+        let p = c.prefijo(2);
+        assert_eq!(p.largo(), 2);
+        assert_eq!(p.k[1], [0., 1., 2., 3., 4., 5.]);
+        assert_eq!(p.v[0], [100., 101., 102., 103., 104., 105.]);
+        assert_eq!(c.largo(), 4, "el original no se toca");
+        assert_eq!(c.prefijo(10).largo(), 4, "pedir de más no rompe");
+        c.truncar(2);
+        assert_eq!((c.k, c.v), (p.k, p.v));
+    }
 }

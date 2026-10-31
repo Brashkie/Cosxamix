@@ -409,6 +409,7 @@ pub fn matmul_i8_fusionado(
     let (sub, bytes_bloque) = match tipo {
         TipoGgml::Q4K => (32usize, 144usize),
         TipoGgml::Q3K => (16, 110),
+        TipoGgml::Q6K => (16, 210),
         _ => return matmul_i8_directo((m, k, n), lhs, pesos, tipo, dst),
     };
     if !k.is_multiple_of(256) {
@@ -457,10 +458,10 @@ pub fn matmul_i8_fusionado(
                     let xq = &lhs_q[f * k..(f + 1) * k];
                     let xe = &lhs_esc[f * n_bloques..(f + 1) * n_bloques];
                     let xs = &lhs_suma[f * n_bloques..(f + 1) * n_bloques];
-                    *s = if tipo == TipoGgml::Q4K {
-                        crate::kernels::dot_q4k_i8(fila, xq, xe, xs)
-                    } else {
-                        crate::kernels::dot_q3k_i8(fila, xq, xe, xs)
+                    *s = match tipo {
+                        TipoGgml::Q4K => crate::kernels::dot_q4k_i8(fila, xq, xe, xs),
+                        TipoGgml::Q6K => crate::kernels::dot_q6k_i8(fila, xq, xe, xs),
+                        _ => crate::kernels::dot_q3k_i8(fila, xq, xe, xs),
                     };
                 }
             }
@@ -473,6 +474,471 @@ pub fn matmul_i8_fusionado(
     }
     Ok(())
 }
+
+/// `dst[f, col] = salida_t[col, f]`, en paralelo y de a 16 filas.
+///
+/// Las multiplicaciones por tramos de columnas dejan la salida transpuesta, y
+/// darla vuelta en un hilo costaba hasta 11 ms en `ffn_gate` con 333 filas —un
+/// 20% de la multiplicación— con los demás núcleos esperando. De a 16 filas,
+/// cada columna aporta una línea de caché entera (16 `f32` seguidos) en vez
+/// de un valor suelto.
+fn transponer_en_paralelo(salida_t: &[f32], m: usize, n: usize, dst: &mut [f32]) {
+    const FILAS: usize = 16;
+    dst.par_chunks_mut(FILAS * n)
+        .enumerate()
+        .for_each(|(g, bloque)| {
+            let f0 = g * FILAS;
+            let filas = bloque.len() / n;
+            for col in 0..n {
+                let origen = &salida_t[col * m + f0..col * m + f0 + filas];
+                for (r, v) in origen.iter().enumerate() {
+                    bloque[r * n + col] = *v;
+                }
+            }
+        });
+}
+
+/// Las escalas por sub-bloque, expandidas a una por carril de 32 bits.
+///
+/// Un trozo de 32 bytes de `i8` sale de `vpmaddubsw` + `vpmaddwd` como ocho
+/// `i32`, y el carril `l` suma los bytes `4l..4l+3`. Así que su escala es la
+/// del sub-bloque donde caen esos bytes: con sub-bloques de 16, los cuatro
+/// primeros carriles llevan una y los otros cuatro la siguiente; con 32, los
+/// ocho la misma. Dejarlas así una vez por fila y por columna es lo que le
+/// ahorra al kernel armar el vector de escalas en cada trozo.
+///
+/// Sin divisiones: la primera versión calculaba el sub-bloque de cada carril
+/// con una, y con 18 filas la expansión pesaba más que lo que ahorraba.
+fn expandir_escalas(esc: &[f32], sub: usize, destino: &mut [f32]) {
+    if sub == 16 {
+        for (t, d) in destino.chunks_exact_mut(8).enumerate() {
+            d[..4].fill(esc[2 * t]);
+            d[4..].fill(esc[2 * t + 1]);
+        }
+    } else {
+        let por_sub = sub / 32;
+        for (t, d) in destino.chunks_exact_mut(8).enumerate() {
+            d.fill(esc[t / por_sub]);
+        }
+    }
+}
+
+/// `dst[m, n] = lhs[m, k] · W[n, k]ᵀ` **por bloques**: el camino del prefill.
+///
+/// Hace las mismas cuentas que [`matmul_i8_directo`] —las mismas columnas
+/// desempaquetadas a `i8`, la misma entrada cuantizada, las mismas escalas
+/// por sub-bloque— en otro orden. Allá, cada producto punto era una llamada:
+/// por cada columna se recorría la entrada entera, fila por fila, y cada byte
+/// traído de la caché se usaba una sola vez. Con 333 filas de 2048 valores son
+/// 680 KB por columna, que no entran en L2: la multiplicación esperaba a la
+/// caché, no a las cuentas.
+///
+/// Acá:
+///
+/// - cada hilo desempaqueta su tramo de columnas una vez;
+/// - la entrada se recorre en franjas de filas que **sí** entran en L2 junto
+///   con el tramo, y la franja se reusa para todas las columnas del tramo;
+/// - adentro, una tesela de 4 filas × 2 columnas en registros
+///   ([`crate::kernels::x86::tesela_i8_avx2`]): cada trozo de columna cargado
+///   se usa 4 veces y cada trozo de fila 2;
+/// - cuantizar la entrada y transponer la salida van en paralelo. En un hilo
+///   eran entre el 24% y el 64% de cada multiplicación —medido por etapas—,
+///   y eran lo que de verdad la frenaba: con ellas en paralelo la mejora
+///   pasó de 1,65x a 2x.
+///
+/// Se probaron y se sacaron dos cosas más, con `examples/measure_precision`
+/// para el error: **escalas enteras** en los k-quants —la entrada con una
+/// escala cada 256 valores, como el Q8_K de candle, y el producto de un
+/// bloque en enteros— ganaba un 15% más pero con 3 a 7 veces más error en
+/// los logits (KL 0,0034 a 0,0071 contra 0,0011); y **tajadas a lo largo de
+/// `k`** para que todo entrara en L2, que no le ganó a no partir.
+///
+/// Solo con AVX2; sin él, o con `k` que no sea múltiplo de 32, cae a
+/// [`matmul_i8_directo`].
+pub fn matmul_i8_bloques(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    pesos: &[u8],
+    tipo: TipoGgml,
+    dst: &mut [f32],
+) -> Result<(), String> {
+    #[cfg(target_arch = "x86_64")]
+    if crate::kernels::usar_avx2() && k.is_multiple_of(32) {
+        return matmul_i8_bloques_avx2((m, k, n), lhs, pesos, tipo, dst);
+    }
+    matmul_i8_directo((m, k, n), lhs, pesos, tipo, dst)
+}
+
+/// Filas y columnas de la tesela. 4 × 2 son 8 acumuladores más 2 columnas
+/// con su valor absoluto y su escala: 14 de los 16 registros.
+#[cfg(target_arch = "x86_64")]
+const TESELA_FILAS: usize = 4;
+#[cfg(target_arch = "x86_64")]
+const TESELA_COLS: usize = 2;
+
+/// Bytes de `i8` de entrada por franja: lo que se deja en L2 mientras pasan
+/// las columnas del tramo.
+#[cfg(target_arch = "x86_64")]
+const FRANJA_BYTES: usize = 128 * 1024;
+
+#[cfg(target_arch = "x86_64")]
+fn matmul_i8_bloques_avx2(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    pesos: &[u8],
+    tipo: TipoGgml,
+    dst: &mut [f32],
+) -> Result<(), String> {
+    use crate::kernels::x86::{tesela_i8_avx2, tesela_u8_avx2};
+
+    if lhs.len() != m * k {
+        return Err(format!("lhs mide {} y deberia medir {m}*{k}", lhs.len()));
+    }
+    if dst.len() != m * n {
+        return Err(format!("dst mide {} y deberia medir {m}*{n}", dst.len()));
+    }
+    let por_bloque = tipo.valores_por_bloque();
+    let sub = crate::quant::sub_bloque(tipo)
+        .ok_or_else(|| format!("{tipo:?}: sin desempaquetado directo a i8"))?;
+    if !k.is_multiple_of(por_bloque) || !k.is_multiple_of(sub) {
+        return Err(format!("una fila de {k} no es multiplo de los bloques"));
+    }
+    let bytes_fila = k / por_bloque * tipo.bytes_por_bloque();
+    if pesos.len() < n * bytes_fila {
+        return Err("faltan bytes de pesos".into());
+    }
+
+    let n_bloques = k / sub;
+    let trozos = k / 32;
+    let ancho_esc = trozos * 8;
+
+    // La entrada, igual que en `matmul_i8_directo`, más sus escalas
+    // expandidas y, para el término del desplazamiento, escala por suma.
+    let mut lhs_q = vec![0i8; m * k];
+    let mut lhs_esc = vec![0f32; m * n_bloques];
+    let mut lhs_e8 = vec![0f32; m * ancho_esc];
+    let mut lhs_es = vec![0f32; m * n_bloques];
+    // En paralelo, fila por fila: en un hilo eran 3 a 14 ms por llamada,
+    // hasta el 20% de la multiplicación, con los demás núcleos esperando.
+    lhs_q
+        .par_chunks_mut(k)
+        .zip(lhs_esc.par_chunks_mut(n_bloques))
+        .zip(lhs_e8.par_chunks_mut(ancho_esc))
+        .zip(lhs_es.par_chunks_mut(n_bloques))
+        .zip(lhs.par_chunks(k))
+        .for_each(|((((q, e), e8), es), x)| {
+            cuantizar_i8_en(x, q, e, sub);
+            expandir_escalas(e, sub, e8);
+            for b in 0..n_bloques {
+                let r = b * sub;
+                let suma = q[r..r + sub].iter().map(|v| *v as i32).sum::<i32>() as f32;
+                es[b] = e[b] * suma;
+            }
+        });
+
+    let franja = (FRANJA_BYTES / k).max(TESELA_FILAS) / TESELA_FILAS * TESELA_FILAS;
+    let mut salida_t = vec![0f32; n * m];
+
+    salida_t
+        .par_chunks_mut(m * COLUMNAS_MINIMAS)
+        .enumerate()
+        .for_each(|(tramo, destino)| {
+            let primera = tramo * COLUMNAS_MINIMAS;
+            let ncols = destino.len() / m;
+
+            // El tramo entero desempaquetado, una vez.
+            let mut cols_q = vec![0i8; ncols * k];
+            let mut cols_e8 = vec![0f32; ncols * ancho_esc];
+            let mut cols_des = vec![0f32; ncols * n_bloques];
+            let mut esc = vec![0f32; n_bloques];
+            let mut hay_des = vec![false; ncols];
+            for j in 0..ncols {
+                let desde = (primera + j) * bytes_fila;
+                let des = &mut cols_des[j * n_bloques..(j + 1) * n_bloques];
+                if crate::quant::desempaquetar_i8(
+                    tipo,
+                    &pesos[desde..desde + bytes_fila],
+                    &mut cols_q[j * k..(j + 1) * k],
+                    &mut esc,
+                    des,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                expandir_escalas(&esc, sub, &mut cols_e8[j * ancho_esc..(j + 1) * ancho_esc]);
+            }
+
+            // Pesos sin signo, si el tramo lo permite: se corren todos por
+            // `-mínimo` y el kernel se ahorra el rodeo del signo. El
+            // corrimiento se descuenta en el término del desplazamiento:
+            // `s·Σ x·(u - c) = s·Σ x·u - c·s·Σ x`, y `Σ x` ya está por fila.
+            // Todos los k-quants entran —Q3_K va de -4 a 3, Q6_K de -32 a 31—;
+            // Q8_0 puede ir de -127 a 127 y sigue por el camino con signo.
+            let (min, max) = cols_q
+                .iter()
+                .fold((i8::MAX, i8::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+            let corrimiento = -(min as i32);
+            let sin_signo = (max as i32) + corrimiento <= 129;
+            if sin_signo && corrimiento != 0 {
+                for v in cols_q.iter_mut() {
+                    *v = ((*v as i32) + corrimiento) as u8 as i8;
+                }
+            }
+            for j in 0..ncols {
+                let des = &mut cols_des[j * n_bloques..(j + 1) * n_bloques];
+                if sin_signo && corrimiento != 0 {
+                    let e8 = &cols_e8[j * ancho_esc..(j + 1) * ancho_esc];
+                    for (b, d) in des.iter_mut().enumerate() {
+                        // La escala del sub-bloque `b`, leída de la expandida.
+                        *d -= corrimiento as f32 * e8[b * sub / 4];
+                    }
+                }
+                hay_des[j] = des.iter().any(|v| *v != 0.0);
+            }
+
+            let fila = |f: usize| (lhs_q[f * k..].as_ptr(), lhs_e8[f * ancho_esc..].as_ptr());
+            let col = |j: usize| (cols_q[j * k..].as_ptr(), cols_e8[j * ancho_esc..].as_ptr());
+
+            // Partir también a lo largo de `k`, en tajadas que entraran en L2
+            // con la franja, se probó con 512, 1024 y 2048 valores: ninguna le
+            // ganó a no partir (1,67x, 1,93x y 2,11x contra 2,05x), y se sacó.
+            let mut f0 = 0;
+            while f0 < m {
+                let f1 = (f0 + franja).min(m);
+                let mut j = 0;
+                while j < ncols {
+                    let nc = (ncols - j).min(TESELA_COLS);
+                    let mut f = f0;
+                    while f < f1 {
+                        let nf = (f1 - f).min(TESELA_FILAS);
+                        // La tesela entera o, en los bordes, de a un producto.
+                        if nf == TESELA_FILAS && nc == TESELA_COLS {
+                            let (x0, e0) = fila(f);
+                            let (x1, e1) = fila(f + 1);
+                            let (x2, e2) = fila(f + 2);
+                            let (x3, e3) = fila(f + 3);
+                            let (c0, d0) = col(j);
+                            let (c1, d1) = col(j + 1);
+                            let (xs, es, cs, ds) =
+                                ([x0, x1, x2, x3], [e0, e1, e2, e3], [c0, c1], [d0, d1]);
+                            // SAFETY: AVX2 comprobado en `matmul_i8_bloques`;
+                            // cada puntero cubre `k` valores y sus
+                            // escalas, la entrada está en -127..=127, y con
+                            // `sin_signo` los pesos en 0..=129.
+                            let r = unsafe {
+                                if sin_signo {
+                                    tesela_u8_avx2::<4, 2>(&xs, &es, &cs, &ds, trozos)
+                                } else {
+                                    tesela_i8_avx2::<4, 2>(&xs, &es, &cs, &ds, trozos)
+                                }
+                            };
+                            for (df, fila_r) in r.iter().enumerate() {
+                                for (dc, v) in fila_r.iter().enumerate() {
+                                    destino[(j + dc) * m + f + df] = *v;
+                                }
+                            }
+                        } else {
+                            for df in 0..nf {
+                                for dc in 0..nc {
+                                    let (x, e) = fila(f + df);
+                                    let (c, d) = col(j + dc);
+                                    // SAFETY: lo mismo que arriba.
+                                    let r = unsafe {
+                                        if sin_signo {
+                                            tesela_u8_avx2::<1, 1>(&[x], &[e], &[c], &[d], trozos)
+                                        } else {
+                                            tesela_i8_avx2::<1, 1>(&[x], &[e], &[c], &[d], trozos)
+                                        }
+                                    };
+                                    destino[(j + dc) * m + f + df] = r[0][0];
+                                }
+                            }
+                        }
+                        f += nf;
+                    }
+                    j += nc;
+                }
+                f0 = f1;
+            }
+
+            // El término del desplazamiento, en los formatos que lo tienen.
+            for j in 0..ncols {
+                if !hay_des[j] {
+                    continue;
+                }
+                let des = &cols_des[j * n_bloques..(j + 1) * n_bloques];
+                for f in 0..m {
+                    destino[j * m + f] +=
+                        crate::kernels::dot(des, &lhs_es[f * n_bloques..(f + 1) * n_bloques]);
+                }
+            }
+        });
+
+    transponer_en_paralelo(&salida_t, m, n, dst);
+    Ok(())
+}
+
+/// Si `tipo` tiene kernel fusionado —sin buffer— para filas de `k` valores.
+///
+/// Q6_K solo con AVX2: su kernel fusionado no tiene versión vectorizada en
+/// otras arquitecturas, y el escalar perdería contra el camino con buffer.
+/// `COSXAMIX_SIN_Q6K_FUSIONADO` lo devuelve al camino con buffer, para
+/// comparar.
+fn hay_fusionado(tipo: TipoGgml, k: usize) -> bool {
+    static Q6K_FUSIONADO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let q6k = *Q6K_FUSIONADO.get_or_init(|| {
+        crate::kernels::usar_avx2() && std::env::var_os("COSXAMIX_SIN_Q6K_FUSIONADO").is_none()
+    });
+    (matches!(tipo, TipoGgml::Q4K | TipoGgml::Q3K) || (tipo == TipoGgml::Q6K && q6k))
+        && k.is_multiple_of(256)
+}
+
+/// La entrada de una fila, cuantizada en sub-bloques de `sub`, con su escala
+/// y su suma por sub-bloque.
+struct EntradaI8 {
+    q: Vec<i8>,
+    escalas: Vec<f32>,
+    sumas: Vec<f32>,
+}
+
+impl EntradaI8 {
+    fn nueva(x: &[f32], sub: usize) -> Self {
+        let mut q = vec![0i8; x.len()];
+        let mut escalas = vec![0f32; x.len() / sub];
+        cuantizar_i8_en(x, &mut q, &mut escalas, sub);
+        let sumas = q
+            .chunks(sub)
+            .map(|c| c.iter().map(|v| *v as i32).sum::<i32>() as f32)
+            .collect();
+        Self { q, escalas, sumas }
+    }
+}
+
+/// Varias proyecciones de **un mismo vector** en una sola pasada paralela:
+/// `destinos[i] = x · pesos[i]ᵀ`. Es el decode de q, k y v, o de gate y up.
+///
+/// Hace exactamente lo que harían las llamadas a [`matmul_auto`] por separado
+/// con una fila —los mismos kernels, la misma entrada cuantizada— y da el
+/// mismo resultado bit a bit. Lo que cambia es que hay **una** región
+/// paralela en vez de tres: cada llamada cuesta unos 10 µs fijos de repartir
+/// y juntar los hilos, y `attn_k` y `attn_v` del 3B son tan chicas (0,2 MB)
+/// que eso era casi todo su costo. Medido dentro del forward, q, k y v iban
+/// a 12 GB/s contra 21 de las ffn.
+///
+/// `pesos[i]` es `(bytes, tipo)` de una matriz de `destinos[i].len()` filas
+/// de `x.len()` valores. Los formatos sin desempaquetado a `i8` (F32, F16)
+/// van por [`matmul_auto`], uno por uno.
+pub fn matmul_varias_una_fila(
+    x: &[f32],
+    pesos: &[(&[u8], TipoGgml)],
+    destinos: &mut [&mut [f32]],
+) -> Result<(), String> {
+    if pesos.len() != destinos.len() {
+        return Err("hace falta un destino por matriz".into());
+    }
+    let k = x.len();
+    let mut filas = Vec::with_capacity(pesos.len());
+    for ((bytes, tipo), d) in pesos.iter().zip(destinos.iter()) {
+        let Some(sub) = crate::quant::sub_bloque(*tipo) else {
+            filas.push(None);
+            continue;
+        };
+        let por_bloque = tipo.valores_por_bloque();
+        if !k.is_multiple_of(por_bloque) || !k.is_multiple_of(sub) {
+            return Err(format!("una fila de {k} no es multiplo de los bloques"));
+        }
+        let bytes_fila = k / por_bloque * tipo.bytes_por_bloque();
+        if bytes.len() < d.len() * bytes_fila {
+            return Err("faltan bytes de pesos".into());
+        }
+        filas.push(Some((sub, bytes_fila)));
+    }
+    // Los que no tienen camino en enteros, aparte.
+    for (i, f) in filas.iter().enumerate() {
+        if f.is_none() {
+            let (bytes, tipo) = pesos[i];
+            let n = destinos[i].len();
+            matmul_auto((1, k, n), x, bytes, tipo, destinos[i])?;
+        }
+    }
+
+    // La entrada, una vez por tamaño de sub-bloque que haga falta.
+    let necesita = |s: usize| filas.iter().flatten().any(|(sub, _)| *sub == s);
+    let e16 = necesita(16).then(|| EntradaI8::nueva(x, 16));
+    let e32 = necesita(32).then(|| EntradaI8::nueva(x, 32));
+
+    // Las tareas: tramos de columnas de todas las matrices, mezclados en una
+    // sola lista para que los hilos se repartan todo de una vez.
+    let mut tareas: Vec<(usize, usize, &mut [f32])> = Vec::new();
+    for (i, d) in destinos.iter_mut().enumerate() {
+        if filas[i].is_none() {
+            continue;
+        }
+        for (t, trozo) in d.chunks_mut(COLUMNAS_MINIMAS).enumerate() {
+            tareas.push((i, t * COLUMNAS_MINIMAS, trozo));
+        }
+    }
+
+    tareas.into_par_iter().for_each(|(i, primera, salida)| {
+        let (bytes, tipo) = pesos[i];
+        let (sub, bytes_fila) = filas[i].expect("filtrado arriba");
+        let e = if sub == 16 {
+            e16.as_ref()
+        } else {
+            e32.as_ref()
+        }
+        .expect("cuantizada arriba");
+        let fila = |j: usize| &bytes[(primera + j) * bytes_fila..(primera + j + 1) * bytes_fila];
+
+        if hay_fusionado(tipo, k) {
+            for (j, s) in salida.iter_mut().enumerate() {
+                *s = match tipo {
+                    TipoGgml::Q4K => {
+                        crate::kernels::dot_q4k_i8(fila(j), &e.q, &e.escalas, &e.sumas)
+                    }
+                    TipoGgml::Q6K => {
+                        crate::kernels::dot_q6k_i8(fila(j), &e.q, &e.escalas, &e.sumas)
+                    }
+                    _ => crate::kernels::dot_q3k_i8(fila(j), &e.q, &e.escalas, &e.sumas),
+                };
+            }
+            return;
+        }
+
+        // El camino con buffer, el mismo de `matmul_i8_directo` con una fila.
+        let n_bloques = k / sub;
+        let mut columna_q = vec![0i8; k];
+        let mut columna_esc = vec![0f32; n_bloques];
+        let mut columna_des = vec![0f32; n_bloques];
+        for (j, s) in salida.iter_mut().enumerate() {
+            if crate::quant::desempaquetar_i8(
+                tipo,
+                fila(j),
+                &mut columna_q,
+                &mut columna_esc,
+                &mut columna_des,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let mut total =
+                crate::kernels::dot_i8_escalado(&columna_q, &e.q, &columna_esc, &e.escalas, sub);
+            if columna_des.iter().any(|v| *v != 0.0) {
+                for ((d, xe), xs) in columna_des.iter().zip(&e.escalas).zip(&e.sumas) {
+                    total += d * xe * xs;
+                }
+            }
+            *s = total;
+        }
+    });
+    Ok(())
+}
+
+/// Desde cuántas filas conviene [`matmul_i8_bloques`]: el cruce medido está
+/// entre 8 (0,79x) y 16 (1,07x), y desde 24 ya gana 1,34x.
+pub const BLOQUES_DESDE: usize = 24;
 
 /// Multiplica eligiendo el camino, que es lo que el motor debería hacer en vez
 /// de obligar a quien llama a saberse la tabla.
@@ -498,6 +964,19 @@ pub fn matmul_i8_fusionado(
 /// bastante más —máscara de bits para el tercer bit, y 16 escalas de 6 bits
 /// por bloque contra 8— y por eso le alcanza el buffer antes.
 ///
+/// Desde [`BLOQUES_DESDE`] filas va todo por [`matmul_i8_bloques`], que con
+/// lotes grandes gana en todos los formatos. Medido sobre todas las matrices
+/// de dos capas del 3B Q3_K_M (`examples/measure_blocked_matmul`):
+///
+/// | filas | antes | por bloques | |
+/// |---:|---:|---:|---:|
+/// | 8 | 19,1 ms | 24,2 ms | 0,79x |
+/// | 16 | 32,5 ms | 30,2 ms | 1,07x |
+/// | 24 | 47,6 ms | 35,4 ms | 1,34x |
+/// | 32 | 61,4 ms | 41,6 ms | 1,48x |
+/// | 128 | 249 ms | 127 ms | 1,95x |
+/// | 333 | 643 ms | 323 ms | 1,99x |
+///
 /// Los umbrales salen de **un tensor y esta máquina**. Son un valor por
 /// defecto medido, no una ley: en otro hardware el cruce se mueve, y la forma
 /// de saberlo es `cargo run --release --features candle --example
@@ -519,7 +998,15 @@ pub fn matmul_auto(
         return matmul((m, k, n), lhs, pesos, tipo, dst);
     }
 
-    let fusionable = matches!(tipo, TipoGgml::Q4K | TipoGgml::Q3K) && k.is_multiple_of(256);
+    // `COSXAMIX_SIN_BLOQUES` lo apaga, para comparar con y sin él.
+    static CON_BLOQUES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let con_bloques =
+        *CON_BLOQUES.get_or_init(|| std::env::var_os("COSXAMIX_SIN_BLOQUES").is_none());
+    if con_bloques && m >= BLOQUES_DESDE {
+        return matmul_i8_bloques((m, k, n), lhs, pesos, tipo, dst);
+    }
+
+    let fusionable = hay_fusionado(tipo, k);
 
     // En Q4_K el fusionado gana en todo el rango medido, de 1 a 32 filas. En
     // Q3_K gana hasta 4 y pierde desde 8.
@@ -947,6 +1434,185 @@ mod tests {
         );
     }
 
+    /// Por bloques y con buffer hacen las mismas cuentas en otro orden: tienen
+    /// que coincidir salvo el redondeo de sumar en otro orden, en los seis
+    /// formatos con desempaquetado a `i8`.
+    ///
+    /// Las formas son a propósito incómodas: 37 filas no son múltiplo de la
+    /// tesela de 4, 70 columnas dejan un último tramo de 6 —par— y 71 uno de 7
+    /// —impar—, que es donde viven los bordes. Q8_0 va por el camino con
+    /// signo (sus pesos van de -127 a 127) y los k-quants por el sin signo.
+    #[test]
+    fn por_bloques_coincide_con_el_de_buffer() {
+        let k = 512usize;
+        for (tipo, bytes_bloque, valores_bloque) in [
+            (TipoGgml::Q3K, 110usize, 256usize),
+            (TipoGgml::Q4K, 144, 256),
+            (TipoGgml::Q5K, 176, 256),
+            (TipoGgml::Q6K, 210, 256),
+            (TipoGgml::Q2K, 84, 256),
+            (TipoGgml::Q8_0, 34, 32),
+        ] {
+            for n in [70usize, 71] {
+                let pesos: Vec<u8> = if tipo == TipoGgml::Q8_0 {
+                    let mut b = pesos_q8_identidad(n, k);
+                    for (i, v) in b.iter_mut().enumerate() {
+                        if i % 34 >= 2 {
+                            *v = ((i * 29 % 253) as i32 - 126) as i8 as u8;
+                        }
+                    }
+                    b
+                } else {
+                    (0..n * k / valores_bloque * bytes_bloque)
+                        .map(|i| ((i * 97 + 29) % 251) as u8)
+                        .collect()
+                };
+                for m in [4usize, 37] {
+                    let x: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.021).cos()).collect();
+                    let mut con_buffer = vec![0f32; m * n];
+                    let mut bloques = vec![0f32; m * n];
+                    matmul_i8_directo((m, k, n), &x, &pesos, tipo, &mut con_buffer).unwrap();
+                    matmul_i8_bloques((m, k, n), &x, &pesos, tipo, &mut bloques).unwrap();
+                    let escala = con_buffer.iter().fold(0f32, |a, v| a.max(v.abs()));
+                    let peor = con_buffer
+                        .iter()
+                        .zip(&bloques)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        peor <= escala * 1e-4,
+                        "{tipo:?} {m}x{n}: diferencia {peor} sobre {escala}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// El fusionado de Q6_K —el de la matriz de salida en el decode— contra
+    /// el camino con buffer, que desempaqueta con `quant::desempaquetar_i8`:
+    /// si el kernel leyera mal el orden de los bits, no coincidirían. Se
+    /// prueban el de AVX2 (por `matmul_i8_fusionado`) y el escalar.
+    #[test]
+    fn el_fusionado_de_q6k_coincide_con_el_de_buffer() {
+        let (k, n) = (512usize, 40usize);
+        let mut pesos: Vec<u8> = (0..n * k / 256 * 210)
+            .map(|i| ((i * 97 + 29) % 251) as u8)
+            .collect();
+        // Una `d` de verdad en cada bloque: con bytes al azar puede salir un
+        // f16 infinito.
+        for b in pesos.chunks_exact_mut(210) {
+            b[208..210].copy_from_slice(&0x2C00u16.to_le_bytes());
+        }
+        let m = 1;
+        let x: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.021).cos()).collect();
+        let mut con_buffer = vec![0f32; m * n];
+        let mut fusionado = vec![0f32; m * n];
+        matmul_i8_directo((m, k, n), &x, &pesos, TipoGgml::Q6K, &mut con_buffer).unwrap();
+        matmul_i8_fusionado((m, k, n), &x, &pesos, TipoGgml::Q6K, &mut fusionado).unwrap();
+        let escala = con_buffer.iter().fold(0f32, |a, v| a.max(v.abs()));
+        for (a, b) in con_buffer.iter().zip(&fusionado) {
+            assert!((a - b).abs() <= escala * 1e-5, "{a} contra {b}");
+        }
+
+        // El escalar, fila por fila, con la misma entrada cuantizada.
+        let mut xq = vec![0i8; k];
+        let mut xe = vec![0f32; k / 16];
+        cuantizar_i8_en(&x, &mut xq, &mut xe, 16);
+        let xs: Vec<f32> = xq
+            .chunks(16)
+            .map(|c| c.iter().map(|v| *v as i32).sum::<i32>() as f32)
+            .collect();
+        let bytes_fila = k / 256 * 210;
+        for (j, esperado) in con_buffer.iter().enumerate() {
+            let fila = &pesos[j * bytes_fila..(j + 1) * bytes_fila];
+            let v = crate::kernels::scalar::dot_q6k_i8(fila, &xq, &xe, &xs);
+            assert!(
+                (v - esperado).abs() <= escala * 1e-5,
+                "escalar: {v} contra {esperado}"
+            );
+        }
+    }
+
+    /// Varias proyecciones en una pasada tienen que dar **lo mismo bit a bit**
+    /// que una llamada a `matmul_auto` por matriz: son los mismos kernels con
+    /// la misma entrada. Se mezclan formatos con kernel fusionado (Q3_K,
+    /// Q4_K, Q6_K) y con buffer (Q5_K, Q8_0), y tamaños que no son múltiplo
+    /// del tramo de columnas.
+    #[test]
+    fn varias_en_una_pasada_dan_lo_mismo_que_de_a_una() {
+        let k = 512usize;
+        let armar = |tipo: TipoGgml, n: usize| -> Vec<u8> {
+            if tipo == TipoGgml::Q8_0 {
+                let mut b = pesos_q8_identidad(n, k);
+                for (i, v) in b.iter_mut().enumerate() {
+                    if i % 34 >= 2 {
+                        *v = ((i * 29 % 253) as i32 - 126) as i8 as u8;
+                    }
+                }
+                return b;
+            }
+            let bytes = tipo.bytes_por_bloque();
+            let mut b: Vec<u8> = (0..n * k / 256 * bytes)
+                .map(|i| ((i * 97 + 29) % 251) as u8)
+                .collect();
+            // `d` —y en Q4_K y Q5_K también `dmin`— finitas en cada bloque: con
+            // bytes al azar puede salir un f16 infinito y el resultado, NaN.
+            let campos: &[usize] = match tipo {
+                TipoGgml::Q3K => &[108],
+                TipoGgml::Q6K => &[208],
+                _ => &[0, 2],
+            };
+            for bl in b.chunks_exact_mut(bytes) {
+                for &d in campos {
+                    bl[d..d + 2].copy_from_slice(&0x2C00u16.to_le_bytes());
+                }
+            }
+            b
+        };
+        let matrices = [
+            (TipoGgml::Q3K, 70usize),
+            (TipoGgml::Q4K, 33),
+            (TipoGgml::Q5K, 40),
+            (TipoGgml::Q6K, 64),
+            (TipoGgml::Q8_0, 5),
+        ];
+        let pesos: Vec<Vec<u8>> = matrices.iter().map(|(t, n)| armar(*t, *n)).collect();
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.021).cos()).collect();
+
+        let mut juntas: Vec<Vec<f32>> = matrices.iter().map(|(_, n)| vec![0f32; *n]).collect();
+        let refs: Vec<(&[u8], TipoGgml)> = pesos
+            .iter()
+            .zip(&matrices)
+            .map(|(p, (t, _))| (p.as_slice(), *t))
+            .collect();
+        let mut destinos: Vec<&mut [f32]> = juntas.iter_mut().map(|v| v.as_mut_slice()).collect();
+        matmul_varias_una_fila(&x, &refs, &mut destinos).unwrap();
+
+        for (i, (tipo, n)) in matrices.iter().enumerate() {
+            let mut sola = vec![0f32; *n];
+            matmul_auto((1, k, *n), &x, &pesos[i], *tipo, &mut sola).unwrap();
+            assert_eq!(sola, juntas[i], "{tipo:?}: no coincide bit a bit");
+        }
+    }
+
+    #[test]
+    fn las_escalas_se_expanden_por_carril() {
+        // Sub-bloques de 16: cuatro carriles para cada uno.
+        let mut d = vec![0f32; 16];
+        expandir_escalas(&[1.0, 2.0, 3.0, 4.0], 16, &mut d);
+        assert_eq!(
+            d,
+            [1., 1., 1., 1., 2., 2., 2., 2., 3., 3., 3., 3., 4., 4., 4., 4.]
+        );
+        // De 32: los ocho iguales.
+        let mut d = vec![0f32; 16];
+        expandir_escalas(&[5.0, 6.0], 32, &mut d);
+        assert_eq!(
+            d,
+            [5., 5., 5., 5., 5., 5., 5., 5., 6., 6., 6., 6., 6., 6., 6., 6.]
+        );
+    }
+
     #[test]
     fn avisa_si_las_formas_no_cuadran() {
         let pesos = pesos_q8_identidad(32, 64);
@@ -991,7 +1657,7 @@ mod tests {
                     .collect()
             };
 
-            for m in [1usize, 2, 4, 8] {
+            for m in [1usize, 2, 4, 8, BLOQUES_DESDE - 1, BLOQUES_DESDE, 37] {
                 let x: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.021).cos()).collect();
 
                 let mut referencia = vec![0f32; m * n];
