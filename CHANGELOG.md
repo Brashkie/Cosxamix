@@ -130,6 +130,16 @@ Todo con el texto generado igual que antes, y cada mejora con su variable
   era el caso normal de WinsiBot hasta su 9.1.0 —su *system* cambiaba con
   cada mensaje del grupo—, y se arregló allá, sin tocar el motor.
 
+### Corregido
+
+- **Clippy 1.99 rompía el CI en todas las plataformas.** Trae un aviso nuevo,
+  `chunks_exact_to_as_chunks`, y el CI niega los avisos: los
+  `chunks_exact(8)` y `chunks_exact(210)` de tamaño fijo pasan a
+  `as_chunks::<N>()`, que deja el tamaño en el tipo.
+- **En ARM64 no compilaba con `-D warnings`.** `transponer_en_paralelo` y
+  `expandir_escalas` solo las usa el camino de AVX2, y fuera de x86-64
+  quedaban sin uso. Ahora se compilan solo ahí, igual que ese camino.
+
 ### Probado y descartado
 
 - **Escalas enteras en los k-quants**, como llama.cpp: la entrada con una

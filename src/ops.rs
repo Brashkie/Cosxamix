@@ -482,6 +482,7 @@ pub fn matmul_i8_fusionado(
 /// 20% de la multiplicación— con los demás núcleos esperando. De a 16 filas,
 /// cada columna aporta una línea de caché entera (16 `f32` seguidos) en vez
 /// de un valor suelto.
+#[cfg(target_arch = "x86_64")]
 fn transponer_en_paralelo(salida_t: &[f32], m: usize, n: usize, dst: &mut [f32]) {
     const FILAS: usize = 16;
     dst.par_chunks_mut(FILAS * n)
@@ -509,15 +510,17 @@ fn transponer_en_paralelo(salida_t: &[f32], m: usize, n: usize, dst: &mut [f32])
 ///
 /// Sin divisiones: la primera versión calculaba el sub-bloque de cada carril
 /// con una, y con 18 filas la expansión pesaba más que lo que ahorraba.
+#[cfg(target_arch = "x86_64")]
 fn expandir_escalas(esc: &[f32], sub: usize, destino: &mut [f32]) {
+    let (trozos, _) = destino.as_chunks_mut::<8>();
     if sub == 16 {
-        for (t, d) in destino.chunks_exact_mut(8).enumerate() {
+        for (t, d) in trozos.iter_mut().enumerate() {
             d[..4].fill(esc[2 * t]);
             d[4..].fill(esc[2 * t + 1]);
         }
     } else {
         let por_sub = sub / 32;
-        for (t, d) in destino.chunks_exact_mut(8).enumerate() {
+        for (t, d) in trozos.iter_mut().enumerate() {
             d.fill(esc[t / por_sub]);
         }
     }
@@ -1500,7 +1503,7 @@ mod tests {
             .collect();
         // Una `d` de verdad en cada bloque: con bytes al azar puede salir un
         // f16 infinito.
-        for b in pesos.chunks_exact_mut(210) {
+        for b in pesos.as_chunks_mut::<210>().0 {
             b[208..210].copy_from_slice(&0x2C00u16.to_le_bytes());
         }
         let m = 1;
@@ -1595,6 +1598,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn las_escalas_se_expanden_por_carril() {
         // Sub-bloques de 16: cuatro carriles para cada uno.

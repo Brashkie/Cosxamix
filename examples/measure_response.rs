@@ -69,7 +69,7 @@ fn ancho_de_banda(bytes: &[u8]) -> f64 {
                     s.spawn(move || {
                         let (pre, medio, post) = unsafe { c.align_to::<u64>() };
                         let mut a = [0u64; 4];
-                        for b in medio.chunks_exact(4) {
+                        for b in medio.as_chunks::<4>().0 {
                             a[0] = a[0].wrapping_add(b[0]);
                             a[1] = a[1].wrapping_add(b[1]);
                             a[2] = a[2].wrapping_add(b[2]);
