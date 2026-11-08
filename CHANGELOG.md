@@ -86,6 +86,10 @@ escribir en los formatos que más rinden, existe **Chavín**, el modelo grande, 
   llegan seguidos, para continuarlos (`engine::prompt_de`). Un daiss-mini de BPE
   8.192 genera a 562 tokens/s, unos 2.100 bytes de texto por segundo.
 - `create_daiss` escribe en cualquier formato con `COSXAMIX_TIPO`.
+- El test de que una palabra enorme no sea cuadrática mide cómo crece el tiempo
+  (4 veces el texto, unas 4 veces el tiempo) y no un límite en segundos, que
+  fallaba en CI por compilar sin optimizar. Con trabajo cuadrático metido a
+  propósito, falla con 15,7×.
 - `examples/measure_tokenizer.rs`, `measure_kquants.rs` y
   `measure_generation.rs`, para medir todo lo anterior.
 

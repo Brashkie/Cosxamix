@@ -1343,13 +1343,31 @@ mod tests {
 
     /// Una palabra enorme sin espacios no puede tardar cuadrático: un mensaje
     /// con un base64 de 1 MB pasaría de milisegundos a minutos.
+    ///
+    /// Se mide cómo crece y no cuántos segundos tarda: con 4 veces más texto,
+    /// lineal tarda unas 4 veces más y cuadrático 16. Un límite en segundos
+    /// fallaba en CI, que compila sin optimizar: 5 a 7,7 s contra 0,1 en release.
     #[test]
     fn una_palabra_enorme_no_es_cuadratica() {
         let corpus = corpus_de_prueba(40_000);
         let bpe = Bpe::entrenar(&corpus, 900);
-        let t = std::time::Instant::now();
-        let ids = bpe.codificar_bytes(&vec![b'a'; 2_000_000]);
-        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
-        assert_eq!(bpe.decodificar_bytes(&ids).unwrap().len(), 2_000_000);
+        let medir = |n: usize| {
+            // El mejor de dos, para que una pausa del sistema no decida.
+            (0..2)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let ids = bpe.codificar_bytes(&vec![b'a'; n]);
+                    let s = t.elapsed().as_secs_f64();
+                    assert_eq!(bpe.decodificar_bytes(&ids).unwrap().len(), n);
+                    s
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let (chico, grande) = (medir(100_000), medir(400_000));
+        let veces = grande / chico.max(1e-6);
+        assert!(
+            veces < 8.0,
+            "4 veces el texto tardó {veces:.1} veces: {chico:.3} s y {grande:.3} s"
+        );
     }
 }
