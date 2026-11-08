@@ -90,6 +90,11 @@ escribir en los formatos que más rinden, existe **Chavín**, el modelo grande, 
   (4 veces el texto, unas 4 veces el tiempo) y no un límite en segundos, que
   fallaba en CI por compilar sin optimizar. Con trabajo cuadrático metido a
   propósito, falla con 15,7×.
+- **Arreglo: no enlazaba en macOS x86_64.** `q2k_avx2_sysv.s` y
+  `classify_avx2_sysv.s` no definían sus símbolos con guion bajo, que es como
+  los busca Mach-O. Ahora sí, como los demás `.s`, y un test revisa que todo
+  `*_sysv.s` los tenga, en cualquier plataforma. Comprobado enlazando el binario
+  de macOS con Zig como enlazador: sin el arreglo da el mismo error que CI.
 - `examples/measure_tokenizer.rs`, `measure_kquants.rs` y
   `measure_generation.rs`, para medir todo lo anterior.
 

@@ -938,4 +938,46 @@ mod tests {
             );
         }
     }
+
+    /// Todo `.s` de System V sirve a Linux y a macOS, y en Mach-O el enlazador
+    /// busca `_foo` donde ELF busca `foo`. Cada símbolo tiene que estar con y sin
+    /// guion bajo: a `q2k` y `classify` les faltaba, y el build de macOS no
+    /// enlazaba. Esto lo detecta en cualquier plataforma, sin una Mac.
+    #[test]
+    fn cada_simbolo_de_system_v_esta_tambien_para_macos() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let mut revisados = 0;
+        for entrada in std::fs::read_dir(&dir).unwrap() {
+            let ruta = entrada.unwrap().path();
+            let nombre = ruta.file_name().unwrap().to_string_lossy().into_owned();
+            if !nombre.ends_with("_sysv.s") {
+                continue;
+            }
+            let texto = std::fs::read_to_string(&ruta).unwrap();
+            let lineas: Vec<&str> = texto.lines().map(str::trim).collect();
+            for l in &lineas {
+                let Some(sym) = l.strip_prefix(".globl ") else {
+                    continue;
+                };
+                let sym = sym.trim();
+                if sym.starts_with('_') {
+                    continue;
+                }
+                let gemelo = format!("_{sym}");
+                assert!(
+                    lineas.contains(&format!(".globl {gemelo}").as_str()),
+                    "{nombre}: falta `.globl {gemelo}`"
+                );
+                assert!(
+                    lineas.contains(&format!("{gemelo}:").as_str()),
+                    "{nombre}: falta la etiqueta `{gemelo}:`"
+                );
+                revisados += 1;
+            }
+        }
+        assert!(
+            revisados >= 5,
+            "solo {revisados} símbolos: ¿se movieron los .s?"
+        );
+    }
 }

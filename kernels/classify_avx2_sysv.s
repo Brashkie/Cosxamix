@@ -12,9 +12,13 @@
 // La especificacion ejecutable es `escalar` en `src/kernels/classify.rs`.
 
     .text
+    // Con y sin guion bajo: en Mach-O (macOS) el enlazador busca `_cosxamix_clasificar_asm`, y en
+    // ELF `cosxamix_clasificar_asm`. Como en `dot_avx2_sysv.s`: faltaba, y rompio el build de macOS.
     .globl cosxamix_clasificar_asm
+    .globl _cosxamix_clasificar_asm
     .p2align 4
 cosxamix_clasificar_asm:
+_cosxamix_clasificar_asm:
     test rsi, rsi
     jz 2f
 

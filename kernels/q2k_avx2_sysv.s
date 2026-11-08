@@ -19,9 +19,13 @@
 // las escalas del bloque; ymm0 y ymm1, los valores.
 
     .text
+    // Con y sin guion bajo: en Mach-O (macOS) el enlazador busca `_cosxamix_q2k_asm`, y en
+    // ELF `cosxamix_q2k_asm`. Como en `dot_avx2_sysv.s`: faltaba, y rompio el build de macOS.
     .globl cosxamix_q2k_asm
+    .globl _cosxamix_q2k_asm
     .p2align 4
 cosxamix_q2k_asm:
+_cosxamix_q2k_asm:
 
     // Constantes del bucle, armadas con inmediatos: sin seccion de datos.
     mov eax, 0x00010001
