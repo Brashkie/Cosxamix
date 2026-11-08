@@ -16,6 +16,8 @@
 //! cuantizada. Eso acota el alcance a modelos que entren en RAM en f32 — el
 //! 0,5B entra, el 3B no.
 
+/// Entrenar todos los parámetros, desde cero.
+pub mod full;
 pub mod lora;
 pub mod model;
 

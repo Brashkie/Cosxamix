@@ -272,7 +272,31 @@ COSXAMIX_BPE=modelos/daiss-8192.bpe cargo run --release --example create_daiss
 
 El tokenizador viaja dentro del archivo del modelo.
 
-**Un daiss recién escrito no está entrenado**: sus pesos son ruido con la
+**Chavín** es el modelo grande: `chavin-30b`, 29,5 B de parámetros, medido para una
+máquina de 16 GB. Ahora los modelos se pueden escribir en k-quants, y él va en
+Q2_K, 9,02 GB:
+
+```
+COSXAMIX_DAISS=chavin-30b cargo run --release --example create_daiss
+COSXAMIX_TIPO=q3k COSXAMIX_DAISS=daiss-3b cargo run --release --example create_daiss
+```
+
+Corre acá a 2,38 tok/s, el 57% de lo que la memoria permite, gracias a un kernel
+fusionado de Q2_K escrito en Rust, ensamblador, C y Zig.
+
+Y ahora se pueden entrenar desde cero, en esta CPU: `examples/train_daiss.rs` entrena
+todos los parámetros, y el GGUF exportado se sirve por la API con su propio
+vocabulario, sin JSON. Como no tiene plantilla de chat, los mensajes le llegan uno
+detrás de otro y los continúa. Un daiss-mini llega a 2,03 bits por byte sobre texto no
+visto en 10 minutos, por debajo de `xz` (2,15), y a 1,77 en 30:
+
+```
+COSXAMIX_VOCAB=8192 cargo run --release --features training --example train_daiss -- corpus.txt
+```
+
+Escribe frases que parecen español y todavía no quieren decir nada.
+
+**Un daiss o un Chavín recién escrito no está entrenado**: sus pesos son ruido con la
 desviación correcta y genera texto sin sentido. Lo que existe y está
 verificado es el camino entero —definir, inicializar, cuantizar, escribir,
 leer, cargar—, que es la condición previa de cualquier entrenamiento. Lo que
@@ -294,12 +318,12 @@ La última fila es la que decide. Termux es un objetivo del proyecto, y un motor
 que necesita un compilador de C++ en el teléfono reintroduce el requisito que se
 estaba quitando — movido de sitio, pero el mismo.
 
-**Una trampa que solo se ve probando**: el crate `tokenizers` trae por defecto el
-feature `onig`, que es Oniguruma —una librería de C— y rompe el cruce a Android
-con `failed to run custom build command for onig_sys`. Se desactiva con
-`default-features = false` y el camino alternativo usa `fancy-regex`, Rust puro.
-Está anotado en `Cargo.toml` porque es la clase de dependencia que se vuelve a
-colar sin que nadie la vea.
+**El motor ya no usa el crate `tokenizers`.** `src/tokenizer_json.rs` lee el mismo
+`tokenizer.json` y da los mismos tokens, comprobado contra el crate sobre todo
+Unicode: 12,7 ms para cargar en vez de 278, 34 MB/s para codificar en vez de 1,6.
+Y un GGUF que trae su vocabulario adentro, como los oficiales, no necesita ningún
+JSON. El crate queda solo para esa prueba, con `default-features = false`, porque su
+feature `onig` por defecto es una librería de C que rompe el cruce a Android.
 
 ### El hallazgo más grande: `target-cpu`
 

@@ -14,12 +14,9 @@
 //! motor que necesita un compilador de C++ en el teléfono reintroduce el
 //! requisito que se estaba quitando — movido de sitio, pero el mismo.
 //!
-//! Apareció una trampa que solo se ve probando: el crate `tokenizers` trae por
-//! defecto `onig`, que es **Oniguruma, una librería de C**, y rompe el cruce a
-//! Android con `failed to run custom build command for onig_sys`. Se desactiva
-//! con `default-features = false`; el camino alternativo usa `fancy-regex`, que
-//! es Rust puro. Está anotado en `Cargo.toml` porque es justo la clase de
-//! dependencia que se vuelve a colar sin que nadie la vea.
+//! El tokenizador tampoco trae C: lo lee [`TokenizadorJson`], sin el crate
+//! `tokenizers`, cuyo feature `onig` por defecto rompía el cruce a Android
+//! (ver `tokenizer_json.rs`).
 //!
 //! ## Qué hace y qué no
 //!
@@ -39,9 +36,9 @@ use candle_transformers::generation::LogitsProcessor;
 // El modelo viene de `src/model/`, no del crate: ahí está la versión con el
 // caché de atención expuesto. El porqué está en la cabecera de ese archivo.
 use crate::model::qwen2::{CacheAtencion, ModelWeights};
-use tokenizers::Tokenizer;
+use crate::tokenizer_json::TokenizadorJson;
 
-use crate::engine::{formatear, ErrorMotor, ModeloDisponible, Motor, Peticion, Respuesta};
+use crate::engine::{prompt_de, ErrorMotor, ModeloDisponible, Motor, Peticion, Respuesta};
 
 /// Tope de tokens que se conservan en el caché de atención entre peticiones.
 ///
@@ -81,7 +78,7 @@ struct Sesion {
 
 struct Cargado {
     pesos: ModelWeights,
-    tokenizer: Tokenizer,
+    tokenizer: TokenizadorJson,
     /// Para `/api/tags` y para informar `estaba_caliente`.
     bytes: u64,
     capas: usize,
@@ -189,11 +186,7 @@ impl MotorCandle {
         if g.is_none() {
             *g = Some(self.cargar()?);
         }
-        let c = g.as_ref().expect("cargado");
-        c.tokenizer
-            .encode(texto, true)
-            .map(|e| e.get_ids().to_vec())
-            .map_err(|e| ErrorMotor::Interno(format!("tokenizar: {e}")))
+        Ok(g.as_ref().expect("cargado").tokenizer.codificar(texto))
     }
 
     /// Los logits del siguiente token para una secuencia dada. Solo diagnóstico.
@@ -369,11 +362,10 @@ impl MotorCandle {
         if g.is_none() {
             *g = Some(self.cargar()?);
         }
-        g.as_ref()
+        Ok(g.as_ref()
             .expect("cargado")
             .tokenizer
-            .decode(ids, true)
-            .map_err(|e| ErrorMotor::Interno(format!("decodificar: {e}")))
+            .decodificar(ids, true))
     }
 
     /// Procesa `tokens` desde `desde` y devuelve el token más probable de cada
@@ -468,7 +460,7 @@ impl MotorCandle {
         let pesos = ModelWeights::from_gguf(contenido, &mut f, &self.device)
             .map_err(|e| interno(format!("no pude construir el modelo: {e}")))?;
 
-        let tokenizer = Tokenizer::from_file(&self.tok)
+        let tokenizer = TokenizadorJson::para_modelo(&self.gguf, &self.tok)
             .map_err(|e| interno(format!("tokenizer inválido: {e}")))?;
 
         Ok(Cargado {
@@ -522,12 +514,8 @@ impl Motor for MotorCandle {
 
         let interno = |e: String| ErrorMotor::Interno(e);
 
-        let prompt = formatear(&p.mensajes);
-        let codificado = c
-            .tokenizer
-            .encode(prompt, true)
-            .map_err(|e| interno(format!("no pude tokenizar: {e}")))?;
-        let entrada: Vec<u32> = codificado.get_ids().to_vec();
+        let prompt = prompt_de(&p.mensajes, c.tokenizer.es_de_chat());
+        let entrada: Vec<u32> = c.tokenizer.codificar(&prompt);
 
         if entrada.is_empty() {
             return Err(interno("el prompt quedó vacío tras tokenizar".into()));
@@ -627,7 +615,7 @@ impl Motor for MotorCandle {
             .forward(&t, reutilizados)
             .map_err(|e| interno(format!("prefill: {e}")))?;
         // ── Generación, token a token ────────────────────────────────────────
-        let fin = c.tokenizer.token_to_id("<|im_end|>");
+        let fin = c.tokenizer.token_a_id("<|im_end|>");
         let mut salida: Vec<u32> = Vec::new();
         // Lo ya emitido, para poder mandar solo la diferencia.
         let mut emitido = String::new();
@@ -663,18 +651,17 @@ impl Motor for MotorCandle {
             // Cuesta O(n^2) en el largo de la respuesta, y no importa:
             // decodificar 200 tokens son microsegundos al lado de los ~100 ms
             // que cuesta el forward que produce cada uno.
-            if let Ok(completo) = c.tokenizer.decode(&salida, true) {
-                // Si el decodificado nuevo no empieza por el anterior, el
-                // tokenizador reescribio algo que ya habia salido. Es raro,
-                // pero emitir un trozo mal cortado partiria un caracter, asi
-                // que en ese caso se espera al token siguiente.
-                if let Some(nuevo) = completo.strip_prefix(emitido.as_str()) {
-                    if !nuevo.is_empty() {
-                        if !emitir(nuevo) {
-                            cortado = true;
-                        }
-                        emitido = completo.clone();
+            let completo = c.tokenizer.decodificar(&salida, true);
+            // Si el decodificado nuevo no empieza por el anterior, el
+            // tokenizador reescribio algo que ya habia salido. Es raro,
+            // pero emitir un trozo mal cortado partiria un caracter, asi
+            // que en ese caso se espera al token siguiente.
+            if let Some(nuevo) = completo.strip_prefix(emitido.as_str()) {
+                if !nuevo.is_empty() {
+                    if !emitir(nuevo) {
+                        cortado = true;
                     }
+                    emitido = completo.clone();
                 }
             }
             if cortado {
@@ -691,10 +678,7 @@ impl Motor for MotorCandle {
                 .map_err(|e| interno(format!("paso {pos}: {e}")))?;
         }
 
-        let texto = c
-            .tokenizer
-            .decode(&salida, true)
-            .map_err(|e| interno(format!("no pude decodificar: {e}")))?;
+        let texto = c.tokenizer.decodificar(&salida, true);
 
         // El caché contiene ahora el prompt MÁS lo generado: todo eso pasó por
         // `forward`. Registrarlo completo es lo que hace que el turno siguiente
@@ -724,7 +708,7 @@ impl Motor for MotorCandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Mensaje;
+    use crate::engine::{formatear, Mensaje};
 
     #[test]
     fn el_formato_lleva_las_marcas_de_turno_de_qwen() {

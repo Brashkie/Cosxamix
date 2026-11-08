@@ -138,9 +138,45 @@ pub const FAMILIA: &[Config] = &[
     },
 ];
 
+/// **Chavín**: el modelo grande, en el límite de lo que una máquina como esta
+/// puede correr.
+///
+/// La misma forma de bloque que daiss, para que el mismo motor lo sirva, pero
+/// sin seguir a ningún modelo ajeno: las medidas salen del hardware.
+///
+/// - **30 mil millones de parámetros**, porque es lo que entra en 15,8 GB de
+///   RAM: en `Q2_K` son 9,02 GB (0,33 bytes por parámetro), y queda lugar para
+///   el sistema y el caché de atención. En `Q3_K` son 11,81 GB, justo, y en
+///   `Q8_0` 29,2 GB, que no entra.
+/// - **Anchos múltiplos de 256**, para que admita k-quants en toda la red. Sin
+///   eso no se podría escribir en ningún formato que entre.
+/// - **4 cabezas de clave y valor de 48**: el caché por token crece con ellas:
+///   288 KB por token, 590 MB para 2048 tokens. Con 8 sería el doble.
+///
+/// Igual que un daiss recién escrito, **son pesos al azar y genera ruido**.
+/// Preentrenar 30B desde cero son miles de horas de GPU, y en esta máquina no
+/// se puede (ROADMAP §8).
+pub const CHAVIN: &[Config] = &[Config {
+    nombre: "chavin-30b",
+    dim: 6144,
+    capas: 72,
+    cabezas: 48,
+    cabezas_kv: 4,
+    ffn: 16384,
+    vocab: VOCAB,
+    contexto: 32768,
+    eps: 1e-6,
+    rope: 1_000_000.0,
+}];
+
 impl Config {
     pub fn de_nombre(n: &str) -> Option<&'static Config> {
-        FAMILIA.iter().find(|c| c.nombre == n)
+        FAMILIA.iter().chain(CHAVIN).find(|c| c.nombre == n)
+    }
+
+    /// `daiss` o `chavin`: lo que va antes del guion.
+    pub fn familia(&self) -> &'static str {
+        self.nombre.split('-').next().unwrap_or(self.nombre)
     }
 
     pub fn dim_cabeza(&self) -> usize {
@@ -380,6 +416,57 @@ pub struct Resumen {
     pub segundos: f64,
 }
 
+/// El escritor de un modelo, con sus metadatos y sus tensores declarados: lo que
+/// le falta son los pesos. Lo comparten escribir pesos al azar y exportar un
+/// modelo entrenado (`training/full.rs`).
+pub fn escritor_de(
+    cfg: &Config,
+    pesos: TipoGgml,
+    semilla: u64,
+    tokenizador: Option<&Bpe>,
+) -> Escritor {
+    let mut e = Escritor::nuevo();
+
+    e.meta_texto("general.architecture", "qwen2")
+        .meta_texto("general.name", cfg.nombre)
+        .meta_texto("general.basename", cfg.familia())
+        .meta_texto(
+            "general.size_label",
+            cfg.nombre.split('-').nth(1).unwrap_or(cfg.nombre),
+        )
+        .meta_texto("general.license", "mit")
+        .meta_u32("general.file_type", pesos as u32)
+        .meta_u32("qwen2.block_count", cfg.capas as u32)
+        .meta_u32("qwen2.context_length", cfg.contexto as u32)
+        .meta_u32("qwen2.embedding_length", cfg.dim as u32)
+        .meta_u32("qwen2.feed_forward_length", cfg.ffn as u32)
+        .meta_u32("qwen2.attention.head_count", cfg.cabezas as u32)
+        .meta_u32("qwen2.attention.head_count_kv", cfg.cabezas_kv as u32)
+        .meta_f32("qwen2.attention.layer_norm_rms_epsilon", cfg.eps)
+        .meta_f32("qwen2.rope.freq_base", cfg.rope)
+        .meta_texto("cosxamix.init", "normal(0, 0.02), residual / sqrt(2*capas)")
+        .meta("cosxamix.seed", Valor::U64(semilla));
+
+    if let Some(t) = tokenizador {
+        // Los pares se guardan aplanados en una lista de U32: GGUF no tiene
+        // listas de tuplas, y una lista de listas obligaría a quien lee a
+        // reconstruir la forma igual.
+        let mut planos = Vec::with_capacity(t.fusiones() * 2);
+        for (a, d) in t.pares() {
+            planos.push(Valor::U32(a));
+            planos.push(Valor::U32(d));
+        }
+        e.meta_texto("cosxamix.tokenizer.model", "bpe-bytes")
+            .meta_u32("cosxamix.tokenizer.size", t.tamano() as u32)
+            .meta("cosxamix.tokenizer.merges", Valor::Lista(planos));
+    }
+
+    for d in cfg.declaraciones(pesos) {
+        e.tensor(d);
+    }
+    e
+}
+
 /// Inicializa un daiss y lo escribe como GGUF.
 ///
 /// Genera **fila por fila**: el pico de memoria es una fila del tensor más
@@ -417,45 +504,7 @@ pub fn escribir_con(
         propio.vocab = t.tamano();
     }
     let cfg = &propio;
-    let mut e = Escritor::nuevo();
-
-    e.meta_texto("general.architecture", "qwen2")
-        .meta_texto("general.name", cfg.nombre)
-        .meta_texto("general.basename", "daiss")
-        .meta_texto(
-            "general.size_label",
-            cfg.nombre.trim_start_matches("daiss-"),
-        )
-        .meta_texto("general.license", "mit")
-        .meta_u32("general.file_type", pesos as u32)
-        .meta_u32("qwen2.block_count", cfg.capas as u32)
-        .meta_u32("qwen2.context_length", cfg.contexto as u32)
-        .meta_u32("qwen2.embedding_length", cfg.dim as u32)
-        .meta_u32("qwen2.feed_forward_length", cfg.ffn as u32)
-        .meta_u32("qwen2.attention.head_count", cfg.cabezas as u32)
-        .meta_u32("qwen2.attention.head_count_kv", cfg.cabezas_kv as u32)
-        .meta_f32("qwen2.attention.layer_norm_rms_epsilon", cfg.eps)
-        .meta_f32("qwen2.rope.freq_base", cfg.rope)
-        .meta_texto("cosxamix.init", "normal(0, 0.02), residual / sqrt(2*capas)")
-        .meta("cosxamix.seed", Valor::U64(semilla));
-
-    if let Some(t) = tokenizador {
-        // Los pares se guardan aplanados en una lista de U32: GGUF no tiene
-        // listas de tuplas, y una lista de listas obligaría a quien lee a
-        // reconstruir la forma igual.
-        let mut planos = Vec::with_capacity(t.fusiones() * 2);
-        for (a, d) in t.pares() {
-            planos.push(Valor::U32(a));
-            planos.push(Valor::U32(d));
-        }
-        e.meta_texto("cosxamix.tokenizer.model", "bpe-bytes")
-            .meta_u32("cosxamix.tokenizer.size", t.tamano() as u32)
-            .meta("cosxamix.tokenizer.merges", Valor::Lista(planos));
-    }
-
-    for d in cfg.declaraciones(pesos) {
-        e.tensor(d);
-    }
+    let e = escritor_de(cfg, pesos, semilla, tokenizador);
 
     let capas = cfg.capas;
 
@@ -581,7 +630,7 @@ mod tests {
     /// al cargarse, mucho después y lejos.
     #[test]
     fn las_cinco_formas_cierran() {
-        for c in FAMILIA {
+        for c in FAMILIA.iter().chain(CHAVIN) {
             assert_eq!(c.dim % c.cabezas, 0, "{}: dim entre cabezas", c.nombre);
             assert_eq!(
                 c.cabezas % c.cabezas_kv,
@@ -620,12 +669,66 @@ mod tests {
         assert_eq!(sin, ["daiss-0.5b"], "quien no admite k-quants cambio");
     }
 
+    /// Chavín tiene que entrar en la máquina para la que se pensó, en el
+    /// formato en el que se escribe, y admitir k-quants en toda la red.
+    #[test]
+    fn chavin_entra_en_la_maquina_para_la_que_se_penso() {
+        let c = Config::de_nombre("chavin-30b").unwrap();
+        assert_eq!(c.familia(), "chavin");
+        assert!(c.admite_kquants());
+        let gb = |t| c.bytes_en(t) as f64 / 1_073_741_824.0;
+        assert!(gb(TipoGgml::Q2K) < 10.0, "Q2_K: {}", gb(TipoGgml::Q2K));
+        assert!(gb(TipoGgml::Q3K) < 13.0, "Q3_K: {}", gb(TipoGgml::Q3K));
+        // 2048 tokens de contexto no pueden pasar de los ~600 MB.
+        assert!(c.bytes_de_cache_por_token() * 2048 < 650 << 20);
+    }
+
+    /// Escribir con k-quants: el archivo se lee, mide lo que dice y los pesos
+    /// vuelven con el error que corresponde al formato.
+    #[test]
+    fn se_escribe_en_k_quants_y_se_lee_de_vuelta() {
+        let dir = std::env::temp_dir().join("cosxamix-daiss-kquants");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Una forma mínima pero con todo lo de verdad: múltiplos de 256.
+        let chico = Config {
+            nombre: "chavin-prueba",
+            dim: 256,
+            capas: 2,
+            cabezas: 4,
+            cabezas_kv: 2,
+            ffn: 512,
+            vocab: 600,
+            contexto: 128,
+            eps: 1e-6,
+            rope: 10000.0,
+        };
+        for tipo in [TipoGgml::Q2K, TipoGgml::Q3K, TipoGgml::Q4K] {
+            let ruta = dir.join(format!("{tipo:?}.gguf"));
+            let r = escribir(&chico, tipo, 7, &ruta).unwrap();
+            assert!(r.bytes >= chico.bytes_en(tipo));
+            let g = crate::gguf::Gguf::abrir(&ruta).unwrap();
+            assert_eq!(
+                g.metadatos.get("general.basename").and_then(|v| v.texto()),
+                Some("chavin")
+            );
+            let t = g.tensor("blk.1.ffn_up.weight").unwrap();
+            assert_eq!(t.tipo, tipo);
+            let datos = g.datos_de(&ruta, t).unwrap();
+            let mut y = vec![0f32; t.elementos()];
+            crate::quant::descuantizar(tipo, &datos, &mut y).unwrap();
+            let sigma = (y.iter().map(|v| v * v).sum::<f32>() / y.len() as f32).sqrt();
+            assert!((sigma - 0.02).abs() < 0.005, "{tipo:?}: desviación {sigma}");
+            std::fs::remove_file(&ruta).unwrap();
+        }
+    }
+
     /// La cuenta de parámetros tiene que dar lo que dice el nombre, con el
     /// margen de que el nombre redondea.
     #[test]
     fn los_parametros_cuadran_con_el_nombre() {
         let esperado = [
-            ("daiss-mini", 80_000_000u64, 90_000_000u64),
+            ("chavin-30b", 28_000_000_000u64, 31_000_000_000u64),
+            ("daiss-mini", 80_000_000, 90_000_000),
             ("daiss-0.5b", 450_000_000, 650_000_000),
             ("daiss-3b", 2_900_000_000, 3_400_000_000),
             ("daiss-7b", 7_000_000_000, 8_000_000_000),
@@ -799,11 +902,23 @@ mod tests {
         assert_eq!(vuelta.codificar(texto), tok.codificar(texto));
         assert_eq!(vuelta.decodificar(&vuelta.codificar(texto)).unwrap(), texto);
 
+        // El motor lo lee del mismo GGUF, sin JSON, y codifica como se entrenó.
+        use crate::tokenizer_json::TokenizadorJson;
+        assert!(TokenizadorJson::gguf_lo_trae(&ruta));
+        let motor = TokenizadorJson::del_gguf(&g)
+            .unwrap()
+            .expect("el motor no lo vio");
+        assert_eq!(motor.codificar(texto), tok.codificar(texto));
+        assert_eq!(motor.decodificar(&motor.codificar(texto), true), texto);
+        assert!(!motor.es_de_chat(), "un daiss propio no sabe de turnos");
+
         // Y un daiss sin tokenizador propio tiene que decir que no lo trae, no
         // fallar.
         let otro = dir.join("prestado.gguf");
         escribir(cfg, TipoGgml::Q8_0, 7, &otro).unwrap();
         let g2 = crate::gguf::Gguf::abrir(&otro).unwrap();
         assert!(tokenizador_de(&g2).unwrap().is_none());
+        assert!(TokenizadorJson::del_gguf(&g2).unwrap().is_none());
+        assert!(!TokenizadorJson::gguf_lo_trae(&otro));
     }
 }

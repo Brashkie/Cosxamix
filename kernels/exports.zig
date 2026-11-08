@@ -15,10 +15,14 @@
 //! En ARM hay una sola copia (baseline): NEON es parte de la base de ARMv8-A.
 
 const dot = @import("dot.zig");
+const classify = @import("classify.zig");
+const q2k = @import("q2k.zig");
 
 pub fn exportar(comptime sufijo: []const u8) void {
     @export(&dot.cosxamix_dot_f32, .{ .name = "cosxamix_dot_f32" ++ sufijo });
     @export(&dot.cosxamix_rmsnorm_f32, .{ .name = "cosxamix_rmsnorm_f32" ++ sufijo });
+    @export(&q2k.cosxamix_q2k_zig, .{ .name = "cosxamix_q2k_zig" ++ sufijo });
+    @export(&classify.cosxamix_clasificar, .{ .name = "cosxamix_clasificar" ++ sufijo });
     @export(&dot.cosxamix_noop, .{ .name = "cosxamix_noop" ++ sufijo });
     @export(&dot.cosxamix_silu_f32, .{ .name = "cosxamix_silu_f32" ++ sufijo });
     @export(&dot.cosxamix_dot_i8_escalado_f32, .{ .name = "cosxamix_dot_i8_escalado_f32" ++ sufijo });

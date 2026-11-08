@@ -44,6 +44,17 @@ pub fn formatear(mensajes: &[Mensaje]) -> String {
     p
 }
 
+/// El prompt de una petición: con la plantilla de chat si el modelo la conoce, y
+/// si no —un daiss entrenado acá, que solo aprendió a continuar texto— los
+/// mensajes uno detrás de otro, para que los continúe.
+pub fn prompt_de(mensajes: &[Mensaje], chat: bool) -> String {
+    if chat {
+        return formatear(mensajes);
+    }
+    let textos: Vec<&str> = mensajes.iter().map(|m| m.contenido.as_str()).collect();
+    textos.join("\n")
+}
+
 /// Lo que se le pide a un motor para una generación.
 #[derive(Debug, Clone)]
 pub struct Peticion {
@@ -322,5 +333,27 @@ mod tests {
         let ms = m.modelos();
         assert_eq!(ms.len(), 1);
         assert_eq!(ms[0].nombre, "cosxamix-demo");
+    }
+}
+
+#[cfg(test)]
+mod prueba_prompt {
+    use super::*;
+
+    #[test]
+    fn sin_chat_los_mensajes_van_seguidos() {
+        let m = |rol: &str, c: &str| Mensaje {
+            rol: rol.into(),
+            contenido: c.into(),
+        };
+        let ms = [
+            m("system", "Sos un bot."),
+            m("user", "En un lugar de la Mancha"),
+        ];
+        assert_eq!(
+            prompt_de(&ms, false),
+            "Sos un bot.\nEn un lugar de la Mancha"
+        );
+        assert_eq!(prompt_de(&ms, true), formatear(&ms));
     }
 }

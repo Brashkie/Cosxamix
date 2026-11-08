@@ -410,6 +410,7 @@ pub fn matmul_i8_fusionado(
         TipoGgml::Q4K => (32usize, 144usize),
         TipoGgml::Q3K => (16, 110),
         TipoGgml::Q6K => (16, 210),
+        TipoGgml::Q2K => (16, 84),
         _ => return matmul_i8_directo((m, k, n), lhs, pesos, tipo, dst),
     };
     if !k.is_multiple_of(256) {
@@ -461,6 +462,7 @@ pub fn matmul_i8_fusionado(
                     *s = match tipo {
                         TipoGgml::Q4K => crate::kernels::dot_q4k_i8(fila, xq, xe, xs),
                         TipoGgml::Q6K => crate::kernels::dot_q6k_i8(fila, xq, xe, xs),
+                        TipoGgml::Q2K => crate::kernels::q2k::dot(fila, xq, xe, xs),
                         _ => crate::kernels::dot_q3k_i8(fila, xq, xe, xs),
                     };
                 }
@@ -793,7 +795,15 @@ fn hay_fusionado(tipo: TipoGgml, k: usize) -> bool {
     let q6k = *Q6K_FUSIONADO.get_or_init(|| {
         crate::kernels::usar_avx2() && std::env::var_os("COSXAMIX_SIN_Q6K_FUSIONADO").is_none()
     });
-    (matches!(tipo, TipoGgml::Q4K | TipoGgml::Q3K) || (tipo == TipoGgml::Q6K && q6k))
+    // `COSXAMIX_SIN_Q2K_FUSIONADO` hace lo mismo con Q2_K.
+    static Q2K_FUSIONADO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let q2k = *Q2K_FUSIONADO.get_or_init(|| {
+        crate::kernels::q2k::elegida() != crate::kernels::q2k::Copia::Escalar
+            && std::env::var_os("COSXAMIX_SIN_Q2K_FUSIONADO").is_none()
+    });
+    (matches!(tipo, TipoGgml::Q4K | TipoGgml::Q3K)
+        || (tipo == TipoGgml::Q6K && q6k)
+        || (tipo == TipoGgml::Q2K && q2k))
         && k.is_multiple_of(256)
 }
 
@@ -903,6 +913,7 @@ pub fn matmul_varias_una_fila(
                     TipoGgml::Q6K => {
                         crate::kernels::dot_q6k_i8(fila(j), &e.q, &e.escalas, &e.sumas)
                     }
+                    TipoGgml::Q2K => crate::kernels::q2k::dot(fila(j), &e.q, &e.escalas, &e.sumas),
                     _ => crate::kernels::dot_q3k_i8(fila(j), &e.q, &e.escalas, &e.sumas),
                 };
             }
@@ -1563,6 +1574,7 @@ mod tests {
             let campos: &[usize] = match tipo {
                 TipoGgml::Q3K => &[108],
                 TipoGgml::Q6K => &[208],
+                TipoGgml::Q2K => &[80, 82],
                 _ => &[0, 2],
             };
             for bl in b.chunks_exact_mut(bytes) {
@@ -1574,6 +1586,7 @@ mod tests {
         };
         let matrices = [
             (TipoGgml::Q3K, 70usize),
+            (TipoGgml::Q2K, 48),
             (TipoGgml::Q4K, 33),
             (TipoGgml::Q5K, 40),
             (TipoGgml::Q6K, 64),
@@ -1643,6 +1656,7 @@ mod tests {
         for (tipo, bytes_bloque) in [
             (TipoGgml::Q4K, 144usize),
             (TipoGgml::Q3K, 110),
+            (TipoGgml::Q2K, 84),
             (TipoGgml::F32, 1024),
             (TipoGgml::F16, 512),
         ] {

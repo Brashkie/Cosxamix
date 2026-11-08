@@ -9,6 +9,8 @@
 //!   cargo run --release --features candle --example compare_models -- --cuant
 //!   cargo run --release --features candle --example compare_models -- --motores
 //!
+//! `--cuantizador` compara el Q3_K_M oficial con el recuantizado por nosotros.
+//!
 //! `--motores` corre las mismas preguntas sobre el MISMO modelo —el 3B en
 //! Q3_K_M, el del bot— con candle y con el motor propio: es la batería que
 //! decide si el propio puede ser el de por defecto (DECISIONES §23).
@@ -208,6 +210,24 @@ fn main() {
                 "modelos/tokenizer-3b.json",
                 tipo,
             );
+        }
+        return;
+    }
+
+    // El mismo modelo, los mismos formatos por tensor: el Q3_K_M oficial contra
+    // el que sale de nuestro cuantizador (`examples/requantize.rs`).
+    if std::env::args().any(|a| a == "--cuantizador") {
+        for (nombre, gguf) in [
+            (
+                "3b-q3_k_m oficial",
+                "modelos/qwen2.5-3b-instruct-q3_k_m.gguf",
+            ),
+            (
+                "3b-q3_k_m nuestro",
+                "modelos/qwen2.5-3b-q3_k_m-cosxamix.gguf",
+            ),
+        ] {
+            medir_con(nombre, gguf, "modelos/tokenizer-3b.json", TipoMotor::Propio);
         }
         return;
     }

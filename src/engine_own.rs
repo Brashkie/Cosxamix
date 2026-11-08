@@ -7,7 +7,7 @@
 //! saliendo en partes, y el corte en `<|im_end|>`.
 //!
 //! Copia a propósito el contrato de [`crate::engine_candle::MotorCandle`]
-//! donde decide el resultado —la misma plantilla de chat ([`formatear`]), el
+//! donde decide el resultado —la misma plantilla de chat ([`crate::engine::formatear`]), el
 //! mismo muestreo (semilla 42, top-p 0,9), el mismo tope de sesiones y de
 //! tokens por sesión—, porque elegir entre los dos tiene que ser cambiar
 //! `COSXAMIX_MOTOR`, no cambiar de comportamiento.
@@ -19,18 +19,18 @@
 //! caché es un valor aparte ([`Cache`]) que `forward` recibe, así que cada
 //! sesión tiene el suyo y entrar a una conversación es sacarlo del mapa.
 //!
-//! El tokenizador es el de Qwen —el crate `tokenizers`, que no es candle
-//! aunque viaje con la misma feature—: estos modelos se entrenaron con él.
+//! El vocabulario es el de Qwen, porque estos modelos se entrenaron con él. Lo
+//! lee [`TokenizadorJson`], que da los mismos tokens que el crate `tokenizers`
+//! y carga mucho más rápido (ver `tokenizer_json.rs`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use tokenizers::Tokenizer;
-
-use crate::engine::{formatear, ErrorMotor, ModeloDisponible, Motor, Peticion, Respuesta};
+use crate::engine::{prompt_de, ErrorMotor, ModeloDisponible, Motor, Peticion, Respuesta};
 use crate::forward::{Cache, Modelo};
 use crate::sampler::Muestreador;
+use crate::tokenizer_json::TokenizadorJson;
 
 /// Los mismos topes que el motor de candle, por lo mismo: ver allí.
 const MAX_CACHE_TOKENS: usize = 4096;
@@ -45,7 +45,7 @@ struct Sesion {
 
 struct Cargado {
     modelo: Modelo,
-    tokenizer: Tokenizer,
+    tokenizer: TokenizadorJson,
     bytes: u64,
     sesiones: HashMap<String, Sesion>,
     reloj: u64,
@@ -84,9 +84,9 @@ impl MotorPropio {
             .map_err(|e| interno(format!("no pude medir el gguf: {e}")))?
             .len();
         let modelo = Modelo::abrir(&self.gguf).map_err(|e| interno(format!("gguf: {e}")))?;
-        let tokenizer = Tokenizer::from_file(&self.tok)
+        let tokenizer = TokenizadorJson::para_modelo(&self.gguf, &self.tok)
             .map_err(|e| interno(format!("tokenizer inválido: {e}")))?;
-        let fin_turno = tokenizer.token_to_id("<|im_end|>");
+        let fin_turno = tokenizer.token_a_id("<|im_end|>");
 
         // Los pesos están mapeados, no leídos: sin esto, "cargado" querría
         // decir "abierto", y la primera pregunta pagaría traer el modelo
@@ -189,12 +189,8 @@ impl Motor for MotorPropio {
         }
         let c = g.as_mut().expect("recién cargado");
 
-        let entrada: Vec<u32> = c
-            .tokenizer
-            .encode(formatear(&p.mensajes), true)
-            .map_err(|e| interno(format!("no pude tokenizar: {e}")))?
-            .get_ids()
-            .to_vec();
+        let prompt = prompt_de(&p.mensajes, c.tokenizer.es_de_chat());
+        let entrada: Vec<u32> = c.tokenizer.codificar(&prompt);
         if entrada.is_empty() {
             return Err(interno("el prompt quedó vacío tras tokenizar".into()));
         }
@@ -269,12 +265,11 @@ impl Motor for MotorPropio {
             // medio carácter UTF-8. Se decodifica todo lo generado y se emite
             // lo que creció (ver el motor de candle).
             let mut cortado = false;
-            if let Ok(completo) = c.tokenizer.decode(&salida, true) {
-                if let Some(nuevo) = completo.strip_prefix(emitido.as_str()) {
-                    if !nuevo.is_empty() {
-                        cortado = !emitir(nuevo);
-                        emitido = completo.clone();
-                    }
+            let completo = c.tokenizer.decodificar(&salida, true);
+            if let Some(nuevo) = completo.strip_prefix(emitido.as_str()) {
+                if !nuevo.is_empty() {
+                    cortado = !emitir(nuevo);
+                    emitido = completo.clone();
                 }
             }
             if cortado || cache.largo() >= contexto {
@@ -286,10 +281,7 @@ impl Motor for MotorPropio {
                 .map_err(|e| interno(format!("paso {}: {e}", salida.len())))?;
         }
 
-        let texto = c
-            .tokenizer
-            .decode(&salida, true)
-            .map_err(|e| interno(format!("no pude decodificar: {e}")))?;
+        let texto = c.tokenizer.decodificar(&salida, true);
 
         // El caché tiene ahora el prompt y lo generado menos el último token
         // —ese salió de los logits y no pasó por `forward`—. Se guarda la

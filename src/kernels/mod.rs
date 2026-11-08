@@ -69,6 +69,12 @@ pub mod q4k_neon;
 #[cfg(feature = "zig")]
 pub mod zig;
 
+/// Clasificar bytes de a 32, para la pre-tokenización, en todos los lenguajes.
+pub mod classify;
+
+/// El kernel fusionado de Q2_K, el formato de Chavín, en todos los lenguajes.
+pub mod q2k;
+
 /// El fusionado de Q3_K en ensamblador. Ver la cabecera del módulo.
 #[cfg(all(feature = "asm_q3k", target_arch = "x86_64"))]
 pub mod q3k_asm;

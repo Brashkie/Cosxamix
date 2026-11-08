@@ -1,6 +1,6 @@
 [package]
 name = "cosxamix"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Runtime de IA que sirve modelos de lenguaje por HTTP, compatible con el dialecto de Ollama"
 license     = "MIT"
@@ -50,12 +50,11 @@ candle-nn           = { version = "0.9", optional = true }
 rayon               = "1"
 num_cpus            = { version = "1", optional = true }
 
-# `default-features = false` NO es cosmetico: por defecto `tokenizers` trae el
-# feature `onig`, que es Oniguruma — una libreria de C — y rompe la compilacion
-# cruzada a Android con "failed to run custom build command for onig_sys".
-# Comprobado: con esta linea, toda la pila cruza a aarch64-linux-android; sin
-# ella, no. El camino alternativo usa fancy-regex, que es Rust puro.
-tokenizers = { version = "0.21", optional = true, default-features = false, features = ["unstable_wasm"] }
+
+# NFC, que es lo que un `tokenizer.json` pide antes de tokenizar. Sin
+# dependencias salvo tinyvec, y ya llegaba de rebote por `tokenizers` en otra
+# version.
+unicode-normalization = "0.1"
 
 [profile.release]
 lto           = true
@@ -93,7 +92,7 @@ asm_q3k = []
 # eso.
 #
 #   cargo run --release --features candle
-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:num_cpus"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:num_cpus"]
 
 # Entrenamiento LoRA. Implica `candle` porque no puede existir sin el, y va
 # aparte porque quien solo quiera servir no tiene por que compilarlo.
@@ -103,6 +102,13 @@ training = ["candle"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+# Solo para comprobar que el tokenizador propio da lo mismo, token por token
+# (tests/tokenizer_json.rs). El motor no lo usa desde la 0.8.0.
+#
+# `default-features = false` NO es cosmetico: por defecto trae el feature
+# `onig`, que es Oniguruma —una libreria de C— y rompe la compilacion cruzada a
+# Android. El camino alternativo usa fancy-regex, que es Rust puro.
+tokenizers = { version = "0.21", default-features = false, features = ["unstable_wasm"] }
 
 [[bench]]
 name    = "kernels"
@@ -203,6 +209,18 @@ required-features = ["candle"]
 
 [[example]]
 name = "measure_precision"
+required-features = ["candle"]
+
+[[example]]
+name = "train_daiss"
+required-features = ["training"]
+
+[[example]]
+name = "measure_tensor_train"
+required-features = ["training"]
+
+[[example]]
+name = "measure_generation"
 required-features = ["candle"]
 
 [[example]]

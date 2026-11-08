@@ -21,8 +21,8 @@
 use std::path::Path;
 
 use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::ops::softmax_last_dim;
+use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
+use candle_nn::ops::softmax;
 use candle_transformers::utils::repeat_kv;
 
 use super::lora::LinealLora;
@@ -241,8 +241,10 @@ impl ModeloEntrenable {
             .contiguous()?;
 
         // `rope` espera (b, cabezas, t, dim); se agrega el lote de 1.
-        let q = candle_nn::rotary_emb::rope(&q.unsqueeze(0)?, cos, sin)?;
-        let k = candle_nn::rotary_emb::rope(&k.unsqueeze(0)?, cos, sin)?;
+        // `rope_slow` y no `rope`, por lo mismo que `softmax` más abajo: el rápido
+        // no tiene camino de vuelta, y `q` y `k` no aprenderían nada.
+        let q = candle_nn::rotary_emb::rope_slow(&q.unsqueeze(0)?, cos, sin)?;
+        let k = candle_nn::rotary_emb::rope_slow(&k.unsqueeze(0)?, cos, sin)?;
 
         let rep = c.cabezas / c.cabezas_kv;
         let k = repeat_kv(k, rep)?;
@@ -251,7 +253,10 @@ impl ModeloEntrenable {
         let escala = 1f64 / (c.dim_cabeza as f64).sqrt();
         let att = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * escala)?;
         let att = att.broadcast_add(mascara)?;
-        let att = softmax_last_dim(&att)?;
+        // `softmax` y no `softmax_last_dim`: ese es más rápido pero **no tiene
+        // camino de vuelta** (`apply_op1_no_bwd`), y corta el gradiente sin avisar:
+        // las proyecciones de consulta y clave no aprenden nada.
+        let att = softmax(&att, D::Minus1)?;
         let salida = att.matmul(&v.contiguous()?)?;
 
         salida

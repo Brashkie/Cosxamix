@@ -296,9 +296,13 @@ fn compilar_c() {
     use std::path::PathBuf;
     use std::process::Command;
 
-    let fuente = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
-        Ok("x86_64") => "kernels/q3k_avx2.c",
-        Ok("aarch64") => "kernels/neon_dotprod.c",
+    let fuentes: &[&str] = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86_64") => &[
+            "kernels/q3k_avx2.c",
+            "kernels/classify_avx2.c",
+            "kernels/q2k_avx2.c",
+        ],
+        Ok("aarch64") => &["kernels/neon_dotprod.c", "kernels/q2k_neon.c"],
         _ => return,
     };
     let salida = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
@@ -329,8 +333,8 @@ fn compilar_c() {
         "-Wextra",
         "-Werror",
         "--",
-        fuente,
     ]);
+    cmd.args(fuentes);
     cmd.arg(format!("-femit-bin={}", destino.display()));
     match cmd.status() {
         Ok(s) if s.success() => {}

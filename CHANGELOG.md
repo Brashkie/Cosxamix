@@ -9,6 +9,86 @@ acá va qué cambió, no por qué.
 
 ---
 
+## [Sin publicar]
+
+## [0.8.0] - 2026-11-07
+
+El motor deja de depender del crate `tokenizers`, un modelo propio se puede
+escribir en los formatos que más rinden, existe **Chavín**, el modelo grande, y
+**un daiss se entrena desde cero en esta CPU y se sirve por la API**.
+
+- **`src/tokenizer_json.rs`: el tokenizador de Qwen sin el crate `tokenizers`.**
+  Da **los mismos tokens**, comprobado contra el crate (`tests/tokenizer_json.rs`)
+  en los documentos del proyecto, en 20.000 textos al azar y en todo Unicode,
+  comparando además dónde parte cada pieza. Sobre `tokenizer.json`, de 278 a
+  **12,7 ms** al cargar, de 1,6 a **34 MB/s** al codificar y de 16,8 a
+  **235 MB/s** al decodificar; el pico de memoria del proceso, de 67,7 a
+  **13,8 MB**. Guarda una copia compilada al lado (`tokenizer.json.cosxbin`),
+  con el hash del JSON del que salió. El crate queda solo para esos tests.
+- **`src/tokenizer.rs`, más rápido y con las mismas fusiones y los mismos
+  tokens**, comparados contra el algoritmo anterior: entrenar con el corpus de
+  335 KB, de 3.856 a **33-65 ms**, porque ya no vuelve a contar todos los pares
+  en cada fusión; codificar, de 15 a **59 MB/s**. Un texto de 255 MB que repite
+  el corpus, 412 MB/s en todos los núcleos. Una palabra enorme ya no es
+  cuadrática.
+- **`src/kernels/classify.rs`: clasificar bytes de a 32**, en Rust, Rust con
+  AVX2, ensamblador (`kernels/classify_avx2_*.s`), Zig y C. ~6,5 GB/s contra
+  2,7 de la referencia, y el mismo resultado en todos. De punta a punta casi no
+  se nota: son 50 µs de los 5,8 ms de codificar (DECISIONES §27).
+- **`src/quant_kquants.rs`: escribir Q2_K, Q3_K, Q4_K y Q5_K.** Hasta ahora un
+  modelo propio solo podía ir en Q8_0 o más grande. Comparado con los archivos
+  oficiales del mismo modelo, y con un Qwen 3B recuantizado con este código y
+  respondiendo las mismas preguntas: 10/15 contra 11/15, dentro del ruido
+  (DECISIONES §28). `examples/requantize.rs` recuantiza cualquier GGUF.
+- **`chavin-30b`: el modelo grande.** 29,5B parámetros, 72 capas, 9,02 GB en
+  Q2_K, con la forma medida para 15,8 GB de RAM. Se escribe en 14,5 minutos con
+  16 MB de memoria de trabajo; candle lee su último tensor con cero diferencias,
+  y **corre a 2,38 tok/s**, el 57% del techo de memoria. Sus pesos son al azar:
+  no está entrenado (DECISIONES §29).
+- **`src/kernels/q2k.rs`: el kernel fusionado de Q2_K**, en Rust, Rust con AVX2,
+  ensamblador (`kernels/q2k_avx2_*.s`), C (`kernels/q2k_avx2.c` y, en ARM64 con
+  `sdot`, `kernels/q2k_neon.c`) y Zig (`kernels/q2k.zig`). Una fila de Chavín, de
+  1,4 a **9,5 GB/s**. Generando: Chavín, de 0,83 a **2,38 tok/s**; el Q2_K oficial
+  de Qwen 3B, de 8,56 a **15,32 tok/s**, con el mismo texto (DECISIONES §30).
+  `COSXAMIX_SIN_Q2K_FUSIONADO` lo apaga, y `COSXAMIX_Q2K` elige el lenguaje.
+- **Los GGUF que traen el vocabulario adentro ya no necesitan `tokenizer.json`.**
+  Sale de `tokenizer.ggml.*`, con los mismos tokens que el JSON; un
+  `<modelo>.tokenizer.json` sigue mandando si está (DECISIONES §31).
+- **`src/training/full.rs`: entrenar un daiss desde cero, con todos los
+  parámetros.** Lo entrenado se exporta a GGUF y el motor propio da los mismos
+  logits (hay un test). `examples/train_daiss.rs` mide bits por byte sobre texto no
+  visto: un daiss-mini de BPE 8.192, en 10 minutos de CPU, llega a **2,03**, por
+  debajo de `xz` (2,15) y de un Markov de orden 4 (2,23). El modelo sin tokenizador,
+  a 2,41 (DECISIONES §32).
+- **Bytes contra BPE, a 30 minutos**: BPE 8.192 llega a 1,77 bits por byte y el
+  modelo sin tokenizador a 1,95, con la mitad de parámetros (DECISIONES §32).
+  `train_daiss` cuenta solo el tiempo de entrenar y mide al final todo el texto
+  de prueba.
+- **`examples/measure_tensor_train.rs`: Tensor-Train en las tablas de vocabulario,
+  medido en bits por byte, y pierde.** Al mismo tamaño, Q2_K empeora el modelo
+  0,004 bits por byte y Tensor-Train, 0,6 a 1,0 (DECISIONES §32).
+  `ModeloCompleto::cargar_pesos` lee lo que `exportar` escribe.
+- **Tensor-Train entrenado desde el principio sí sirve** (`COSXAMIX_TT`,
+  `ModeloCompleto::con_tensor_train`). Con los mismos 4,86 M parámetros que el
+  modelo sin tokenizador, BPE 8.192 con las tablas en rango 32 llega a 1,908 bits
+  por byte contra 1,951; las tablas, 30,6 veces más chicas, y a 0,135 del modelo
+  denso, que tiene casi el doble de parámetros (DECISIONES §32).
+- **Arreglo: el LoRA no entrenaba la atención.** `softmax_last_dim` y `rope` de
+  candle no tienen camino de vuelta, y cortan el gradiente sin avisar: el adaptador
+  de `q` no aprendía nada desde la 0.3.0. Ahora usa `softmax` y `rope_slow`, y un
+  test exige gradiente en todos los pesos.
+- **El lote se reparte entre los núcleos** (`perdida_y_gradientes`): candle no
+  escala con el lote, y un paso de 16 × 128 baja de 2,5 a 1,0 s, con los mismos
+  gradientes.
+- **Un daiss entrenado se sirve por la API**, sin JSON: el motor lee su
+  vocabulario de `cosxamix.tokenizer.merges` (`TokenizadorJson::de_bpe`) y lo
+  codifica como se entrenó. Como no sabe de turnos de chat, los mensajes le
+  llegan seguidos, para continuarlos (`engine::prompt_de`). Un daiss-mini de BPE
+  8.192 genera a 562 tokens/s, unos 2.100 bytes de texto por segundo.
+- `create_daiss` escribe en cualquier formato con `COSXAMIX_TIPO`.
+- `examples/measure_tokenizer.rs`, `measure_kquants.rs` y
+  `measure_generation.rs`, para medir todo lo anterior.
+
 ## [0.7.0] - 2026-10-30
 
 Responder un mensaje cuesta mucho menos donde más se notaba: **leer el
@@ -1520,6 +1600,7 @@ agrega una sección a uno y se olvida del otro, CI falla.
 - Verificado en esta versión: **22 tests**, 0 avisos, clippy limpio en las tres
   combinaciones (por defecto, `candle`, `zig,candle`).
 
+[0.8.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.8.0
 [0.7.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.7.0
 [0.6.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.6.0
 [0.5.1]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.5.1

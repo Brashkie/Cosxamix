@@ -12,9 +12,11 @@
 //!
 //!     cargo run --release --example create_daiss
 //!     COSXAMIX_DAISS=daiss-7b cargo run --release --example create_daiss
+//!     COSXAMIX_DAISS=chavin-30b cargo run --release --example create_daiss
+//!     COSXAMIX_TIPO=q3k COSXAMIX_DAISS=daiss-3b cargo run --release --example create_daiss
 //!     cargo run --release --features candle --example create_daiss
 
-use cosxamix::daiss::{Config, FAMILIA};
+use cosxamix::daiss::{Config, CHAVIN, FAMILIA};
 use cosxamix::gguf::{Gguf, TipoGgml};
 
 fn gb(bytes: u64) -> f64 {
@@ -23,24 +25,32 @@ fn gb(bytes: u64) -> f64 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
-    println!("  La familia daiss");
+    println!("  La familia daiss y Chavin");
     println!();
     println!(
-        "  {:<12}{:>8}{:>7}{:>7}{:>8}{:>10}{:>10}{:>10}{:>12}",
-        "modelo", "params", "capas", "dim", "cab/kv", "Q8_0", "F16", "F32", "cache/token"
+        "  {:<12}{:>8}{:>7}{:>7}{:>8}{:>10}{:>10}{:>10}{:>10}{:>12}",
+        "modelo", "params", "capas", "dim", "cab/kv", "Q2_K", "Q3_K", "Q4_K", "Q8_0", "cache/token"
     );
-    println!("  {:-<84}", "");
-    for c in FAMILIA {
+    println!("  {:-<94}", "");
+    for c in FAMILIA.iter().chain(CHAVIN) {
+        let k = |t| {
+            if c.admite_kquants() {
+                format!("{:.2} GB", gb(c.bytes_en(t)))
+            } else {
+                "-".to_string()
+            }
+        };
         println!(
-            "  {:<12}{:>8}{:>7}{:>7}{:>8}{:>10}{:>10}{:>10}{:>12}",
+            "  {:<12}{:>8}{:>7}{:>7}{:>8}{:>10}{:>10}{:>10}{:>10}{:>12}",
             c.nombre,
             format!("{:.2}B", c.parametros() as f64 / 1e9),
             c.capas,
             c.dim,
             format!("{}/{}", c.cabezas, c.cabezas_kv),
+            k(TipoGgml::Q2K),
+            k(TipoGgml::Q3K),
+            k(TipoGgml::Q4K),
             format!("{:.2} GB", gb(c.bytes_en(TipoGgml::Q8_0))),
-            format!("{:.2} GB", gb(c.bytes_en(TipoGgml::F16))),
-            format!("{:.2} GB", gb(c.bytes_en(TipoGgml::F32))),
             format!("{:.1} KB", c.bytes_de_cache_por_token() as f64 / 1024.0),
         );
     }
@@ -68,7 +78,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dir = std::env::var("COSXAMIX_MODELOS").unwrap_or_else(|_| "modelos".into());
     std::fs::create_dir_all(&dir)?;
-    let ruta = std::path::Path::new(&dir).join(format!("{nombre}-q8_0.gguf"));
+    // Chavin no entra en memoria en Q8_0: por defecto va en Q2_K.
+    let por_defecto = if cfg.familia() == "chavin" {
+        "q2k"
+    } else {
+        "q8"
+    };
+    let pedido = std::env::var("COSXAMIX_TIPO").unwrap_or_else(|_| por_defecto.into());
+    let (tipo, etiqueta) = match pedido.as_str() {
+        "q2k" => (TipoGgml::Q2K, "q2_k"),
+        "q3k" => (TipoGgml::Q3K, "q3_k"),
+        "q4k" => (TipoGgml::Q4K, "q4_k"),
+        "q8" => (TipoGgml::Q8_0, "q8_0"),
+        "f16" => (TipoGgml::F16, "f16"),
+        otro => {
+            println!("  COSXAMIX_TIPO={otro}: se puede q2k, q3k, q4k, q8 o f16.");
+            return Ok(());
+        }
+    };
+    if tipo != TipoGgml::Q8_0 && tipo != TipoGgml::F16 && !cfg.admite_kquants() {
+        println!("  {nombre} no admite k-quants: sus anchos no son multiplos de 256.");
+        return Ok(());
+    }
+    let ruta = std::path::Path::new(&dir).join(format!("{nombre}-{etiqueta}.gguf"));
     let semilla: u64 = std::env::var("COSXAMIX_SEMILLA")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -88,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(_) => None,
     };
-    let r = cosxamix::daiss::escribir_con(cfg, TipoGgml::Q8_0, semilla, tok.as_ref(), &ruta)?;
+    let r = cosxamix::daiss::escribir_con(cfg, tipo, semilla, tok.as_ref(), &ruta)?;
     println!(
         "  {} tensores, {:.2}B parametros, {:.2} GB en {:.1} s ({:.0} MB/s)",
         r.tensores,

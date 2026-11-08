@@ -173,7 +173,12 @@ impl GestorModelos {
             let Some(nombre) = ruta.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
                 continue;
             };
-            let Some(tok) = tokenizador_de(&ruta, dir) else {
+            // Un GGUF que trae su vocabulario adentro no necesita ningún JSON:
+            // se pasa él mismo, y el motor lo lee de ahí.
+            let tok = tokenizador_de(&ruta, dir).or_else(|| {
+                crate::tokenizer_json::TokenizadorJson::gguf_lo_trae(&ruta).then(|| ruta.clone())
+            });
+            let Some(tok) = tok else {
                 tracing::warn!(modelo = %nombre, "sin tokenizador, se omite");
                 continue;
             };

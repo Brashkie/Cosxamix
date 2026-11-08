@@ -86,8 +86,8 @@ logits sobre 151.936 palabras, de las que se usa **una**. Dos caminos:
 ### 3. Cerrar el camino de ARM y Android
 
 Lo que ya está: `dot.zig` cruza a `aarch64-linux-android`, toda la pila compila
-para ese target gracias al `default-features = false` de `tokenizers`, y el
-cruce a `aarch64-unknown-linux-gnu` lo **comprueba CI en cada push** — leyendo
+para ese target —el motor ya no usa `tokenizers`, que era lo que más costaba
+cruzar—, y el cruce a `aarch64-unknown-linux-gnu` lo **comprueba CI en cada push** — leyendo
 la cabecera ELF de la librería de Zig, no solo que compile.
 
 Lo que falta es **medirlo en un teléfono de verdad**. Las cifras de ARM hoy son
@@ -289,8 +289,9 @@ búsqueda**: el transformer sería el 13% de los parámetros. Así que el orden 
    contra candle. Lo que se cree acá lo sirve el mismo motor y corre en un
    teléfono.
 3. ~~**Un tokenizador propio**~~ **hecho**: `src/tokenizer.rs`, un BPE a nivel
-   de bytes con entrenamiento propio — sin el crate `tokenizers`, que queda
-   solo para comparar. Medido sobre texto que no vio, el nuestro de 8.192
+   de bytes con entrenamiento propio, y `src/tokenizer_json.rs`, que lee el de
+   Qwen y es lo que usa el motor; el crate `tokenizers` queda solo para
+   comparar ([DECISIONES](DECISIONES.md) §27). Medido sobre texto que no vio, el nuestro de 8.192
    necesita **3,4% más tokens** que el de Qwen de 151.936, y eso lleva a
    daiss-mini de 94% tabla de búsqueda y 82,5 M de parámetros a **47% y
    8,9 M** — nueve veces más chico. Con dos salvedades medidas: el
@@ -298,10 +299,28 @@ búsqueda**: el transformer sería el 13% de los parámetros. Así que el orden 
    texto de prueba es del mismo dominio, así que parte del 3,4% es
    especialización ([DECISIONES](DECISIONES.md) §19). **Lo que falta ahora es
    un corpus**, no código.
-4. **Medir un paso** con todos los parámetros entrenables, que es otro régimen:
-   el LoRA entrena el 0,1% y acá se entrena el 100%, así que el optimizador
-   deja de ser gratis y la memoria del backward crece mucho. Es lo único del
-   punto que no se puede estimar desde el LoRA, y reusa el §7.
+4. ~~**Medir un paso**~~ **hecho**: `src/training/full.rs`. En daiss-mini con lote
+   16 × 128, 1,3 a 2 s por paso, y en 10 minutos de CPU baja de `xz`
+   ([DECISIONES](DECISIONES.md) §32).
+
+**Chavín** existe desde la versión sin publicar: `chavin-30b`, 29,5B, 9,02 GB en
+Q2_K, escrito, leído por candle y corriendo a 2,38 tok/s, el 57% del techo de
+memoria, con pesos al azar ([DECISIONES](DECISIONES.md) §29 y §30). Lo que sigue,
+en orden:
+
+1. ~~**Bytes contra BPE, con más tiempo**~~ **hecho a 30 minutos**: BPE 8.192 da 1,77
+   bits por byte y bytes 1,95 ([DECISIONES](DECISIONES.md) §32). Falta repetir la de
+   contexto parejo con la CPU libre, y probar más tiempo.
+2. ~~**Embeddings en Tensor-Train**~~ **hecho en la 0.8.0** (§32): cortado después
+   pierde; entrenado desde el principio, con rango 32, le gana al modelo sin
+   tokenizador con los mismos parámetros. Queda **guardar los núcleos en el GGUF**
+   y reconstruir al cargar, para que el archivo también se achique.
+3. ~~**Servir un daiss entrenado**~~ **hecho en la 0.8.0**: el motor lee
+   `cosxamix.tokenizer.merges` y, sin plantilla de chat, continúa el texto.
+4. **Un kernel de entrenamiento propio**: repartir el lote da 2,5× en 6 núcleos.
+5. **Medir el kernel de Q2_K en Zig en un ARM sin `sdot`**, que es donde se usa.
+6. **Kernels para el cuantizador**: escribir Chavín son 14,5 minutos y casi todo
+   es la búsqueda de Q2_K, 115 ms por millón de valores contra 20 de Q3_K.
 
 ### 9. El motor propio, reemplazando candle pieza por pieza
 

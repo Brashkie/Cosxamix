@@ -278,7 +278,30 @@ COSXAMIX_BPE=modelos/daiss-8192.bpe cargo run --release --example create_daiss
 
 The tokenizer travels inside the model file.
 
-**A freshly written daiss is not trained**: its weights are noise with the
+**Chavín** is the big model: `chavin-30b`, 29.5 B parameters, sized for a 16 GB
+machine. Models can now be written in k-quants, and it goes in Q2_K, 9.02 GB:
+
+```
+COSXAMIX_DAISS=chavin-30b cargo run --release --example create_daiss
+COSXAMIX_TIPO=q3k COSXAMIX_DAISS=daiss-3b cargo run --release --example create_daiss
+```
+
+It runs here at 2.38 tok/s, 57% of what memory allows, thanks to a fused Q2_K
+kernel written in Rust, assembly, C and Zig.
+
+And they can now be trained from scratch, on this CPU: `examples/train_daiss.rs`
+trains every parameter, and the exported GGUF is served by the API with its own
+vocabulary, no JSON needed. With no chat template, the messages arrive one after the
+other and the model continues them. A daiss-mini reaches 2.03 bits per byte on unseen
+text after 10 minutes, below `xz` (2.15), and 1.77 after 30:
+
+```
+COSXAMIX_VOCAB=8192 cargo run --release --features training --example train_daiss -- corpus.txt
+```
+
+It writes Spanish-looking sentences that don't mean anything yet.
+
+**A freshly written daiss or Chavín is not trained**: its weights are noise with the
 right standard deviation, so it generates nonsense. What exists and is
 verified is the whole path — define, initialise, quantise, write, read, load —
 which is the precondition for any training. What's missing is in
@@ -300,12 +323,13 @@ The last row is what decides it. Termux is a target of this project, and an
 engine that needs a C++ compiler on the phone reintroduces the very requirement
 we were removing — moved elsewhere, but the same one.
 
-**A trap you only see by trying**: the `tokenizers` crate pulls in the `onig`
-feature by default, which is Oniguruma — a C library — and it breaks the cross
-to Android with `failed to run custom build command for onig_sys`. It's turned
-off with `default-features = false`, and the alternative path uses
-`fancy-regex`, pure Rust. It's annotated in `Cargo.toml` because it's the kind
-of dependency that creeps back in without anyone noticing.
+**The engine doesn't use the `tokenizers` crate anymore.** `src/tokenizer_json.rs`
+reads the same `tokenizer.json` and gives the same tokens, checked against the
+crate over all of Unicode: 12.7 ms to load instead of 278, 34 MB/s to encode
+instead of 1.6. And a GGUF that carries its vocabulary inside, like the official
+ones, needs no JSON at all. The crate stays only for that test, with `default-features =
+false`, because its default `onig` feature is a C library that breaks the cross
+to Android.
 
 ### The biggest find: `target-cpu`
 

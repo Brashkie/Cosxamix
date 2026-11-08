@@ -1117,6 +1117,9 @@ compiló. El coste: no arranca en un x86 anterior a 2015.
 
 ## 12. Redes de tensores (MPS / Tensor-Train): aplazado
 
+> Medido sobre un daiss entrenado en §32: en las tablas de vocabulario, Q2_K
+> gana a Tensor-Train por dos órdenes de magnitud.
+
 Es álgebra lineal clásica, real y aplicable — descomponer matrices grandes en
 cadenas de rango bajo reduce parámetros de verdad.
 
@@ -1986,6 +1989,284 @@ calculado en un lote de otro tamaño —y desde 24 filas va por la matmul por
 bloques—, así que puede diferir en el redondeo. En las pruebas, la respuesta
 sale igual; y `check_sessions` confirma que la conversación de la que se
 copia no cambia.
+
+## 27. Sacar `tokenizers` del motor
+
+El BPE propio ya existía, pero **no servía a nadie**: a Qwen lo seguía tokenizando
+el crate. Medido sobre el `tokenizer.json` de Qwen:
+
+| | crate | propio |
+|---|---:|---:|
+| cargar | 278 ms | **12,7 ms** |
+| codificar | 1,6 MB/s | **34 MB/s** |
+| decodificar | 16,8 MB/s | **235 MB/s** |
+| pico de memoria del proceso | 67,7 MB | **13,8 MB** |
+
+Ese archivo solo pide cuatro piezas fijas: especiales, NFC, la expresión regular
+de GPT-2 y BPE. Están escritas a mano en `tokenizer_json.rs`, y si un archivo pide
+otra cosa es un error que lo dice: un tokenizador equivocado no falla, da texto
+sin sentido.
+
+**Los tests de la primera versión no servían tanto como parecía, y se vio
+metiendo errores a propósito.** Pasaban "todo Unicode" con una letra menos en la
+tabla de `\p{L}`, sin la `ſ` y con el especial más corto primero: comparar tokens
+no alcanza, porque si no hay una fusión que cruce un límite, partir ahí o no
+partir da lo mismo. Ahora se comparan **los límites de cada pieza** contra el
+pre-tokenizador del crate, en todo Unicode y sin depender del vocabulario, y un
+vocabulario sintético prueba los especiales que son prefijo de otro. Las 11
+mutaciones se atrapan.
+
+**El kernel no decidió nada, y hay que decirlo.** Clasificar bytes de a 32 está
+en cinco lenguajes y da ~6,5 GB/s con cualquiera de los SIMD —Zig, C, ensamblador
+y Rust empatan: el límite ahí es la memoria—, contra 2,7 de la referencia. Pero
+son 50 µs de los 5,8 ms de codificar. La mejora vino de otro lado: la tabla plana
+en lugar de SipHash, recordar los rangos de los pares, y recordar las palabras
+ya vistas en un texto largo. Los kernels quedan: el proyecto es políglota a
+propósito, y para un corpus de gigabytes clasificar sí pesa más.
+
+**Una trampa de la medición de 255 MB**: ese texto repite el corpus, así que la
+caché de palabras acierta casi siempre. Los 412 MB/s no se extrapolan a un corpus
+de verdad.
+
+## 28. Escribir k-quants, ahora que hay contra qué comparar
+
+`quant.rs` decía que los k-quants no estaban porque "escribirlos sin tener contra
+qué compararlos sería justo lo que este proyecto no hace". Sigue siendo cierto, y
+lo que cambió es que sí hay contra qué: los archivos oficiales de Qwen 3B en Q2_K,
+Q3_K_M y Q4_K_M. El algoritmo es la misma búsqueda de los cuantizadores de GGML.
+
+| error contra los pesos de Q4_K (RMSE ×1000) | oficial | nuestro |
+|---|---:|---:|
+| Q3_K | 4,991 | 4,487 |
+| Q2_K | 9,061 | 8,802 |
+
+**Esa tabla favorece al nuestro y no prueba que sea mejor.** El nuestro cuantiza
+justo los pesos de Q4_K contra los que se mide; el oficial partió de los pesos
+originales, así que su error incluye la distancia entre Q4_K y ellos. Lo que dice
+es que **no es peor**.
+
+La prueba que vale es usarlo: Qwen 3B recuantizado desde Q4_K con los mismos
+formatos por tensor que el Q3_K_M oficial —el mismo tamaño, con 128 bytes de
+diferencia— y las 15 preguntas de `compare_models --cuantizador`:
+
+| | oficial | nuestro |
+|---|---:|---:|
+| aciertos | 11/15 | 10/15 |
+
+Fallan en preguntas distintas: el oficial dijo Auckland y el nuestro Canberra; el
+nuestro dijo 35 donde era 9. Y el nuestro contestó "pájaro", que la prueba no
+acepta porque solo tiene "pajaro" sin acento: serían 11 a 11. **Con 15 preguntas
+no se ve diferencia, y no se puede afirmar más que eso.**
+
+## 29. Chavín: el modelo grande, medido contra esta máquina
+
+Las medidas de `chavin-30b` salen del hardware y no de un modelo ajeno:
+
+| | |
+|---|---:|
+| parámetros | 29,50 B (72 capas, ancho 6144, FFN 16384) |
+| Q2_K / Q3_K / Q8_0 | 9,02 / 11,81 / 29,20 GB |
+| caché por token | 288 KB |
+| escribirlo, en Q2_K | 870 s, 16 MB de memoria de trabajo |
+| cargarlo, desde este disco | 240 s, y 124 s más la primera respuesta |
+| **generar** | **2,38 tok/s** |
+| techo de memoria, `37,5 GB/s ÷ 9,02 GB` | 4,2 tok/s |
+| **del techo** | **57%** |
+
+Q2_K porque es lo que entra: con 15,8 GB de RAM, Q3_K deja 4 GB para todo lo demás
+y Q8_0 no entra. Corre, y la máquina se mantuvo estable. Pide que haya memoria
+libre: con 6,1 GB, el primer paso tardó 127 s trayendo páginas del disco.
+
+**Lo que no es: un modelo que sepa algo.** Sus pesos son al azar y genera ruido.
+Preentrenar 30B desde cero son miles de horas de GPU. Los caminos reales para que
+aprenda son los de ROADMAP §8.
+
+## 30. El kernel de Q2_K
+
+Q2_K era el único formato de los que importan sin kernel fusionado: desempaquetaba
+cada fila a un buffer y después multiplicaba. Con una fila de 6144 valores, el
+ancho de Chavín:
+
+| | GB/s | sobre el buffer |
+|---|---:|---:|
+| con buffer, antes | 1,4 | — |
+| referencia en Rust | 1,5 | 1,05× |
+| Zig | 1,7 | 1,14× |
+| C | 8,1 | 5,6× |
+| ensamblador | 8,9 | 6,2× |
+| **Rust con AVX2** | **9,5** | **6,6×** |
+
+Rust gana, el ensamblador queda a un 7% y C a un 15%, así que el despachador usa
+Rust. **Zig rinde poco porque está escrito simple**, sumando de a 16 valores: sin
+`vpmaddubsw` ni `sdot`, la cuenta se hace a 16 bits. Se probaron dos formas más:
+reducir de a pares con `@shuffle` dio 1,08×, y escribir la forma de `vpmaddwd` para
+que el compilador la reconociera, 0,75×. Queda la primera, y es el camino de los ARM
+sin `sdot`, como la Raspberry Pi 4, donde falta medirlo: en x86 no se elige nunca. El
+de C con `sdot` compila, y lo prueba el runner ARM de CI: acá no se pudo ejecutar.
+
+Generando, las dos corridas con el mismo método —calentamiento y mediana de tres—,
+con el kernel y sin él (`COSXAMIX_SIN_Q2K_FUSIONADO`):
+
+| | sin | con | |
+|---|---:|---:|---:|
+| Chavín 30B | 0,83 tok/s | **2,38 tok/s** | 2,9× |
+| Qwen 3B Q2_K oficial | 8,56 tok/s | **15,32 tok/s** | 1,8× |
+
+Con temperatura 0, Qwen da **exactamente el mismo texto** con y sin el kernel.
+Chavín gana más porque casi todo son matrices en Q2_K, y en el Qwen oficial una
+parte va en otros formatos.
+
+## 31. JSON: dónde está y dónde no
+
+Quedó anotado porque se preguntó con razón: convertir millones de números a texto
+sería inviable. **Y no se hace**: los pesos son GGUF binario, y los tensores y el
+caché de atención son `f32` e `i8` crudos. JSON solo aparecía en el `tokenizer.json`
+de Qwen, que es texto, no números, y formato de ellos.
+
+Aun así costaba: 278 ms y 67,7 MB de pico en cada arranque. Primero se compiló a un
+binario al lado (`.cosxbin`), que deja 12,7 ms pero igual lee el JSON para comprobar
+su hash. Lo mejor fue notar que **los GGUF oficiales ya traen el vocabulario adentro**
+(`tokenizer.ggml.tokens`, `merges`, `token_type`): el lector de GGUF ya lee esas
+listas, así que el JSON sobra. Da los mismos tokens, y Qwen 3B corre sin ningún JSON
+en la carpeta a 13,6 tok/s.
+
+Hace falta para un daiss o un Chavín con vocabulario prestado, que no lo traen:
+ahí sigue el JSON, o el BPE propio incrustado.
+
+## 32. Entrenar desde cero, y si hace falta un tokenizador
+
+La pregunta venía de una postura: no limitarse a optimizar lo que existe. Una de las
+tres vías propuestas era quitar el tokenizador y leer bytes. Se puede probar: el
+mismo bloque de daiss-mini —256 de ancho, 6 capas—, los mismos 10 minutos de CPU, el
+Quijote (1,9 MB para entrenar y 211 KB que no ve) y una medida común, **bits por
+byte**, que es además lo que mide un compresor.
+
+| | parámetros | en tablas | pasos | bytes/token | **bits/byte** |
+|---|---:|---:|---:|---:|---:|
+| bytes, sin tokenizador | 4,86 M | 3% | 400 | 1,00 | 2,41 |
+| BPE 1.024 | 5,25 M | 10% | 356 | 2,69 | 2,18 |
+| **BPE 8.192** | 8,92 M | 47% | 275 | 3,78 | **2,03** |
+| *`xz -9` con todo el entrenamiento de contexto* | | | | | *2,15* |
+| *Markov de orden 4* | | | | | *2,23* |
+
+**A 10 minutos gana el tokenizador, y no zanja la pregunta.** Las tres curvas seguían
+bajando, y la de bytes es la que más rápido bajaba: 1,0 bits en 9 minutos contra 0,5.
+Y la comparación no es pareja en dos cosas que favorecen al BPE: con la misma
+cantidad de tokens por paso, una ventana de bytes ve 128 caracteres de contexto y una
+de BPE 8.192 ve 484; y el BPE arranca con el corpus ya estudiado, en 3,46 bits por
+byte antes del primer paso, contra 8,04. También hay una que favorece a los bytes:
+tiene casi la mitad de los parámetros. Para generar, además, el de bytes hace 3,8
+veces más pasadas por el mismo texto. Lo que dice esto es que **el tokenizador no es
+solo deuda técnica: es compresión ya hecha**. Si un modelo de bytes lo alcanza con
+más tiempo sigue abierto, y es la medición que falta.
+
+### A 30 minutos, con la medida justa
+
+Se repitió con tres cambios: 30 minutos; el reloj cuenta solo el entrenamiento,
+así que medir no le quita pasos a nadie; y la cifra final es sobre **todo** el
+texto de prueba, en ventanas sin solapar y sin azar.
+
+| | parámetros | pasos | 10 min | **30 min** |
+|---|---:|---:|---:|---:|
+| **BPE 8.192**, lote 16 × 128 | 8,92 M | 918 | 2,03 | **1,773** |
+| bytes, 16 × 128 | 4,86 M | 1.040 | 2,41 | 1,951 |
+| bytes, 4 × 484: el contexto de BPE | 4,86 M | 1.068 | | 2,210 |
+
+**La distancia se achicó de 0,38 a 0,18 y dejó de achicarse** en los últimos
+minutos, con el modelo de bytes a la mitad de parámetros. A este tamaño y en esta
+CPU, el tokenizador sigue ganando.
+
+**Darle a los bytes el mismo contexto que al BPE no ayudó**: 2,21. Ver más lejos
+sirve poco si todavía no aprendió lo cercano. Pero esa corrida no es limpia: otro
+proceso ocupó la CPU 18 de sus 30 minutos (2.300 ms por paso contra 1.215), y
+hizo unos 1.070 pasos en vez de unos 1.400. La de 128 tuvo lo mismo en sus últimos
+9 minutos. No cambia el orden; sí las distancias.
+
+**Lo que escribe no tiene sentido todavía**: Mancha, señor, Sancho, «respondió don
+Quijote» y la forma de los diálogos, pero frases que no dicen nada. 275 pasos son muy
+pocos. Es el primer modelo creado acá que aprende de un corpus, no uno útil.
+
+### Lo que salió mal, que es lo más valioso
+
+**La primera tanda de 30 minutos no sirvió.** Dio 3,21, 2,33 y 2,23 con la atención
+congelada: un test nuevo, que exige gradiente en todos los pesos, encontró que
+`attn_q` y `attn_k` no recibían ninguno. `softmax_last_dim` y `rope` de candle son
+`apply_op_no_bwd`: cortan el gradiente sin error, sin aviso, y la pérdida igual baja
+porque el resto aprende. Con los dos cambiados por `softmax` y `rope_slow`, los tres
+modelos mejoraron entre 0,15 y 0,8 bits por byte.
+
+**El LoRA tenía el mismo error desde la 0.3.0**: el adaptador de `q` nunca aprendió.
+Se decía que "entrena de verdad: la pérdida baja", y era cierto solo a medias. La
+pérdida que baja no prueba que todo esté aprendiendo.
+
+**candle no escala con el lote**: con 6 o con 12 hilos, 16 secuencias tardan 2,5 s y
+una, 235 ms. Repartir el lote entre los núcleos y promediar los gradientes lo baja a
+1,0 s, 2,5 veces y no 6, con el mismo resultado (hay un test). Lo que queda por debajo
+de 6 no está medido, y es donde un kernel de entrenamiento propio tendría sitio.
+
+### Tensor-Train en las tablas de vocabulario: medido, y pierde
+
+Era la otra vía, y §12 pedía un modelo entrenado para medirla. Con BPE 8.192 las
+tablas son el 47% de daiss-mini. `examples/measure_tensor_train.rs` toma el de 30
+minutos, comprime una tabla por vez y mide bits por byte en todo el texto de prueba.
+Tensor-Train es TT-SVD exacta, como TensorGPT, sobre `(8·4)(8·4)(8·4)(16·4)`; la SVD
+de rango bajo y la cuantización son las dos cosas que tiene que ganarle.
+
+| | veces más chica | `token_embd` | `output` |
+|---|---:|---:|---:|
+| Q4_K | 7,1× | +0,0000 | +0,0003 |
+| **Q2_K** | 12,2× | **+0,004** | **+0,007** |
+| SVD rango 32 | 7,8× | +0,093 | +0,038 |
+| SVD rango 16 | 15,5× | +0,259 | +0,121 |
+| TT r = 128 | 5,3× | +0,631 | +0,371 |
+| TT r = 64 | 10,4× | +0,961 | +0,616 |
+| TT r = 32 | 30,6× | +1,247 | +1,018 |
+
+Bits por byte que se pierden sobre 1,7725. Los bytes de SVD y TT están en F32;
+cuantizados bajarían, pero no lo suficiente para cerrar dos órdenes de magnitud.
+
+**A un tamaño parecido, Q2_K pierde 0,004 y Tensor-Train, 0,96.** Y desde r = 32 la
+tabla de embeddings queda con el 97% de error: es como borrarla, y el modelo se
+sostiene en lo que saben las capas, cerca de 3 bits por byte. La cifra de TensorGPT,
+39× a 65×, no se reproduce acá sin reentrenar.
+
+Por qué, en lo que se puede ver: Tensor-Train supone que los índices vecinos se
+parecen, y los números de un vocabulario BPE son el orden en que se aprendieron las
+fusiones, no una cercanía. Y la tabla de embeddings ni siquiera tiene rango bajo: la
+SVD de rango 128, la mitad, deja el 52% de error, porque los tokens que casi no
+aparecen conservan su inicialización al azar, que es ruido de rango completo.
+
+### Tensor-Train entrenado desde el principio: otra historia
+
+Cortar una tabla ya entrenada no es lo mismo que aprenderla en esa forma. Con
+`COSXAMIX_TT`, `ModeloCompleto::con_tensor_train` entrena los cuatro núcleos de
+cada tabla, y en cada paso reconstruye la matriz densa, que es diferenciable.
+Exporta las tablas densas, así que el motor lo sirve como a cualquier otro. Los
+mismos 30 minutos y la misma medida que arriba:
+
+| | parámetros | en tablas | pasos | **bits/byte** |
+|---|---:|---:|---:|---:|
+| BPE 8.192, tablas densas | 8,92 M | 47% | 918 | **1,773** |
+| **BPE 8.192, TT r = 32** | **4,86 M** | 2,8% | 847 | **1,908** |
+| BPE 8.192, TT r = 64 | 5,13 M | 7,9% | 715 | 1,918 |
+| bytes, sin tokenizador | 4,86 M | 3% | 1.040 | 1,951 |
+
+**Con los mismos 4,86 M parámetros, el vocabulario de 8.192 en Tensor-Train le gana
+al modelo sin tokenizador**: 1,908 contra 1,951. Y queda a 0,135 del modelo denso,
+que tiene casi el doble. Las tablas son 30,6 veces más chicas, y cortándolas después
+ese mismo rango costaba 1,25 bits por byte: acá cuesta 0,135. TensorGPT no se
+reproducía porque se lo aplicaba mal: **la forma hay que aprenderla, no imponerla**.
+
+**Rango 64 no mejoró a 32.** Hizo menos pasos —715 contra 847—, en parte porque cada
+paso reconstruye más y en parte porque otro proceso ocupó la CPU, y a igual número de
+pasos las dos curvas van juntas. Con este corpus, el rango no es lo que falta.
+
+**Lo que no es**: no le gana a Q2_K en calidad. Q2_K achica las tablas densas 12,2×
+y pierde 0,004; Tensor-Train, 30,6× y pierde 0,135. Son para cosas distintas: Q2_K
+es para servir un modelo que ya existe, y Tensor-Train, para entrenar uno chico con
+un vocabulario grande. Y el GGUF todavía guarda las tablas densas (34 MB): guardar
+los núcleos y reconstruir al cargar es lo que haría falta para que el archivo también
+se achique.
 
 ## Cifras que hubo que corregir
 

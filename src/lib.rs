@@ -17,6 +17,9 @@ pub mod gguf;
 /// escribiendo en un buffer que da quien llama.
 pub mod quant;
 
+/// Escribir k-quants: Q2_K, Q3_K, Q4_K y Q5_K.
+pub mod quant_kquants;
+
 /// Escribir GGUF, que es lo que hace que un modelo propio exista como archivo.
 pub mod gguf_write;
 
@@ -25,6 +28,12 @@ pub mod daiss;
 
 /// Tokenizador propio: BPE a nivel de bytes, con entrenamiento.
 pub mod tokenizer;
+
+/// Leer un `tokenizer.json` de la forma de GPT-2 y Qwen, sin el crate `tokenizers`.
+pub mod tokenizer_json;
+
+/// Las clases Unicode de la expresion regular de GPT-2. Generado.
+pub mod unicode_classes;
 
 /// El forward de Qwen2 sobre la pila propia, sin candle.
 pub mod forward;

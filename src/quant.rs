@@ -732,20 +732,15 @@ pub fn f32_a_f16(x: f32) -> u16 {
 
 /// Pasa `f32` al formato pedido y lo agrega a `salida`.
 ///
-/// Es el inverso de [`descuantizar`] y cubre los tres formatos con los que
-/// tiene sentido **escribir** un modelo nuevo:
+/// Es el inverso de [`descuantizar`] y cubre los formatos con los que tiene
+/// sentido **escribir** un modelo nuevo:
 ///
 /// - `F32`, que no pierde nada y pesa cuatro bytes por valor;
 /// - `F16`, mitad de tamaño y el error de redondeo de `f16`;
 /// - `Q8_0`, un byte por valor más una escala `f16` cada 32, o sea 1,0625
-///   bytes por valor — nueve veces menos que `F32` por diez.
-///
-/// Los k-quants no están, y a propósito: su cuantizador busca la escala y el
-/// mínimo que minimizan el error de cada sub-bloque con una búsqueda
-/// iterativa, no es una formula cerrada, y escribirlo sin tener contra qué
-/// compararlo valor por valor sería justo lo que este proyecto no hace. Un
-/// modelo propio se escribe en `Q8_0` y se recuantiza después con una
-/// herramienta que ya esté verificada.
+///   bytes por valor — nueve veces menos que `F32` por diez;
+/// - `Q5K`, `Q4K`, `Q3K` y `Q2K` (ver `quant_kquants.rs`), que son los que más rinden:
+///   el techo de generación es el ancho de banda dividido el tamaño.
 pub fn cuantizar_bloques(tipo: TipoGgml, x: &[f32], salida: &mut Vec<u8>) -> Result<(), String> {
     let por_bloque = tipo.valores_por_bloque();
     if !x.len().is_multiple_of(por_bloque) {
@@ -782,6 +777,26 @@ pub fn cuantizar_bloques(tipo: TipoGgml, x: &[f32], salida: &mut Vec<u8>) -> Res
                 for v in trozo {
                     salida.push(((v * inv).round() as i32).clamp(-127, 127) as i8 as u8);
                 }
+            }
+        }
+        TipoGgml::Q2K => {
+            for b in x.as_chunks::<256>().0 {
+                crate::quant_kquants::bloque_q2k(b, salida);
+            }
+        }
+        TipoGgml::Q3K => {
+            for b in x.as_chunks::<256>().0 {
+                crate::quant_kquants::bloque_q3k(b, salida);
+            }
+        }
+        TipoGgml::Q4K => {
+            for b in x.as_chunks::<256>().0 {
+                crate::quant_kquants::bloque_q4k(b, salida);
+            }
+        }
+        TipoGgml::Q5K => {
+            for b in x.as_chunks::<256>().0 {
+                crate::quant_kquants::bloque_q5k(b, salida);
             }
         }
         otro => return Err(format!("{otro:?}: sin cuantizador para escribir")),
