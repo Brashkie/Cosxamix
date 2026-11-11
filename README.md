@@ -243,10 +243,12 @@ of 6x **is now explained**: a single thread already reads 19 GB/s and 4 saturate
 the RAM. Speculative decoding stays out: with the engine near the ceiling, the
 numbers still don't add up (ROADMAP §5).
 
-Later on, as a separate project, **QCML** will be born (`.qcml`, under the
-QCBZ brand): an in-house container that stores models trained with tensor
-networks as their cores rather than as dense matrices, so the 0.8.0 savings
-—tables 30.6x smaller— reach the file too (ROADMAP §11).
+Later on, as a separate project, **QCML** will be born (`.qcml`, *Quantum
+Compression for Machine Learning*): an in-house format that aims to **beat GGUF
+in every respect**, measured one aspect at a time. It stores tensor networks
+—the mathematics of quantum states, with no quantum computing involved— as
+their cores rather than as dense matrices, so the 0.8.0 savings —tables 30.6x
+smaller— reach the file too (ROADMAP §11).
 
 ---
 

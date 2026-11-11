@@ -49,7 +49,8 @@ acá va qué cambió, no por qué.
   la especulativa revisada con los números nuevos, que todavía no dan (§5); la
   esparcidad de activaciones, a medir antes de escribir un kernel (§10); capas
   que comparten pesos, para probar entrenando un daiss (§8); y **QCML** (`.qcml`,
-  marca QCBZ), el contenedor propio para modelos con redes de tensores, que va a
+  *Quantum Compression for Machine Learning*), el formato propio que quiere
+  superar a GGUF en todos los aspectos, con redes de tensores nativas, y que va a
   ser un proyecto aparte (§11).
 
 ## [0.8.0] - 2026-11-07

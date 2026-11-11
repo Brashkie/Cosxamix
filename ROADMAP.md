@@ -529,77 +529,122 @@ leer sus pesos, y eso cambia el resultado. Antes de escribir un kernel:
 
 Si el 1 o el 2 no dan, se anota y se cierra, como la especulativa.
 
-### 11. QCML: el contenedor propio, en un proyecto aparte
+### 11. QCML: el formato propio que quiere superar a GGUF, en un proyecto aparte
 
-**QCML** (`.qcml`, *Quantum Compression for Machine Learning*), de la marca
-**QCBZ** (*Quantum Compression Brashkie Zeitsi*), es un formato de archivo binario
-propio para guardar modelos con **redes de tensores**: Tensor-Train / MPS
-primero, y más adelante Tucker y Tensor-Ring. Se va a crear como **un proyecto
-aparte**, sin fecha todavía; Cosxamix sigue optimizando y evolucionando por su
-lado y lo va a leer cuando exista. El nombre viene de que Tensor-Train y MPS
-(*matrix product states*) nacieron en la física cuántica: no hay cómputo
-cuántico, son productos de matrices en la CPU.
+**QCML** (`.qcml`) es un formato de archivo binario propio para guardar modelos
+de lenguaje. Se va a crear como **un proyecto aparte**, sin fecha todavía;
+Cosxamix sigue optimizando y evolucionando por su lado y lo va a leer cuando
+exista. **El objetivo es superar a GGUF en todos los aspectos**, no solo en uno:
+tamaño, carga, memoria, velocidad, precisión, robustez y capacidad de crecer. Y
+como todo acá, "superar" quiere decir **medido contra GGUF sobre los mismos
+modelos**, aspecto por aspecto, no declarado.
 
-**Por qué hace falta, medido.** En la 0.8.0, un daiss-mini con las tablas de
-vocabulario entrenadas en Tensor-Train de rango 32 tiene esas tablas **30,6×
-más chicas** y le gana al modelo sin tokenizador con los mismos parámetros
-(§8 y [DECISIONES](DECISIONES.md) §32). Pero el GGUF guarda las tablas densas,
-reconstruidas: `daiss-mini-8192-tt32-30m.gguf` pesa 35,7 MB, lo mismo que el
-modelo sin Tensor-Train. El ahorro existe en el modelo y se pierde en el archivo.
+#### Qué significa el nombre
+
+**QCML = *Quantum Compression for Machine Learning***, compresión cuántica para
+aprendizaje automático:
+
+- ***Quantum*** (cuántica): por las **redes de tensores**, que nacieron en la
+  física cuántica. El estado de un sistema de muchas partículas tiene un tamaño
+  que crece exponencialmente, y la física lo guarda como una cadena de tensores
+  chicos, un **MPS** (*matrix product state*), donde el *rango de enlace* decide
+  cuánto se guarda. En matemática aplicada la misma estructura se llama
+  **Tensor-Train** (Oseledets, 2011). Una matriz de pesos se puede tratar igual:
+  como un tensor de varios índices, guardado como una cadena de núcleos. **No hay
+  cómputo cuántico**: son productos de matrices en la CPU. El nombre dice de dónde
+  viene la matemática, no que haga falta una computadora cuántica.
+- ***Compression*** (compresión): guardar el mismo modelo en menos bytes,
+  combinando dos cosas que se complementan: **factorizar** (redes de tensores, que
+  quitan redundancia entre filas y columnas) y **cuantizar** (menos bits por
+  valor, como los K-quants que ya hace Cosxamix).
+- ***for Machine Learning*** (para aprendizaje automático): hecho para pesos de
+  modelos —matrices, tablas de vocabulario, normas— y para leerlos mapeados y
+  multiplicar sin copiar, no como un formato de compresión general.
+
+#### Por qué hace falta, medido
+
+En la 0.8.0, un daiss-mini con las tablas de vocabulario entrenadas en
+Tensor-Train de rango 32 tiene esas tablas **30,6× más chicas** y le gana al
+modelo sin tokenizador con los mismos parámetros (§8 y
+[DECISIONES](DECISIONES.md) §32). Pero GGUF solo sabe guardar la matriz:
+`daiss-mini-8192-tt32-30m.gguf` pesa 35,7 MB, lo mismo que el modelo sin
+Tensor-Train. **El ahorro existe en el modelo y se pierde en el archivo.**
 Guardando los núcleos, la estimación —**a medir**— es de 35,7 a ~19,5 MB (−45%)
 con los mismos bits por byte.
 
-**Por qué un contenedor propio y no GGUF.** No es porque GGUF no pueda: GGUF
-guarda tensores de hasta 4 dimensiones y se mapea en memoria con la alineación de
-`general.alignment`. Las razones son tres:
+#### Qué es cierto de GGUF y qué no
 
-1. **un esquema nativo para redes de tensores**: el tipo de factorización (TT,
-   MPS, Tucker, Tensor-Ring), los factores, los rangos `rₖ` y cómo se contrae van
-   en el índice, con validación estricta, y no repartidos en claves sueltas;
-2. **alineación fija a 64 bytes**, la de una línea de caché y la de AVX-512, en
-   todos los bloques de datos y siempre;
-3. **independencia del ecosistema** de llama.cpp: los cambios de su formato o de
-   sus herramientas no rompen nada.
+Para que la comparación sea justa: GGUF **sí** guarda tensores de hasta 4
+dimensiones, **sí** se mapea en memoria sin copiar (`gguf::Pesos` lo hace) y **sí** permite cambiar la alineación con `general.alignment`. QCML no
+gana por eso. Gana, o tiene que ganar, en lo de la tabla de abajo.
 
-**La estructura propuesta**, en *little endian*:
+#### Aspecto por aspecto: dónde GGUF se queda corto y cómo se mide
 
-- la marca `QCML` (`0x51 0x43 0x4D 0x4C`), la versión y la alineación;
-- una cabecera de 64 bytes con cuántos metadatos y tensores hay y dónde empiezan
-  el índice y los datos;
-- la tabla de metadatos;
-- el índice, alineado a 64: por tensor, su nombre, sus dimensiones, si va denso
-  (cuantizado como en GGUF) o como red de tensores, y en ese caso sus factores,
-  rangos y dónde está cada núcleo;
-- los datos contiguos, cada bloque alineado a 64, para mapearlos y leerlos sin
-  copiar.
+| aspecto | GGUF hoy | QCML | cómo se mide |
+|---|---|---|---|
+| **redes de tensores** | no tiene cómo describirlas: solo matrices | Tensor-Train / MPS nativo, después Tucker y Tensor-Ring, con factores y rangos en el índice | tamaño y bits por byte, mismo modelo |
+| **llegar a un tensor** | el índice de tensores va **después** de los metadatos: en un Qwen hay que recorrer **5,96 MB** de cabecera, 5,93 de ellos el tokenizador en texto, para leer un índice de 24,8 KB (medido) | cabecera fija de 64 bytes que dice dónde empieza el índice; índice ordenado para buscar por nombre sin recorrer todo | tiempo de abrir y de encontrar un tensor |
+| **tokenizador** | 151.936 tokens, sus 151.936 tipos y 151.387 *merges* como valores sueltos de los metadatos | en una sección propia y compacta, que se lee solo si se usa | bytes y tiempo de carga |
+| **alineación** | 32 por defecto, configurable | fija a 64 bytes en todo bloque: una línea de caché y un registro de AVX-512 | — (por construcción) |
+| **integridad** | sin sumas de comprobación: un archivo corrupto se detecta, si se detecta, generando basura | una suma por tensor (por ejemplo xxHash o CRC32C), verificable bajo pedido | detectar un byte cambiado a propósito |
+| **validación** | formas y tipos se comprueban afuera, en cada lector | esquema estricto: el índice dice tamaños, y el lector rechaza lo que no cuadra antes de mapear | tests con archivos rotos a propósito |
+| **disposición para los kernels** | bloques en el orden del formato; llama.cpp los reordena al cargar para algunas CPU | puede guardar los bloques ya intercalados para el kernel que los va a leer, sin reordenar al cargar | tiempo de carga y tok/s |
+| **dimensiones** | hasta 4 | sin ese tope para los núcleos | — |
+| **ecosistema** | atado a cambios de llama.cpp | propio, versionado, con su especificación | — |
 
-**Lo que promete y lo que no.** Sirve para modelos **entrenados** con esas capas
-en redes de tensores, donde la cadena es el modelo. **No sirve para comprimir un
-modelo que ya existe**: cortar las tablas de un daiss entrenado después lo empeora
-0,6-1,25 bits por byte, contra +0,004 de Q2_K (§32), y en el Qwen `output.weight`
-necesita el 28,6% del rango para el 47,5% de la energía (§6). El "50-70% menos
-sin perder precisión" de los papers no se cumple con pesos ya entrenados; el
-convertidor tiene que negarse cuando el corte no es exacto.
+Y lo que QCML **no puede empeorar**: con un modelo denso, cuantizado igual, tiene
+que dar el mismo tamaño, la misma velocidad y los mismos bytes de pesos que el
+GGUF. Si en algo queda peor, se anota y se corrige antes de decir que lo supera.
 
-**Los pasos:**
+#### La estructura propuesta
 
-1. el formato, con su lector y su escritor, reconstruyendo las matrices al cargar,
-   y medir tamaño, tiempo de carga y bits por byte contra el GGUF;
-2. multiplicar directamente desde los núcleos, sin la matriz densa: una fila de
-   embeddings contrayendo la cadena, y los logits multiplicando por ella. Medir
-   velocidad y RAM contra la tabla densa en Q8_0 y Q2_K;
-3. los kernels de contracción en Rust, Zig, C y ensamblador, como todos (regla
-   3).
+En *little endian*:
 
-**Ideas para después, sin medir:**
+1. la marca `QCML` (`0x51 0x43 0x4D 0x4C`);
+2. una cabecera fija de 64 bytes: versión, alineación, cuántos metadatos y
+   tensores hay, y dónde empiezan el índice, los datos y el tokenizador;
+3. la tabla de metadatos, con tipos;
+4. el índice de tensores, alineado a 64: por tensor, su nombre, sus dimensiones,
+   su tipo, si va denso —cuantizado como en GGUF— o como red de tensores, y en ese
+   caso la factorización, los factores, los rangos y dónde está cada núcleo; más
+   su tamaño y su suma de comprobación;
+5. el tokenizador, en su sección;
+6. los datos contiguos, cada bloque alineado a 64, para mapearlos y leerlos sin
+   copiar.
 
-- **el plan de contracción en la cabecera**: el orden en que se multiplican los
-  núcleos decide los FLOPs y la memoria temporal; en una cadena de 4 núcleos es
-  obvio, pero en Tucker o Tensor-Ring vale guardarlo calculado;
-- **una factorización por tipo de capa**: Tensor-Train en el vocabulario, Tucker
+#### Lo que promete y lo que no
+
+Las redes de tensores sirven para modelos **entrenados** con esas capas así,
+donde la cadena es el modelo. **No sirven para comprimir un modelo que ya
+existe**: cortar las tablas de un daiss entrenado después lo empeora 0,6-1,25
+bits por byte, contra +0,004 de Q2_K (§32), y en el Qwen `output.weight` necesita
+el 28,6% del rango para el 47,5% de la energía (§6). El "50-70% menos sin perder
+precisión" de los papers no se cumple con pesos ya entrenados, así que el
+convertidor desde GGUF guarda en red de tensores solo lo que se corta sin error,
+y el resto lo guarda denso. Con un modelo como el Qwen, QCML gana en todo lo de
+la tabla salvo en el tamaño de los pesos, donde empata.
+
+#### Los pasos
+
+1. **El formato**: la especificación, el lector y el escritor, y el convertidor
+   desde GGUF. Medir contra GGUF, sobre los mismos modelos: tamaño, tiempo de
+   abrir, RAM y bits por byte.
+2. **Reconstruir al cargar** las matrices de las redes de tensores, y medir.
+3. **Multiplicar directamente desde los núcleos**, sin la matriz densa: una fila
+   de embeddings contrayendo la cadena, y los logits multiplicando por ella.
+   Medir velocidad y RAM contra la tabla densa en Q8_0 y Q2_K.
+4. **Los kernels de contracción** en Rust, Zig, C y ensamblador, como todos
+   (regla 3).
+
+#### Ideas para después, sin medir
+
+- **El plan de contracción en la cabecera**: el orden en que se multiplican los
+  núcleos decide los FLOPs y la memoria temporal. En una cadena de 4 núcleos es
+  obvio, pero en Tucker o Tensor-Ring vale guardarlo calculado.
+- **Una factorización por tipo de capa**: Tensor-Train en el vocabulario, Tucker
   en la atención, Tensor-Ring en el FFN, y las capas sensibles sin comprimir. Por
-  lo de §32, solo vale entrenando así;
-- **un núcleo compartido entre capas**, con un adaptador por capa: es el punto 7
+  lo de §32, solo vale entrenando así.
+- **Un núcleo compartido entre capas**, con un adaptador por capa: es el punto 7
   de §8.
 
 ## Decidido y cerrado
