@@ -154,6 +154,8 @@ Environment variables:
 | `RAYON_NUM_THREADS` | physical cores | Threads for the matrix math |
 | `COSXAMIX_MOTOR` | `propio` | The in-house engine and its kernels: 1.6-1.9x faster than candle per message as WinsiBot uses it, and 11/15 vs 10/15 on the battery ([DECISIONES §23](DECISIONES.md)). `candle` goes back to the old one |
 | `COSXAMIX_SIN_BLOQUES`, `COSXAMIX_SIN_Q6K_FUSIONADO`, `COSXAMIX_SIN_VARIAS`, `COSXAMIX_SIN_PRESTAMO` | unset | Each one turns off a 0.7.0 optimization —the blocked prefill matmul, the Q6_K kernel, q-k-v in one pass, the prefix shared across conversations— to measure with and without it ([DECISIONES §24-26](DECISIONES.md)) |
+| `COSXAMIX_PRECARGA` | `2` | Rows ahead that the decode asks the cache for while it computes one; `0` turns it off ([DECISIONES §33](DECISIONES.md)) |
+| `COSXAMIX_SIN_Q5K_FUSIONADO` | unset | Turns off the Q5_K fused kernel, to measure with and without it ([DECISIONES §34](DECISIONES.md)) |
 
 **Every `.gguf` in the directory is registered**, not only the one in
 `COSXAMIX_GGUF`: that variable says which one is pre-warmed, not which one
@@ -233,14 +235,13 @@ order set by how much it moves latency, not by how interesting it is to write.
 
 In short: **reading the prompt** is now 1.7x faster than in 0.6.0, and the
 start of the *system* prompt is read once for every chat (0.7.0).
-**Generation** runs at ~66% of what RAM delivers streaming the same bytes, and
-what's left there is as much compute as memory ([DECISIONES
-§25](DECISIONES.md)). In the reference measurement the engine was at **51% of
-this machine's memory-bandwidth ceiling**, meaning there's less than 2x left
-to win here. Why 6 cores yield 2.6x instead
-of 6x **is now explained**: the matrices that don't fit in the 12 MB of L3
-don't scale, and they are 89% of the weights. It's the memory wall, and more
-threads won't fix it — which is exactly what killed speculative decoding.
+**Generation** runs at **~81-87% of the measured memory ceiling** (~30 GB/s,
+DDR4-2133), with the row prefetch of 0.9.0 ([DECISIONES §33](DECISIONES.md));
+the 51% quoted before was computed against a ceiling this RAM cannot deliver.
+What's left is small and lives in the kernels. Why 6 cores yield 2.6x instead
+of 6x **is now explained**: a single thread already reads 19 GB/s and 4 saturate
+the RAM. Speculative decoding stays out: with the engine near the ceiling, the
+numbers still don't add up (ROADMAP §5).
 
 ---
 
@@ -568,7 +569,8 @@ cargo run --release --features candle --example compare_models -- --cuant
 #### Parallelism: how many cores it really uses
 
 The theoretical ceiling on CPU is `RAM bandwidth / model size`. With an
-i5-10400 and dual-channel DDR4 that's ~40 GB/s over 0.47 GB: **~85 tokens/s**.
+i5-10400 and dual-channel DDR4-2133 that's ~30 GB/s measured over 0.47 GB:
+**~64 tokens/s**.
 
 Measured separating prefill from decode — two runs with the same prompt and a
 different token count, so prefill cancels out in the subtraction:

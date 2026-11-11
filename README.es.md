@@ -148,6 +148,8 @@ Variables de entorno:
 | `RAYON_NUM_THREADS` | núcleos físicos | Hilos del cálculo matricial |
 | `COSXAMIX_MOTOR` | `propio` | El motor de la casa y sus kernels: 1,6-1,9x más rápido que candle por mensaje en el uso de WinsiBot, y 11/15 contra 10/15 en la batería ([DECISIONES §23](DECISIONES.md)). `candle` vuelve al de antes |
 | `COSXAMIX_SIN_BLOQUES`, `COSXAMIX_SIN_Q6K_FUSIONADO`, `COSXAMIX_SIN_VARIAS`, `COSXAMIX_SIN_PRESTAMO` | sin definir | Cada una apaga una optimización de la 0.7.0 —la matmul por bloques del prefill, el kernel de Q6_K, q-k-v en una pasada, el prefijo entre conversaciones—, para medir con y sin ella ([DECISIONES §24-26](DECISIONES.md)) |
+| `COSXAMIX_PRECARGA` | `2` | Cuántas filas por delante pide el decode a la caché mientras calcula una; `0` la apaga ([DECISIONES §33](DECISIONES.md)) |
+| `COSXAMIX_SIN_Q5K_FUSIONADO` | sin definir | Apaga el kernel fusionado de Q5_K, para medir con y sin él ([DECISIONES §34](DECISIONES.md)) |
 
 **Todos los `.gguf` del directorio se registran**, no solo el de
 `COSXAMIX_GGUF`: esa variable dice cuál se precalienta, no cuál es el único
@@ -227,14 +229,13 @@ puesto por cuánto mueve la latencia, no por cuán interesante es de programar.
 
 En resumen: **leer el prompt** ya va 1,7x más rápido que en la 0.6.0, y el
 comienzo del *system* se lee una sola vez para todos los chats (0.7.0).
-**Generar** va a ~66% de lo que da la RAM recorriendo los mismos bytes, y lo
-que queda ahí es casi tanto de cálculo como de memoria ([DECISIONES
-§25](DECISIONES.md)). En la medición de referencia, el motor estaba al **51%
-del techo de ancho de banda**, o sea que queda menos de 2x por ganar acá. Que de 6 núcleos salgan
-2,6x en vez de 6x **ya tiene explicación**: las matrices que no entran en los
-12 MB de L3 no escalan, y son el 89% de los pesos. Es el muro de memoria, y
-más hilos no lo arreglan — que es exactamente lo que mató a la decodificación
-especulativa.
+**Generar** está al **~81-87% del techo de memoria** medido (~30 GB/s,
+DDR4-2133), con la precarga de la 0.9.0 ([DECISIONES §33](DECISIONES.md)); el
+51% que se decía antes se calculaba contra un techo que esta RAM no puede dar. Lo
+que queda es poco y está en los kernels. Que de 6 núcleos salgan 2,6x en vez de
+6x **ya tiene explicación**: un hilo solo lee 19 GB/s y con 4 la RAM se satura.
+La decodificación especulativa sigue fuera: con el motor cerca del techo, la
+cuenta todavía no da (ROADMAP §5).
 
 ---
 
@@ -557,7 +558,8 @@ cargo run --release --features candle --example compare_models -- --cuant
 #### Paralelismo: cuántos núcleos usa de verdad
 
 El techo teórico en CPU es `ancho de banda de RAM / tamaño del modelo`. Con un
-i5-10400 y DDR4 de doble canal son ~40 GB/s sobre 0,47 GB: **~85 tokens/s**.
+i5-10400 y DDR4-2133 de doble canal son ~30 GB/s medidos sobre 0,47 GB:
+**~64 tokens/s**.
 
 Medido separando prefill de decode —dos corridas con el mismo prompt y distinta
 cantidad de tokens, para que el prefill se cancele al restar:

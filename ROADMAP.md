@@ -12,23 +12,27 @@ borra. Ya borró la decodificación especulativa.
 
 ## Dónde estamos, medido
 
-Máquina de referencia: i5-10400 (6 núcleos / 12 hilos, AVX2), DDR4-2666 doble
-canal, **~37,5 GB/s** reales. Sin GPU en el camino.
+Máquina de referencia: i5-10400 (6 núcleos / 12 hilos, AVX2), DDR4-2133 doble
+canal: 34,1 GB/s teóricos y **~30 GB/s medidos** (`examples/measure_ceiling.rs`,
+DECISIONES §33). Sin GPU en el camino.
 
 | | |
 |---|---|
 | modelo | Qwen2.5-3B-Instruct Q3_K_M, 1644 MB |
 | residente | 1687 MB (x1,03 del archivo) |
-| generación | ~11,9 tok/s |
+| generación | ~14,7 tok/s (con la precarga de la 0.9.0) |
 | lectura del prompt | ~50 tok/s (333 tokens en 6,6 s, matmul por bloques) |
-| **del techo de memoria** | **51%** |
+| **del techo de memoria** | **~81%** (`30 ÷ 1,644 = 18,2 tok/s`) |
 | calidad | 10/15 preguntas verificables |
 | sesiones concurrentes | 16, caché LRU, intercalar no cuesta nada |
 | plataformas con kernel vectorizado | x86-64 (AVX2) y ARM/Android (Zig) |
 
-El techo es `tokens/s ≈ ancho de banda / tamaño del modelo`. Al 51%, lo que
-queda por ganar en esta máquina **es menos de 2x**, y hace falta cerrar la brecha
-de cómputo para cobrarlo.
+El techo es `tokens/s ≈ ancho de banda / tamaño del modelo`. El 51% que decía
+esta tabla se calculaba contra 37,5 GB/s, que esta RAM no puede dar; con el techo
+medido, y la precarga, el decode está al **~81-87%** según el formato
+([DECISIONES](DECISIONES.md) §33). Lo que queda en esta máquina es poco y está en
+los kernels de Q4_K y Q6_K. **La mejora más grande ya no es de software**: con la
+RAM a 2666 (XMP), el techo sube un 25%.
 
 ---
 
@@ -157,6 +161,21 @@ estas dos, y las dos son verificables:
 El código se puede recuperar del historial; `truncar_cache` y la máscara con
 caché, que eran lo difícil, ya están en el árbol.
 
+**Revisado en la 0.9.0: la condición 1 se cumplió y la cuenta todavía no da.** El
+decode está al ~81-87% del techo, pero eso no hace barato verificar `K`
+posiciones: el prefill, que ya va por bloques, cuesta ~26 ms por token en el 3B
+(256 en 6,6 s) contra ~68 ms un token de decode. Verificar 4 cuesta entonces al
+menos ~1,5 tokens de decode. Con el 0,5B aceptado el 40% —en el medio del 28-50%
+medido—, cada verificación deja `(1 − 0,4⁵) / (1 − 0,4) ≈ 1,65` tokens, y los 4
+del borrador cuestan ~1 token más del 3B. **Es una estimación, no una medición**:
+~2,5-2,7 tokens de costo por 1,65 de avance, más lento. Lo que la cambiaría, y hay que
+medir antes de escribir código:
+
+- cuánto cuesta de verdad el forward con `K` = 2, 4 y 5 posiciones en el motor
+  propio, que no es el de candle con el que se midió la tabla del README;
+- un borrador que acierte mucho más: un daiss entrenado para imitar al 3B, o
+  *n*-gramas del mismo prompt, que no cuestan casi nada.
+
 ### 6. Redes de tensores (MPS / Tensor-Train)
 
 **Medido, y el resultado reordena el punto.** `examples/measure_rank.rs` dice
@@ -177,6 +196,11 @@ Así que el punto queda dividido:
   los logits y no en la energía, porque energía de Frobenius no es precisión;
 - **nada de esto se aplica a daiss hasta que esté entrenado**, y eso ya no es
   una opinión.
+
+Después, en la 0.8.0 (§32): **cortar después pierde**, también en las tablas de
+vocabulario (lo que TensorGPT promete sin reentrenar), y **entrenar desde el
+principio con las tablas en Tensor-Train gana**. Guardar los núcleos en un
+contenedor propio, en vez de las tablas densas, va a ser un proyecto aparte.
 
 El detalle y el control de ruido de cuantización, en
 [DECISIONES](DECISIONES.md) §12.
@@ -304,8 +328,8 @@ búsqueda**: el transformer sería el 13% de los parámetros. Así que el orden 
    ([DECISIONES](DECISIONES.md) §32).
 
 **Chavín** existe desde la versión sin publicar: `chavin-30b`, 29,5B, 9,02 GB en
-Q2_K, escrito, leído por candle y corriendo a 2,38 tok/s, el 57% del techo de
-memoria, con pesos al azar ([DECISIONES](DECISIONES.md) §29 y §30). Lo que sigue,
+Q2_K, escrito, leído por candle y corriendo a 2,38 tok/s, el 71% del techo de
+memoria medido (§33), con pesos al azar ([DECISIONES](DECISIONES.md) §29 y §30). Lo que sigue,
 en orden:
 
 1. ~~**Bytes contra BPE, con más tiempo**~~ **hecho a 30 minutos**: BPE 8.192 da 1,77
@@ -313,14 +337,19 @@ en orden:
    contexto parejo con la CPU libre, y probar más tiempo.
 2. ~~**Embeddings en Tensor-Train**~~ **hecho en la 0.8.0** (§32): cortado después
    pierde; entrenado desde el principio, con rango 32, le gana al modelo sin
-   tokenizador con los mismos parámetros. Queda **guardar los núcleos en el GGUF**
-   y reconstruir al cargar, para que el archivo también se achique.
+   tokenizador con los mismos parámetros. Guardar los núcleos en el archivo, para
+   que también se achique, va a ser un proyecto aparte.
 3. ~~**Servir un daiss entrenado**~~ **hecho en la 0.8.0**: el motor lee
    `cosxamix.tokenizer.merges` y, sin plantilla de chat, continúa el texto.
 4. **Un kernel de entrenamiento propio**: repartir el lote da 2,5× en 6 núcleos.
 5. **Medir el kernel de Q2_K en Zig en un ARM sin `sdot`**, que es donde se usa.
 6. **Kernels para el cuantizador**: escribir Chavín son 14,5 minutos y casi todo
    es la búsqueda de Q2_K, 115 ms por millón de valores contra 20 de Q3_K.
+7. **Capas que comparten pesos**: un núcleo común a todas las capas y un
+   adaptador chico por capa, como proponen SCADA-Tucker y Minima. Cortarlo después
+   en un modelo entrenado casi seguro pierde, como el Tensor-Train; lo que se
+   puede probar es **entrenar** un daiss-mini así y comparar bits por byte con los
+   mismos parámetros.
 
 ### 9. El motor propio, reemplazando candle pieza por pieza
 
@@ -481,6 +510,23 @@ más barata de saber si está bien.
 Y es donde el ensamblador deja de competir contra un bucle que LLVM ya
 vectoriza: en la matmul cuantizada propia el bucle caliente es **nuestro**, y
 ahí sí se puede probar AVX-512, que candle no usa.
+
+### 10. Esparcidad de las activaciones: medir antes de escribir
+
+La entrada de `ffn_down` es `silu(gate) · up`. Los papers dicen que el 50-70% es
+cero, pero **SiLU no da ceros exactos**: eso es de ReLU. Lo que se puede hacer es
+tratar como cero lo que está bajo un umbral (TEAL), saltar esas columnas y no
+leer sus pesos, y eso cambia el resultado. Antes de escribir un kernel:
+
+1. medir, en el Qwen 3B, qué fracción de esa entrada queda bajo cada umbral, capa
+   por capa;
+2. medir cuánto cuesta en precisión con la infraestructura de KL de
+   `measure_precision`, saltando de verdad esas columnas;
+3. si el costo es chico, resolver el formato: los pesos van por filas en bloques
+   de 256, así que saltar columnas pide guardar `ffn_down` traspuesta o en
+   bloques por columna.
+
+Si el 1 o el 2 no dan, se anota y se cierra, como la especulativa.
 
 ## Decidido y cerrado
 

@@ -42,6 +42,42 @@ use rayon::prelude::*;
 /// aguja, pero tampoco cuesta nada.
 const COLUMNAS_MINIMAS: usize = 32;
 
+/// Cuántas filas por delante se piden a la caché mientras se calcula una:
+/// 2, o lo que diga `COSXAMIX_PRECARGA` (0 la apaga).
+///
+/// Medido con `measure_ceiling`, alternando 6 rondas sobre el Qwen 3B: el
+/// decode gana 2-7% en Q4_K, 10% en Q3_K y 14% en Q2_K, y el prefill no cambia.
+/// Gana más donde el kernel calcula más por byte, que es cuando el núcleo deja
+/// de pedir datos. Con 4 filas da lo mismo o un poco menos (DECISIONES §33).
+fn filas_de_precarga() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COSXAMIX_PRECARGA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// Pide a la caché las líneas de `bytes` sin esperarlas. Mientras un núcleo
+/// calcula deja de pedir datos, y el prefetcher del hardware se detiene en cada
+/// borde de página de 4 KB: esto le adelanta el trabajo.
+#[inline(always)]
+fn precargar(bytes: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    for linea in bytes.chunks(64) {
+        // SAFETY: `prefetcht0` es SSE, que todo x86-64 tiene, y nunca falla:
+        // una dirección inválida se ignora. Esta además es válida.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                linea.as_ptr().cast(),
+            )
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = bytes;
+}
+
 /// `dst[m, n] = lhs[m, k] · W[n, k]ᵀ`.
 ///
 /// `pesos` son los bytes crudos del tensor, tal cual salen del GGUF: `n` filas
@@ -408,6 +444,7 @@ pub fn matmul_i8_fusionado(
     // cubre todos.
     let (sub, bytes_bloque) = match tipo {
         TipoGgml::Q4K => (32usize, 144usize),
+        TipoGgml::Q5K => (32, 176),
         TipoGgml::Q3K => (16, 110),
         TipoGgml::Q6K => (16, 210),
         TipoGgml::Q2K => (16, 84),
@@ -452,15 +489,22 @@ pub fn matmul_i8_fusionado(
         .enumerate()
         .for_each(|(tramo, destino)| {
             let primera = tramo * COLUMNAS_MINIMAS;
+            let adelante = filas_de_precarga();
+            let total = destino.len() / m;
             for (j, salida) in destino.chunks_mut(m).enumerate() {
                 let desde = (primera + j) * bytes_fila;
                 let fila = &pesos[desde..desde + bytes_fila];
+                if adelante > 0 && j + adelante < total {
+                    let otra = desde + adelante * bytes_fila;
+                    precargar(&pesos[otra..otra + bytes_fila]);
+                }
                 for (f, s) in salida.iter_mut().enumerate() {
                     let xq = &lhs_q[f * k..(f + 1) * k];
                     let xe = &lhs_esc[f * n_bloques..(f + 1) * n_bloques];
                     let xs = &lhs_suma[f * n_bloques..(f + 1) * n_bloques];
                     *s = match tipo {
                         TipoGgml::Q4K => crate::kernels::dot_q4k_i8(fila, xq, xe, xs),
+                        TipoGgml::Q5K => crate::kernels::dot_q5k_i8(fila, xq, xe, xs),
                         TipoGgml::Q6K => crate::kernels::dot_q6k_i8(fila, xq, xe, xs),
                         TipoGgml::Q2K => crate::kernels::q2k::dot(fila, xq, xe, xs),
                         _ => crate::kernels::dot_q3k_i8(fila, xq, xe, xs),
@@ -801,8 +845,14 @@ fn hay_fusionado(tipo: TipoGgml, k: usize) -> bool {
         crate::kernels::q2k::elegida() != crate::kernels::q2k::Copia::Escalar
             && std::env::var_os("COSXAMIX_SIN_Q2K_FUSIONADO").is_none()
     });
+    // `COSXAMIX_SIN_Q5K_FUSIONADO`, lo mismo con Q5_K.
+    static Q5K_FUSIONADO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let q5k = *Q5K_FUSIONADO.get_or_init(|| {
+        crate::kernels::usar_avx2() && std::env::var_os("COSXAMIX_SIN_Q5K_FUSIONADO").is_none()
+    });
     (matches!(tipo, TipoGgml::Q4K | TipoGgml::Q3K)
         || (tipo == TipoGgml::Q6K && q6k)
+        || (tipo == TipoGgml::Q5K && q5k)
         || (tipo == TipoGgml::Q2K && q2k))
         && k.is_multiple_of(256)
 }
@@ -905,10 +955,18 @@ pub fn matmul_varias_una_fila(
         let fila = |j: usize| &bytes[(primera + j) * bytes_fila..(primera + j + 1) * bytes_fila];
 
         if hay_fusionado(tipo, k) {
+            let adelante = filas_de_precarga();
+            let total = salida.len();
             for (j, s) in salida.iter_mut().enumerate() {
+                if adelante > 0 && j + adelante < total {
+                    precargar(fila(j + adelante));
+                }
                 *s = match tipo {
                     TipoGgml::Q4K => {
                         crate::kernels::dot_q4k_i8(fila(j), &e.q, &e.escalas, &e.sumas)
+                    }
+                    TipoGgml::Q5K => {
+                        crate::kernels::dot_q5k_i8(fila(j), &e.q, &e.escalas, &e.sumas)
                     }
                     TipoGgml::Q6K => {
                         crate::kernels::dot_q6k_i8(fila(j), &e.q, &e.escalas, &e.sumas)

@@ -2073,6 +2073,9 @@ Las medidas de `chavin-30b` salen del hardware y no de un modelo ajeno:
 | techo de memoria, `37,5 GB/s ÷ 9,02 GB` | 4,2 tok/s |
 | **del techo** | **57%** |
 
+> Corregido en §33: la RAM entrega ~30 GB/s y no 37,5. El techo es 3,3 tok/s, y
+> 2,38 es el **71%**.
+
 Q2_K porque es lo que entra: con 15,8 GB de RAM, Q3_K deja 4 GB para todo lo demás
 y Q8_0 no entra. Corre, y la máquina se mantuvo estable. Pide que haya memoria
 libre: con 6,1 GB, el primer paso tardó 127 s trayendo páginas del disco.
@@ -2268,6 +2271,186 @@ un vocabulario grande. Y el GGUF todavía guarda las tablas densas (34 MB): guar
 los núcleos y reconstruir al cargar es lo que haría falta para que el archivo también
 se achique.
 
+## 33. El techo de verdad, y dónde se pierde
+
+La pregunta era si Cosxamix llega al límite del hardware. La cuenta de siempre,
+`37,5 GB/s ÷ tamaño`, decía que el decode estaba al 51-66%. Antes de optimizar se
+midió el techo, y estaba mal: **la RAM corre a DDR4-2133** —lo dice Windows, en los
+dos módulos—, cuyo máximo teórico es `2133 × 8 bytes × 2 canales = 34,1 GB/s`. El
+"37,5 reales" del ROADMAP era imposible en esta máquina.
+
+`examples/measure_ceiling.rs` mide en cuatro escalones, y lo que se pierde entre
+dos tiene un solo culpable. Qwen 3B Q4_K_M, 1,92 GB por token, dos corridas:
+
+| hilos | RAM | pesos de un tirón | por grupos (145 sincr.) | forward | tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 19,0 | 18,0 | 17,9 | 10,9 | 5,7 |
+| 2 | 24,3 | 23,7 | 23,9 | 19,2 | 10,0 |
+| 4 | 29,0 | 28,7 | 28,3 | 23,2 | 12,1 |
+| **6** | **30,0** | **30,0** | **29,3** | **24,4** | **12,7** |
+| 12 | 29,3 | 28,7 | 28,4 | 24,0 | 12,5 |
+
+En GB/s de pesos. Tres cosas que se creían y no eran:
+
+- **El mapeo no cuesta nada**: leer los pesos da lo mismo que leer un búfer.
+- **Sincronizar los hilos cuesta el 2%** (30,0 → 29,3), con la misma cantidad de
+  pasadas paralelas que el forward. Un pool de hilos persistente con una
+  sincronización por capa —la propuesta obvia, y la nuestra— ganaría eso como
+  mucho, así que no se hace.
+- **"6 núcleos rinden como 2,6" no era un problema de hilos**, como decía "Lo que
+  no se pudo explicar": un hilo solo ya lee 19 GB/s y con 4 la RAM se satura.
+
+Lo que se pierde está entre "por grupos" y el forward, 17%, y `measure_decode`
+dice que lo que no es multiplicar cuesta ~0%: **está dentro de los kernels**. Con
+un hilo se ve mejor: el kernel procesa 10,9 GB/s y el hilo podría leer 18. Mientras
+un núcleo calcula deja de pedir datos, y el prefetcher del hardware se detiene en
+cada borde de página de 4 KB.
+
+### La precarga de filas
+
+Si es eso, pedir la fila siguiente mientras se calcula la actual tiene que ayudar.
+`ops::precargar` emite un `prefetcht0` por línea de la fila que viene `D` filas más
+adelante, en los dos caminos del decode. Medirlo costó: con el navegador y un video
+abiertos la RAM daba entre 19 y 28 GB/s de una corrida a otra, así que se alternó
+seis rondas, cambiando el orden en cada una, y se comparan medianas:
+
+| | sin precarga | 2 filas | 4 filas |
+|---|---:|---:|---:|
+| Q4_K_M | 11,90 tok/s | 12,15 (+2%) | 12,25 (+3%) |
+| Q3_K_M | 13,40 | **14,70 (+10%)** | 14,45 (+8%) |
+| Q2_K | 14,20 | **16,25 (+14%)** | 15,70 (+11%) |
+
+Con la máquina quieta, Q4_K_M había dado +7% (24,5 → 26,2 GB/s). **Gana más
+donde el kernel calcula más por byte**, que es lo que la hipótesis predice: Q2_K
+desempaqueta más por cada byte que trae. Queda en 2 filas, y `COSXAMIX_PRECARGA=0`
+la apaga. El prefill no cambia (6,61 contra 6,60 s con 256 tokens) y el texto
+generado es el mismo, byte a byte: precargar no toca ningún resultado.
+
+### Dónde queda
+
+Contra el techo medido de ~30 GB/s, el decode del 3B Q4_K_M pasa del ~82% al
+~85-87%. Los motores más trabajados quedan en el 75-85%. Chavín, a 2,38 tok/s antes
+de la precarga, estaba al 71% de `30 ÷ 9,02 = 3,3 tok/s`, y no al 57%.
+
+Lo que queda es poco y está en los kernels de Q4_K y Q6_K. El 12% del token es la
+matriz de salida, en Q6_K. Y con la RAM a 2133, **la mejora más grande no es de
+software**: si los módulos admiten 2666 (XMP en la BIOS), el techo sube un 25%.
+
+## 34. El kernel de Q5_K
+
+Después de §33 quedaba ver qué kernel seguía por debajo de la RAM. Medirlo dentro
+del forward mezcla todo, así que `measure_ceiling` ganó otra medida: ~1 MB de filas
+de cada formato, en caché, con un hilo. Es lo que el kernel procesa cuando la RAM no
+lo frena, su techo de cálculo. Con 64 filas, el costo fijo de cada llamada tapaba al
+kernel y Q4_K parecía hacer 6,6 GB/s; con 1 MB hace 9,5-11.
+
+| formato | GB/s en caché, 1 hilo |
+|---|---:|
+| Q6_K | 10,4-14,1 |
+| Q4_K | 9,5-11,7 |
+| Q3_K | 6,8-8,0 |
+| Q2_K | 7,3 |
+| **Q5_K** | **3,0** |
+
+**Q5_K no tenía kernel fusionado**: desempaquetaba cada fila a un búfer, que es
+justo lo que §30 le había quitado a Q2_K. Con 6 hilos no llegaba a 18 GB/s, lejos de
+los 30 de la RAM, así que un modelo Q5_K_M —de los más usados— estaba limitado por
+cálculo. En los Qwen que usa el bot casi no aparece (2 matrices en el Q3_K_M), y por
+eso no se había visto.
+
+Q5_K es Q4_K con un bit más: el mismo encabezado de 16 bytes, 32 bytes `qh` con el
+quinto bit de cada valor y los mismos 128 de nibbles. El kernel es el de Q4_K con
+tres operaciones por mitad —`and` contra la máscara del bit, `cmpeq`, `and` con 16—
+y un `or` antes de `vpmaddubsw`, más un segundo acumulador. En caché pasa de 3,0 a
+**10-11 GB/s**, a la par de Q4_K.
+
+De punta a punta hizo falta un modelo que fuera casi todo Q5_K, y no había: se
+recuantizó el Qwen 3B a Q5_K con `requantize`. Sale de un Q4_K_M, así que sirve para
+medir velocidad y no calidad. Con el motor propio, 6 hilos y tres rondas alternadas:
+
+| | tok/s |
+|---|---:|
+| con búfer | 5,15-5,43 |
+| **fusionado** | **9,03-9,18** |
+
+**1,71×.** Una medición intermedia no mostró nada, y la causa fue el binario de
+`measure_generation`, que no se había recompilado: con y sin la variable corría el
+mismo código. Queda anotado porque "no cambia nada" era una conclusión a un paso.
+
+**El texto se separa a la palabra 16, y el que se aparta es el camino viejo.** El
+kernel suma en otro orden, y con temperatura 0 un empate casi exacto puede ir para
+cualquier lado. Para saber cuál de los dos se equivoca se generó con
+`COSXAMIX_MATMUL=f32`, que no cuantiza la entrada: da **exactamente** el texto del
+kernel nuevo. El test de los kernels fusionados cubre Q5_K, y una mutación —las
+máscaras de los dos bits cruzadas— lo hace fallar.
+
+### En los otros lenguajes
+
+Por la regla 3 se escribió en todos (`src/kernels/q5k.rs`, `COSXAMIX_Q5K`). El
+ensamblador (`scripts/gen_q5k_asm.py`) y el C prueban además otra forma de armar el
+quinto bit: correr `qh` hasta que el bit `j` quede en la posición 4 y aislarlo con un
+solo `and 0x10`, dos instrucciones donde los intrínsecos usan tres. Una fila en caché,
+con `examples/measure_q5k.rs`:
+
+| | fila de 11.008 | fila de 2.048 |
+|---|---:|---:|
+| con búfer, antes | 4,0 GB/s | 3,9 GB/s |
+| **Rust con AVX2** | **17,0 (4,27×)** | **16,4 (4,19×)** |
+| ensamblador | 16,4 (4,10×) | 14,8 (3,78×) |
+| C | 15,8 (3,95×) | 14,7 (3,76×) |
+| Zig | 3,2 (0,81×) | 3,2 (0,81×) |
+| referencia en Rust | 2,5 | 2,5 |
+
+**Gana Rust, y el truco no**: una instrucción menos por sub-bloque no movió nada,
+porque el cuello no es la cantidad de operaciones con enteros. El ensamblador queda a
+un 4-10% y C a un 7-10%, que es la misma distancia que en Q2_K. **Zig, escrito simple,
+pierde contra el búfer** en x86 —suma a 16 bits con `@reduce`, sin `vpmaddubsw`—, y
+como el fusionado de Q5_K solo se usa con AVX2, en ARM hoy tampoco se elige: es el
+punto de partida para cuando se mida un ARM sin `sdot`.
+
+Las cinco copias pasan el mismo test, y una mutación en el ensamblador —el corrimiento
+de un solo sub-bloque, 3 en vez de 2— lo hace fallar.
+
+## 35. Q3_K por hilo: medido por partes, y no queda más sin perder precisión
+
+Q3_K procesa ~10 GB/s por hilo en caché, contra ~14 de Q4_K, y el decode del
+Q3_K_M queda un poco más lejos de la RAM que el de Q4_K_M. Antes de tocar el kernel
+se midió por partes, que es la lección de §24: `examples/measure_q3k_parts.rs` copia
+el kernel y le quita una cosa por vez (las variantes dan resultados incorrectos a
+propósito; solo miden).
+
+| sin... | fila de 11.008 | fila de 2.048 |
+|---|---:|---:|
+| (completo) | 478 ns, 9,9 GB/s | 90 ns, 9,7 GB/s |
+| las escalas | **−40%** | **−33%** |
+| el tercer bit | −18% | −19% |
+| `f32` por grupo | −17% | −17% |
+| todo menos cargar | −81% | −86% |
+
+**Las escalas son lo más caro**, y no por lo que parecía. Son una cadena de unas diez
+operaciones de las que dependen los ocho grupos, así que se probaron dos formas de
+esconder la espera, las dos con el mismo resultado que el kernel:
+
+| | fila de 11.008 | fila de 2.048 |
+|---|---:|---:|
+| calcular las del bloque siguiente antes | 0,98× | 0,99-1,00× |
+| dos pasadas: primero todas, ya repartidas por grupo | 0,73-0,74× | 0,75-0,76× |
+
+**Adelantarlas no cambia nada**: el procesador ya solapaba la cadena por su cuenta, así
+que lo que cuestan es trabajo, no espera. Dos pasadas es peor: escribir y releer la
+tabla cuesta más que la permutación que ahorra. Lo que de verdad quitaría trabajo son
+las escalas enteras, y §24 ya las descartó: 3 a 7 veces más error.
+
+**Doce hilos tampoco**: con Q3_K y Q2_K, que calculan más por byte, un hilo lógico
+podría calcular mientras el otro espera a la RAM. Alternando cinco rondas: +1% en
+Q3_K, −7% en Q2_K y +5% en Q4_K, en direcciones opuestas. La máquina tenía 0,6 GB
+libres y todas las cifras salieron bajas, así que la conclusión es solo que no hay una
+ventaja que se vea; el pool sigue en los núcleos físicos.
+
+Queda como está. Con 6 hilos, ~10 GB/s cada uno ya son el doble de lo que la RAM
+entrega: el kernel no es lo que limita el decode, y lo que falta hasta el techo se
+gana mejor por otro lado, como hizo la precarga.
+
 ## Cifras que hubo que corregir
 
 Se listan porque una cifra mal medida dirige el trabajo hacia el lado
@@ -2277,6 +2460,8 @@ equivocado, y todas estas lo hicieron un rato.
 |---|---|---|
 | 6,1 tok/s de generación | ~25 tok/s | se dividían tokens por el tiempo **total**, con respuestas de 1-2 tokens donde el prefill domina |
 | al 30% del techo de memoria | el 3B está al **51%** | el 30% era del 0,5B |
+| el techo es 37,5 GB/s y el 3B está al 51-66% | la RAM es DDR4-2133: **~30 GB/s medidos**, y el 3B está al ~82% | el 37,5 nunca se midió en esta máquina; el máximo teórico de la RAM instalada es 34,1 (§33) |
+| la brecha del decode es sincronizar los hilos | **2%** | era la sospecha de todos; se midió con las mismas 145 pasadas paralelas del forward, sin cálculo (§33) |
 | el 1,5B es el punto dulce | no lo es | la prueba de 6 preguntas no tenía resolución |
 | la capa de salida explica la especulativa lenta | es el 15% | la causa es el coste de descuantizar cada k-quant, que se paga por fila |
 | el motor está limitado por cálculo | **sigue siendo cierto**, y se confirmó midiendo | la "corrección" que lo negaba duró medio día: dos kernels la desmintieron (§10) |
@@ -2295,6 +2480,10 @@ equivocado, y todas estas lo hicieron un rato.
 ---
 
 ## Lo que no se pudo explicar
+
+> **Explicado en §33**: no es sincronización (cuesta el 2%). Un hilo solo ya lee
+> 19 GB/s de los ~30 que da la RAM, y con 4 hilos se satura. Lo que de verdad se
+> perdía estaba en los kernels, y la precarga de filas recuperó parte.
 
 **El escalado de hilos.** De 1 a 6 núcleos se obtienen 2,6x, no 6x:
 

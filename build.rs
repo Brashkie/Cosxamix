@@ -301,6 +301,7 @@ fn compilar_c() {
             "kernels/q3k_avx2.c",
             "kernels/classify_avx2.c",
             "kernels/q2k_avx2.c",
+            "kernels/q5k_avx2.c",
         ],
         Ok("aarch64") => &["kernels/neon_dotprod.c", "kernels/q2k_neon.c"],
         _ => return,

@@ -74,6 +74,7 @@ pub mod classify;
 
 /// El kernel fusionado de Q2_K, el formato de Chavín, en todos los lenguajes.
 pub mod q2k;
+pub mod q5k;
 
 /// El fusionado de Q3_K en ensamblador. Ver la cabecera del módulo.
 #[cfg(all(feature = "asm_q3k", target_arch = "x86_64"))]
@@ -471,6 +472,26 @@ pub fn dot_q6k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
     scalar::dot_q6k_i8(bloques, xq, xe, xs)
 }
 
+/// Producto punto de una fila en **Q5_K** contra una entrada en `i8`, sin
+/// materializar los pesos. Ver [`scalar::dot_q5k_i8`].
+///
+/// Está en Rust, ensamblador, C y Zig; [`q5k::elegida`] dice cuál corre. Como
+/// el camino con búfer gana sin AVX2, `ops::matmul_auto` lo elige solo con AVX2.
+pub fn dot_q5k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
+    assert!(
+        xq.len().is_multiple_of(256),
+        "dot_q5k_i8: la fila tiene que ser multiplo de 256"
+    );
+    assert_eq!(xe.len(), xq.len() / 32, "dot_q5k_i8: faltan escalas");
+    assert_eq!(xs.len(), xe.len(), "dot_q5k_i8: faltan sumas");
+    assert!(
+        bloques.len() >= xq.len() / 256 * 176,
+        "dot_q5k_i8: faltan bytes de pesos"
+    );
+
+    q5k::dot(bloques, xq, xe, xs)
+}
+
 pub fn silu(salida: &mut [f32], entrada: &[f32]) {
     assert_eq!(
         salida.len(),
@@ -788,7 +809,11 @@ mod tests {
     fn el_fusionado_coincide_con_desempaquetar_y_multiplicar() {
         use crate::gguf::TipoGgml;
 
-        for (tipo, bytes_bloque) in [(TipoGgml::Q4K, 144usize), (TipoGgml::Q3K, 110)] {
+        for (tipo, bytes_bloque) in [
+            (TipoGgml::Q4K, 144usize),
+            (TipoGgml::Q3K, 110),
+            (TipoGgml::Q5K, 176),
+        ] {
             let n_bloques = 8usize; // 2048 valores, el ancho del 3B
             let k = n_bloques * 256;
             let sub = crate::quant::sub_bloque(tipo).unwrap();
@@ -823,6 +848,11 @@ mod tests {
                     scalar::dot_q4k_i8(&pesos, &xq, &xe, &xs),
                     dot_q4k_i8(&pesos, &xq, &xe, &xs),
                 )
+            } else if tipo == TipoGgml::Q5K {
+                (
+                    scalar::dot_q5k_i8(&pesos, &xq, &xe, &xs),
+                    dot_q5k_i8(&pesos, &xq, &xe, &xs),
+                )
             } else {
                 (
                     scalar::dot_q3k_i8(&pesos, &xq, &xe, &xs),
@@ -831,7 +861,7 @@ mod tests {
             };
 
             #[cfg(target_arch = "x86_64")]
-            if tipo != TipoGgml::Q4K && cpu_avx2() {
+            if tipo == TipoGgml::Q3K && cpu_avx2() {
                 #[cfg(feature = "c")]
                 {
                     let en_c = unsafe { c::dot_q3k_i8(&pesos, &xq, &xe, &xs) };

@@ -537,6 +537,81 @@ pub unsafe fn dot_q4k_i8_avx2(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32])
     reducir_f32(acc) - reducir_f32(desp)
 }
 
+/// [`super::scalar::dot_q5k_i8`] en AVX2: [`dot_q4k_i8_avx2`] con el quinto bit.
+///
+/// Q5_K era el único formato de los que importan sin kernel fusionado:
+/// desempaquetaba cada fila a un búfer, y medido en caché con un hilo procesaba
+/// 3,0 GB/s contra 9,5-14 de Q4_K y Q6_K (DECISIONES §34). Con 6 hilos eso no
+/// llega a los ~30 GB/s de la RAM: un modelo Q5_K_M quedaba limitado por cálculo.
+///
+/// El bit alto de cada valor está en `qh`: el bit `j` del byte `i` es el del
+/// valor `i` del sub-bloque `j`. Por par de sub-bloques se aísla con un `and`
+/// contra la máscara del bit, se convierte en 0xFF o 0 con `cmpeq`, y un `and`
+/// con 16 lo deja listo para el `or` con el nibble. Los valores quedan de 0 a
+/// 31, sin signo, que es lo que `vpmaddubsw` pide; el peor caso suma
+/// 31 × 127 × 2 = 7.874, lejos de los 32.767 de un `i16`.
+///
+/// Dos acumuladores, uno por mitad, para que las FMA no esperen a la anterior,
+/// como en Q3_K.
+///
+/// # Safety
+///
+/// Pide AVX2, FMA y F16C. El que llama lo garantiza.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn dot_q5k_i8_avx2(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
+    let unos = _mm256_set1_epi16(1);
+    let nibble = _mm256_set1_epi8(0x0F);
+    let dieciseis = _mm256_set1_epi8(16);
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut desp = _mm256_setzero_ps();
+
+    for bl in 0..xq.len() / 256 {
+        let o = bl * 176;
+        // El encabezado es el de Q4_K, byte por byte.
+        let escalas = escalas_q4k(
+            &bloques[o..o + 176],
+            &xe[bl * 8..bl * 8 + 8],
+            &xs[bl * 8..bl * 8 + 8],
+            &mut desp,
+        );
+        let qh = _mm256_loadu_si256(bloques.as_ptr().add(o + 16) as *const __m256i);
+        let qs = bloques.as_ptr().add(o + 48);
+
+        for par in 0..4 {
+            let bytes = _mm256_loadu_si256(qs.add(par * 32) as *const __m256i);
+            let m_bajo = _mm256_set1_epi8((1u8 << (2 * par)) as i8);
+            let m_alto = _mm256_set1_epi8((2u8 << (2 * par)) as i8);
+            let alto = |m: __m256i| {
+                _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, m), m), dieciseis)
+            };
+            let bajos = _mm256_or_si256(_mm256_and_si256(bytes, nibble), alto(m_bajo));
+            let altos = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(bytes, 4), nibble),
+                alto(m_alto),
+            );
+
+            let x0 = _mm256_loadu_si256(xq.as_ptr().add(bl * 256 + par * 64) as *const __m256i);
+            let x1 =
+                _mm256_loadu_si256(xq.as_ptr().add(bl * 256 + par * 64 + 32) as *const __m256i);
+            let p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(bajos, x0), unos);
+            let p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(altos, x1), unos);
+            acc0 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(p0),
+                _mm256_set1_ps(escalas[par * 2]),
+                acc0,
+            );
+            acc1 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(p1),
+                _mm256_set1_ps(escalas[par * 2 + 1]),
+                acc1,
+            );
+        }
+    }
+
+    reducir_f32(_mm256_add_ps(acc0, acc1)) - reducir_f32(desp)
+}
+
 /// [`super::scalar::dot_q3k_i8`] en AVX2.
 ///
 /// Dos diferencias con [`dot_q4k_i8_avx2`], y las dos son del formato:

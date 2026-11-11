@@ -169,6 +169,53 @@ pub fn dot_q4k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
     total
 }
 
+/// Producto punto de una fila en **Q5_K** contra una entrada en `i8`, sin
+/// materializar los pesos. Referencia del kernel fusionado.
+///
+/// Es [`dot_q4k_i8`] con un bit más: el bloque mide 176 bytes —el mismo
+/// encabezado de 16, luego 32 bytes `qh` y los 128 de nibbles— y cada valor va
+/// de 0 a 31, con el quinto bit en `qh`. El bit del sub-bloque `j` es el bit `j`
+/// de `qh[i]`, para la posición `i` de las 32 del sub-bloque.
+pub fn dot_q5k_i8(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32]) -> f32 {
+    debug_assert!(xq.len().is_multiple_of(256));
+    debug_assert_eq!(xe.len(), xq.len() / 32);
+    debug_assert_eq!(xs.len(), xe.len());
+
+    let mut total = 0f32;
+    for bl in 0..xq.len() / 256 {
+        let o = bl * 176;
+        let d = crate::quant::leer_f16(bloques, o);
+        let dmin = crate::quant::leer_f16(bloques, o + 2);
+        let esc = &bloques[o + 4..o + 16];
+        let qh = &bloques[o + 16..o + 48];
+        let qs = &bloques[o + 48..o + 176];
+
+        for par in 0..4 {
+            let base = par * 32;
+            for mitad in 0..2 {
+                let j = par * 2 + mitad;
+                let (sc, mn) = crate::quant::escala_y_minimo(j, esc);
+                let sub = bl * 8 + j;
+                let x = &xq[bl * 256 + par * 64 + mitad * 32..][..32];
+
+                let mut entero = 0i32;
+                for (i, v) in x.iter().enumerate() {
+                    let nibble = if mitad == 0 {
+                        qs[base + i] & 0x0F
+                    } else {
+                        qs[base + i] >> 4
+                    };
+                    let alto = if qh[i] & (1 << j) != 0 { 16 } else { 0 };
+                    entero += *v as i32 * (nibble + alto) as i32;
+                }
+
+                total += xe[sub] * (d * sc as f32 * entero as f32 - dmin * mn as f32 * xs[sub]);
+            }
+        }
+    }
+    total
+}
+
 /// Producto punto de una fila en **Q3_K** contra una entrada en `i8`, sin
 /// materializar los pesos. Referencia del kernel fusionado.
 ///

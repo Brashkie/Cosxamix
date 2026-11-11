@@ -11,6 +11,45 @@ acá va qué cambió, no por qué.
 
 ## [Sin publicar]
 
+## [0.9.0] - 2026-11-11
+
+- **El techo de memoria era más bajo de lo que se decía.** La RAM corre a
+  DDR4-2133, no a 2666: el máximo teórico es 34,1 GB/s y, medido, entrega ~30.
+  El "37,5 GB/s reales" del ROADMAP no podía ser. Con el techo bien medido, el
+  decode del Qwen 3B Q4_K_M está al ~82% y no al 65% (DECISIONES §33).
+- **`examples/measure_ceiling.rs`: dónde se pierde la distancia al techo**, en
+  cuatro escalones: la RAM, los pesos de un tirón, los pesos con una
+  sincronización por llamada del forward, y el forward. **Sincronizar los hilos
+  cuesta el 2%**, así que un pool persistente no ganaría casi nada; los 6 núcleos
+  rinden "como 2,6" porque la RAM se satura con 4. Lo que se pierde está en los
+  kernels.
+- **Precarga de filas** en el decode (`COSXAMIX_PRECARGA`, 2 por defecto, 0 la
+  apaga): mientras se calcula una fila se pide a la caché la que viene dos más
+  adelante. Alternando 6 rondas: **+2-7% en Q4_K, +10% en Q3_K y +14% en Q2_K**,
+  el prefill igual y el mismo texto, byte a byte.
+- **Kernel fusionado de Q5_K** (`kernels::dot_q5k_i8`, en Rust con AVX2 y su
+  referencia escalar). Era el único formato de los que importan sin él, y
+  procesaba 3,0 GB/s por hilo contra 10-11 ahora. Un Qwen 3B en Q5_K pasa de
+  **5,3 a 9,1 tok/s (1,71×)**, y genera lo mismo que el camino de referencia sin
+  cuantizar la entrada; el camino con búfer era el que se apartaba
+  (DECISIONES §34). `COSXAMIX_SIN_Q5K_FUSIONADO` lo apaga.
+- **Q5_K en todos los lenguajes** (`src/kernels/q5k.rs`, `COSXAMIX_Q5K`):
+  ensamblador (`kernels/q5k_avx2_*.s`, generado por `scripts/gen_q5k_asm.py`), C
+  (`kernels/q5k_avx2.c`) y Zig (`kernels/q5k.zig`). En una fila en caché, Rust con
+  AVX2 hace 17,0 GB/s, el ensamblador 16,4, C 15,8 y Zig 3,2: sigue elegido Rust
+  (DECISIONES §34). `examples/measure_q5k.rs` los compara.
+- `examples/measure_q3k_parts.rs`: el kernel de Q3_K medido por partes. Las
+  escalas son el 33-40% de su tiempo; adelantarlas no cambia nada y calcularlas en
+  una pasada aparte es más lento, así que el kernel queda como está
+  (DECISIONES §35).
+- `measure_ceiling` con `COSXAMIX_EN_CACHE=1` da el techo de cálculo de cada
+  kernel, con un hilo, y con `COSXAMIX_PREFILL=256` el tiempo de un prompt.
+  `requantize` acepta `q5k`.
+- ROADMAP y README con el techo corregido (~81-87% y no 51%). En el ROADMAP:
+  la especulativa revisada con los números nuevos, que todavía no dan (§5); la
+  esparcidad de activaciones, a medir antes de escribir un kernel (§10); y capas
+  que comparten pesos, para probar entrenando un daiss (§8).
+
 ## [0.8.0] - 2026-11-07
 
 El motor deja de depender del crate `tokenizers`, un modelo propio se puede
@@ -1609,6 +1648,7 @@ agrega una sección a uno y se olvida del otro, CI falla.
 - Verificado en esta versión: **22 tests**, 0 avisos, clippy limpio en las tres
   combinaciones (por defecto, `candle`, `zig,candle`).
 
+[0.9.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.9.0
 [0.8.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.8.0
 [0.7.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.7.0
 [0.6.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.6.0

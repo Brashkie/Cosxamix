@@ -41,9 +41,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "q2k" => TipoGgml::Q2K,
             "q3k" => TipoGgml::Q3K,
             "q4k" => TipoGgml::Q4K,
+            "q5k" => TipoGgml::Q5K,
             "q8" => TipoGgml::Q8_0,
             otro => {
-                return Err(format!("formato {otro}: q2k, q3k, q4k, q8 o como:otro.gguf").into())
+                return Err(
+                    format!("formato {otro}: q2k, q3k, q4k, q5k, q8 o como:otro.gguf").into(),
+                )
             }
         };
         g.tensores
