@@ -47,8 +47,10 @@ acá va qué cambió, no por qué.
   `requantize` acepta `q5k`.
 - ROADMAP y README con el techo corregido (~81-87% y no 51%). En el ROADMAP:
   la especulativa revisada con los números nuevos, que todavía no dan (§5); la
-  esparcidad de activaciones, a medir antes de escribir un kernel (§10); y capas
-  que comparten pesos, para probar entrenando un daiss (§8).
+  esparcidad de activaciones, a medir antes de escribir un kernel (§10); capas
+  que comparten pesos, para probar entrenando un daiss (§8); y **QCML** (`.qcml`,
+  marca QCBZ), el contenedor propio para modelos con redes de tensores, que va a
+  ser un proyecto aparte (§11).
 
 ## [0.8.0] - 2026-11-07
 

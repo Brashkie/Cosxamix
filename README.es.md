@@ -237,6 +237,11 @@ que queda es poco y está en los kernels. Que de 6 núcleos salgan 2,6x en vez d
 La decodificación especulativa sigue fuera: con el motor cerca del techo, la
 cuenta todavía no da (ROADMAP §5).
 
+Más adelante, en un proyecto aparte, va a nacer **QCML** (`.qcml`, de la marca
+QCBZ): un contenedor propio que guarda los modelos entrenados con redes de
+tensores como núcleos y no como matrices densas, para que el ahorro de la 0.8.0
+—tablas 30,6× más chicas— llegue también al archivo (ROADMAP §11).
+
 ---
 
 ## daiss: los modelos propios

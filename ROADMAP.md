@@ -199,8 +199,9 @@ Así que el punto queda dividido:
 
 Después, en la 0.8.0 (§32): **cortar después pierde**, también en las tablas de
 vocabulario (lo que TensorGPT promete sin reentrenar), y **entrenar desde el
-principio con las tablas en Tensor-Train gana**. Guardar los núcleos en un
-contenedor propio, en vez de las tablas densas, va a ser un proyecto aparte.
+principio con las tablas en Tensor-Train gana**. Guardar los núcleos en vez de
+las tablas densas es **QCML**, el contenedor propio que va a ser un proyecto
+aparte (§11).
 
 El detalle y el control de ruido de cuantización, en
 [DECISIONES](DECISIONES.md) §12.
@@ -338,7 +339,7 @@ en orden:
 2. ~~**Embeddings en Tensor-Train**~~ **hecho en la 0.8.0** (§32): cortado después
    pierde; entrenado desde el principio, con rango 32, le gana al modelo sin
    tokenizador con los mismos parámetros. Guardar los núcleos en el archivo, para
-   que también se achique, va a ser un proyecto aparte.
+   que también se achique, es **QCML**, un proyecto aparte (§11).
 3. ~~**Servir un daiss entrenado**~~ **hecho en la 0.8.0**: el motor lee
    `cosxamix.tokenizer.merges` y, sin plantilla de chat, continúa el texto.
 4. **Un kernel de entrenamiento propio**: repartir el lote da 2,5× en 6 núcleos.
@@ -527,6 +528,79 @@ leer sus pesos, y eso cambia el resultado. Antes de escribir un kernel:
    bloques por columna.
 
 Si el 1 o el 2 no dan, se anota y se cierra, como la especulativa.
+
+### 11. QCML: el contenedor propio, en un proyecto aparte
+
+**QCML** (`.qcml`, *Quantum Compression for Machine Learning*), de la marca
+**QCBZ** (*Quantum Compression Brashkie Zeitsi*), es un formato de archivo binario
+propio para guardar modelos con **redes de tensores**: Tensor-Train / MPS
+primero, y más adelante Tucker y Tensor-Ring. Se va a crear como **un proyecto
+aparte**, sin fecha todavía; Cosxamix sigue optimizando y evolucionando por su
+lado y lo va a leer cuando exista. El nombre viene de que Tensor-Train y MPS
+(*matrix product states*) nacieron en la física cuántica: no hay cómputo
+cuántico, son productos de matrices en la CPU.
+
+**Por qué hace falta, medido.** En la 0.8.0, un daiss-mini con las tablas de
+vocabulario entrenadas en Tensor-Train de rango 32 tiene esas tablas **30,6×
+más chicas** y le gana al modelo sin tokenizador con los mismos parámetros
+(§8 y [DECISIONES](DECISIONES.md) §32). Pero el GGUF guarda las tablas densas,
+reconstruidas: `daiss-mini-8192-tt32-30m.gguf` pesa 35,7 MB, lo mismo que el
+modelo sin Tensor-Train. El ahorro existe en el modelo y se pierde en el archivo.
+Guardando los núcleos, la estimación —**a medir**— es de 35,7 a ~19,5 MB (−45%)
+con los mismos bits por byte.
+
+**Por qué un contenedor propio y no GGUF.** No es porque GGUF no pueda: GGUF
+guarda tensores de hasta 4 dimensiones y se mapea en memoria con la alineación de
+`general.alignment`. Las razones son tres:
+
+1. **un esquema nativo para redes de tensores**: el tipo de factorización (TT,
+   MPS, Tucker, Tensor-Ring), los factores, los rangos `rₖ` y cómo se contrae van
+   en el índice, con validación estricta, y no repartidos en claves sueltas;
+2. **alineación fija a 64 bytes**, la de una línea de caché y la de AVX-512, en
+   todos los bloques de datos y siempre;
+3. **independencia del ecosistema** de llama.cpp: los cambios de su formato o de
+   sus herramientas no rompen nada.
+
+**La estructura propuesta**, en *little endian*:
+
+- la marca `QCML` (`0x51 0x43 0x4D 0x4C`), la versión y la alineación;
+- una cabecera de 64 bytes con cuántos metadatos y tensores hay y dónde empiezan
+  el índice y los datos;
+- la tabla de metadatos;
+- el índice, alineado a 64: por tensor, su nombre, sus dimensiones, si va denso
+  (cuantizado como en GGUF) o como red de tensores, y en ese caso sus factores,
+  rangos y dónde está cada núcleo;
+- los datos contiguos, cada bloque alineado a 64, para mapearlos y leerlos sin
+  copiar.
+
+**Lo que promete y lo que no.** Sirve para modelos **entrenados** con esas capas
+en redes de tensores, donde la cadena es el modelo. **No sirve para comprimir un
+modelo que ya existe**: cortar las tablas de un daiss entrenado después lo empeora
+0,6-1,25 bits por byte, contra +0,004 de Q2_K (§32), y en el Qwen `output.weight`
+necesita el 28,6% del rango para el 47,5% de la energía (§6). El "50-70% menos
+sin perder precisión" de los papers no se cumple con pesos ya entrenados; el
+convertidor tiene que negarse cuando el corte no es exacto.
+
+**Los pasos:**
+
+1. el formato, con su lector y su escritor, reconstruyendo las matrices al cargar,
+   y medir tamaño, tiempo de carga y bits por byte contra el GGUF;
+2. multiplicar directamente desde los núcleos, sin la matriz densa: una fila de
+   embeddings contrayendo la cadena, y los logits multiplicando por ella. Medir
+   velocidad y RAM contra la tabla densa en Q8_0 y Q2_K;
+3. los kernels de contracción en Rust, Zig, C y ensamblador, como todos (regla
+   3).
+
+**Ideas para después, sin medir:**
+
+- **el plan de contracción en la cabecera**: el orden en que se multiplican los
+  núcleos decide los FLOPs y la memoria temporal; en una cadena de 4 núcleos es
+  obvio, pero en Tucker o Tensor-Ring vale guardarlo calculado;
+- **una factorización por tipo de capa**: Tensor-Train en el vocabulario, Tucker
+  en la atención, Tensor-Ring en el FFN, y las capas sensibles sin comprimir. Por
+  lo de §32, solo vale entrenando así;
+- **un núcleo compartido entre capas**, con un adaptador por capa: es el punto 7
+  de §8.
 
 ## Decidido y cerrado
 
