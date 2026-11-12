@@ -59,5 +59,9 @@ pub mod engine_manager;
 #[cfg(feature = "candle")]
 pub mod engine_own;
 
+/// Crear imágenes en la CPU con SD-Turbo y TAESD, para `POST /api/image`.
+#[cfg(feature = "candle")]
+pub mod image_gen;
+
 #[cfg(feature = "training")]
 pub mod training;

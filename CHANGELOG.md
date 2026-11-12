@@ -11,6 +11,35 @@ acá va qué cambió, no por qué.
 
 ## [Sin publicar]
 
+## [0.10.0] - 2026-11-11
+
+- **Crear imágenes en la CPU, sin GPU y sin API**: `POST /api/image` con
+  `{"prompt", "seed"?, "size"?}` devuelve un PNG (`src/image_gen.rs`). Es
+  SD-Turbo —Stable Diffusion 2.1 destilado para dar la imagen en un paso— con
+  candle, el scheduler Euler `trailing` de su configuración y el tokenizador
+  BPE de CLIP escrito acá (el modelo no trae `tokenizer.json`). Medido en el
+  i5-10400 a 512×512: **~17 s por imagen**, 0,5 s el texto y ~12,6 s el UNet en
+  f16; la primera vez suma lo que tarde en leer 2,6 GB del disco (~58 s en F:).
+  La misma semilla da la misma imagen, byte a byte. El modelo se carga con el
+  primer pedido y se libera tras 10 minutos sin uso
+  (`COSXAMIX_IMAGEN_LIBERAR_MIN`), porque en f16 pesa 4,2 GB en memoria; en f32
+  (`COSXAMIX_IMAGEN_TIPO=f32`) es un 25% más rápido y pesa 6,6.
+- **TAESD en vez del VAE completo**: el decodificador del VAE de SD tardaba
+  **27 s** —tres veces el UNet— y TAESD (madebyollin, MIT, 4,9 MB) **3 s**,
+  con la misma escena. Está escrito acá, en candle, con su arquitectura original
+  (`taesd.py`); el VAE completo queda con `COSXAMIX_IMAGEN_VAE=completo`.
+- **Un error de candle 0.9.2, encontrado y esquivado**: `conv2d_tiled` decide si
+  la entrada ya está en NHWC comparando strides, y los de un NCHW contiguo
+  coinciden cuando canales = alto = ancho. Ahí lee los píxeles en otro orden.
+  TAESD tiene justo ese caso —64 canales sobre latentes de 64×64— y salían
+  franjas de colores. Se encontró comparando contra TAESD en numpy, que daba la
+  imagen limpia, y se confirmó con 520×520 (latentes de 65×65), que también.
+  `image_gen::conv` le pasa a candle otra vista con otros strides, y un test
+  (`convolucion_cuadrada_como_la_directa`) compara contra la definición a mano:
+  sin el arreglo, falla.
+- `examples/measure_image.rs`: cargar, texto, UNet y decodificado por separado,
+  y la memoria pico.
+
 ## [0.9.0] - 2026-11-11
 
 - **El techo de memoria era más bajo de lo que se decía.** La RAM corre a
@@ -1651,6 +1680,7 @@ agrega una sección a uno y se olvida del otro, CI falla.
 - Verificado en esta versión: **22 tests**, 0 avisos, clippy limpio en las tres
   combinaciones (por defecto, `candle`, `zig,candle`).
 
+[0.10.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.10.0
 [0.9.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.9.0
 [0.8.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.8.0
 [0.7.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.7.0

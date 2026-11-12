@@ -150,6 +150,9 @@ Variables de entorno:
 | `COSXAMIX_SIN_BLOQUES`, `COSXAMIX_SIN_Q6K_FUSIONADO`, `COSXAMIX_SIN_VARIAS`, `COSXAMIX_SIN_PRESTAMO` | sin definir | Cada una apaga una optimización de la 0.7.0 —la matmul por bloques del prefill, el kernel de Q6_K, q-k-v en una pasada, el prefijo entre conversaciones—, para medir con y sin ella ([DECISIONES §24-26](DECISIONES.md)) |
 | `COSXAMIX_PRECARGA` | `2` | Cuántas filas por delante pide el decode a la caché mientras calcula una; `0` la apaga ([DECISIONES §33](DECISIONES.md)) |
 | `COSXAMIX_SIN_Q5K_FUSIONADO` | sin definir | Apaga el kernel fusionado de Q5_K, para medir con y sin él ([DECISIONES §34](DECISIONES.md)) |
+| `COSXAMIX_IMAGEN_TIPO` | `f16` | Los pesos de SD-Turbo para `/api/image`: `f32` es un 25% más rápido y usa 2,4 GB más |
+| `COSXAMIX_IMAGEN_VAE` | `taesd` | `completo` decodifica con el VAE de SD: 27 s contra 3 |
+| `COSXAMIX_IMAGEN_LIBERAR_MIN` | `10` | Minutos sin pedidos de imagen antes de liberar el modelo (4,2 GB) |
 
 **Todos los `.gguf` del directorio se registran**, no solo el de
 `COSXAMIX_GGUF`: esa variable dice cuál se precalienta, no cuál es el único

@@ -55,3 +55,6 @@ __pycache__/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# La salida de examples/measure_image.rs.
+imagen.ppm

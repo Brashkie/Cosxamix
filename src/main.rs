@@ -31,6 +31,8 @@ use cosxamix::kernels;
 #[derive(Clone)]
 struct Estado {
     motor: Arc<dyn Motor>,
+    #[cfg(feature = "candle")]
+    imagenes: Arc<imagenes::Servicio>,
 }
 
 fn env(clave: &str, por_defecto: &str) -> String {
@@ -330,6 +332,144 @@ fn error(c: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+// ─── /api/image ──────────────────────────────────────────────────────────────
+//
+// Fuera del dialecto de Ollama, que no crea imágenes: SD-Turbo en la CPU (ver
+// image_gen.rs). Pesa 4,2 GB en memoria mientras está cargado, así que se carga
+// con el primer pedido y se libera tras `COSXAMIX_IMAGEN_LIBERAR_MIN` minutos
+// sin uso (10). Una imagen a la vez: cada una ocupa todos los núcleos.
+
+#[cfg(feature = "candle")]
+mod imagenes {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use cosxamix::image_gen::{self, Generador};
+
+    pub struct Servicio {
+        dir: PathBuf,
+        cargado: Mutex<Option<(Generador, Instant)>>,
+    }
+
+    impl Servicio {
+        pub fn nuevo(dir: PathBuf) -> Self {
+            Self {
+                dir,
+                cargado: Mutex::new(None),
+            }
+        }
+
+        pub fn disponible(&self) -> bool {
+            image_gen::disponible(&self.dir)
+        }
+
+        /// Un PNG, y lo que tardó en cargar (0 si ya estaba) y en generar.
+        pub fn generar(
+            &self,
+            prompt: &str,
+            semilla: u64,
+            lado: usize,
+        ) -> Result<(Vec<u8>, f64, f64), String> {
+            let mut g = self
+                .cargado
+                .lock()
+                .map_err(|_| "el generador quedó envenenado".to_string())?;
+            let t0 = Instant::now();
+            if g.is_none() {
+                tracing::info!("imágenes: cargando SD-Turbo");
+                *g = Some((Generador::abrir(&self.dir)?, Instant::now()));
+            }
+            let cargar = t0.elapsed().as_secs_f64();
+            let (gen, ultimo) = g.as_mut().ok_or("sin generador")?;
+            let t1 = Instant::now();
+            let img = gen.generar(prompt, semilla, lado)?;
+            *ultimo = Instant::now();
+            Ok((image_gen::png(&img), cargar, t1.elapsed().as_secs_f64()))
+        }
+
+        /// Libera el modelo si lleva `inactivo` sin usarse.
+        pub fn liberar_si_inactivo(&self, inactivo: Duration) {
+            if let Ok(mut g) = self.cargado.try_lock() {
+                if g.as_ref().is_some_and(|(_, u)| u.elapsed() >= inactivo) {
+                    *g = None;
+                    tracing::info!("imágenes: SD-Turbo liberado por inactividad");
+                }
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+// Sin `candle` la ruta contesta que no hay imágenes y no lee el pedido.
+#[cfg_attr(not(feature = "candle"), allow(dead_code))]
+struct PedidoImagen {
+    prompt: String,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    size: Option<usize>,
+}
+
+#[cfg(feature = "candle")]
+async fn imagen(State(e): State<Estado>, Json(p): Json<PedidoImagen>) -> axum::response::Response {
+    let prompt = p.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return (StatusCode::BAD_REQUEST, "falta el prompt").into_response();
+    }
+    if !e.imagenes.disponible() {
+        return (
+            StatusCode::NOT_FOUND,
+            "no hay modelo de imágenes (sd-turbo y taesd en la carpeta de modelos)",
+        )
+            .into_response();
+    }
+    let semilla = p.seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    });
+    let lado = p.size.unwrap_or(512);
+    let servicio = e.imagenes.clone();
+    match tokio::task::spawn_blocking(move || servicio.generar(&prompt, semilla, lado)).await {
+        Ok(Ok((png, cargar, generar))) => {
+            tracing::info!(
+                cargar_s = cargar,
+                generar_s = generar,
+                bytes = png.len(),
+                "imagen generada"
+            );
+            (
+                [
+                    (axum::http::header::CONTENT_TYPE, "image/png".to_string()),
+                    (
+                        axum::http::HeaderName::from_static("x-cosxamix-ms"),
+                        format!("{:.0}", generar * 1e3),
+                    ),
+                    (
+                        axum::http::HeaderName::from_static("x-cosxamix-seed"),
+                        semilla.to_string(),
+                    ),
+                ],
+                png,
+            )
+                .into_response()
+        }
+        Ok(Err(m)) => (StatusCode::UNPROCESSABLE_ENTITY, m).into_response(),
+        Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.to_string()).into_response(),
+    }
+}
+
+#[cfg(not(feature = "candle"))]
+async fn imagen(Json(_): Json<PedidoImagen>) -> axum::response::Response {
+    (
+        StatusCode::NOT_FOUND,
+        "compilado sin la feature `candle`: no hay imágenes",
+    )
+        .into_response()
+}
+
 async fn salud() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true, "servicio": "cosxamix" }))
 }
@@ -473,12 +613,41 @@ async fn main() {
     // HTTP sigue en pie y se puede trabajar en la capa de arriba.
     configurar_hilos();
     let (motor, estado_demo) = elegir_motor();
-    let estado = Estado { motor };
+    #[cfg(feature = "candle")]
+    let imagenes = {
+        let s = Arc::new(imagenes::Servicio::nuevo(std::path::PathBuf::from(env(
+            "COSXAMIX_MODELOS",
+            "./modelos",
+        ))));
+        let minutos: u64 = env("COSXAMIX_IMAGEN_LIBERAR_MIN", "10")
+            .parse()
+            .unwrap_or(10);
+        let s2 = s.clone();
+        tokio::spawn(async move {
+            let mut cada = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                cada.tick().await;
+                s2.liberar_si_inactivo(std::time::Duration::from_secs(minutos * 60));
+            }
+        });
+        if s.disponible() {
+            tracing::info!(
+                "imágenes: SD-Turbo disponible en /api/image (se carga al primer pedido)"
+            );
+        }
+        s
+    };
+    let estado = Estado {
+        motor,
+        #[cfg(feature = "candle")]
+        imagenes,
+    };
 
     let app = Router::new()
         .route("/api/tags", get(tags))
         .route("/v1/chat/completions", post(chat))
         .route("/health", get(salud))
+        .route("/api/image", post(imagen))
         .with_state(estado);
 
     // 11435 y no 11434: así Cosxamix y Ollama pueden correr a la vez y se pueden

@@ -156,6 +156,9 @@ Environment variables:
 | `COSXAMIX_SIN_BLOQUES`, `COSXAMIX_SIN_Q6K_FUSIONADO`, `COSXAMIX_SIN_VARIAS`, `COSXAMIX_SIN_PRESTAMO` | unset | Each one turns off a 0.7.0 optimization —the blocked prefill matmul, the Q6_K kernel, q-k-v in one pass, the prefix shared across conversations— to measure with and without it ([DECISIONES §24-26](DECISIONES.md)) |
 | `COSXAMIX_PRECARGA` | `2` | Rows ahead that the decode asks the cache for while it computes one; `0` turns it off ([DECISIONES §33](DECISIONES.md)) |
 | `COSXAMIX_SIN_Q5K_FUSIONADO` | unset | Turns off the Q5_K fused kernel, to measure with and without it ([DECISIONES §34](DECISIONES.md)) |
+| `COSXAMIX_IMAGEN_TIPO` | `f16` | SD-Turbo weights for `/api/image`: `f32` is 25% faster and uses 2.4 GB more |
+| `COSXAMIX_IMAGEN_VAE` | `taesd` | `completo` decodes with SD's VAE: 27 s against 3 |
+| `COSXAMIX_IMAGEN_LIBERAR_MIN` | `10` | Minutes without image requests before the model (4.2 GB) is released |
 
 **Every `.gguf` in the directory is registered**, not only the one in
 `COSXAMIX_GGUF`: that variable says which one is pre-warmed, not which one

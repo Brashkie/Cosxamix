@@ -4,6 +4,19 @@ Cosxamix se publica bajo la licencia MIT ([LICENSE](LICENSE)). Ademas de sus
 dependencias normales, que cargo resuelve y cuyas licencias quedan registradas
 en `Cargo.lock`, hay **un archivo copiado** a este repositorio.
 
+## Modelos que se usan, sin venir en el repositorio
+
+`/api/image` lee dos modelos que no se distribuyen con Cosxamix: quien los usa
+los baja a su carpeta de modelos.
+
+- **SD-Turbo** (huggingface.co/stabilityai/sd-turbo), bajo la **Stability AI
+  Community License**: gratis para uso no comercial; pide mostrar
+  **"Powered by Stability AI"** donde se ofrezca, seguir su política de uso
+  (stability.ai/use-policy) y no usar lo que genera para entrenar otro modelo
+  generativo. Un uso comercial pide registrarse, y hasta USD 1 millón al año.
+  La licencia completa viene con el modelo (`LICENSE.md`).
+- **TAESD** (github.com/madebyollin/taesd), bajo licencia **MIT**.
+
 ## `src/model/qwen2.rs`
 
 Viene de [huggingface/candle](https://github.com/huggingface/candle) 0.9.2,

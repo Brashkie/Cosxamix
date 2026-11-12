@@ -351,6 +351,14 @@ en orden:
    en un modelo entrenado casi seguro pierde, como el Tensor-Train; lo que se
    puede probar es **entrenar** un daiss-mini así y comparar bits por byte con los
    mismos parámetros.
+8. **Imágenes propias.** `/api/image` corre SD-Turbo, un modelo de terceros
+   (Stability AI Community License): es el "Qwen de las imágenes", lo que sirve
+   hoy mientras se construye lo propio. Entrenar desde cero un modelo de
+   difusión de la calidad de SD en una CPU no da: son meses de GPU. Lo que sí se
+   puede probar: uno chico, de 64×64 o 128×128 (íconos, stickers), entrenado
+   sobre los latentes de TAESD, que es MIT; y las convoluciones con kernels
+   propios en vez de las de candle, que además tienen el error de §`image_gen`
+   (canales = alto = ancho). Hoy, por imagen: ~12,6 s el UNet y 3 s TAESD.
 
 ### 9. El motor propio, reemplazando candle pieza por pieza
 
