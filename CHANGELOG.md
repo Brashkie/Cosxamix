@@ -39,6 +39,15 @@ acá va qué cambió, no por qué.
   sin el arreglo, falla.
 - `examples/measure_image.rs`: cargar, texto, UNet y decodificado por separado,
   y la memoria pico.
+- **El test de la palabra enorme ya no depende del reloj.** Medía cuánto más
+  tardaba 4 veces el texto, con un límite de 8, y el runner de macOS daba
+  8,4-8,6 sin nada cuadrático: la cola de prioridad de 400 mil entradas no entra
+  en la caché, y en debug y con los demás tests a la vez eso pesa. Ahora se
+  cuentan los **pasos** del algoritmo —las vueltas del barrido en una palabra
+  corta, las operaciones de la cola en una larga—, solo en los tests: con 8
+  veces el texto dan **8,00 veces** más, en cualquier máquina, y con una
+  regresión cuadrática puesta a propósito (buscar el mínimo recorriendo toda la
+  cola), **64,00** y falla. El de tiempo queda, solo en release.
 
 ## [0.9.0] - 2026-11-11
 

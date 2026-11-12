@@ -485,6 +485,8 @@ impl Bpe {
             }
         }
         while n > 1 {
+            #[cfg(test)]
+            pasos::sumar(n as u64);
             // El de menor rango; ante un empate, el de más a la izquierda.
             let (mut i, mut menor) = (0, NADA);
             for (k, r) in rangos[..n - 1].iter().enumerate() {
@@ -543,6 +545,8 @@ impl Bpe {
                      d: u32| {
             let (a, b) = (simbolos[i as usize], simbolos[d as usize]);
             if let Some((r, _)) = self.tabla.buscar(a, b) {
+                #[cfg(test)]
+                pasos::sumar(1);
                 cola.push(Reverse((r, i, a, b)));
             }
         };
@@ -550,6 +554,8 @@ impl Bpe {
             poner(&mut cola, &simbolos, i, i + 1);
         }
         while let Some(Reverse((_, i, a, b))) = cola.pop() {
+            #[cfg(test)]
+            pasos::sumar(1);
             let d = sig[i as usize];
             if simbolos[i as usize] != a || d == FIN || simbolos[d as usize] != b {
                 continue;
@@ -908,6 +914,26 @@ fn clase_de(c: char) -> Clase {
         Clase::Digito
     } else {
         Clase::Otro
+    }
+}
+
+/// Los pasos de la codificación —vueltas del barrido en una palabra corta,
+/// operaciones de la cola en una larga—, contados solo en los tests y por
+/// hilo: miden cómo crece el trabajo sin depender del reloj de la máquina.
+#[cfg(test)]
+pub(crate) mod pasos {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PASOS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn sumar(n: u64) {
+        PASOS.with(|p| p.set(p.get() + n));
+    }
+
+    pub fn tomar() -> u64 {
+        PASOS.with(|p| p.replace(0))
     }
 }
 
@@ -1341,19 +1367,51 @@ mod tests {
         }
     }
 
-    /// Una palabra enorme sin espacios no puede tardar cuadrático: un mensaje
-    /// con un base64 de 1 MB pasaría de milisegundos a minutos.
-    ///
-    /// Se mide cómo crece y no cuántos segundos tarda: con 4 veces más texto,
-    /// lineal tarda unas 4 veces más y cuadrático 16. Un límite en segundos
-    /// fallaba en CI, que compila sin optimizar: 5 a 7,7 s contra 0,1 en release.
+    /// Una palabra enorme sin espacios no puede costar cuadrático: un mensaje
+    /// con un base64 de 1 MB pasaría de milisegundos a minutos. Se cuentan los
+    /// pasos del algoritmo y no el tiempo, así que da lo mismo en cualquier
+    /// máquina, en debug o en release: con 8 veces el texto, lineal da ~8 y
+    /// cuadrático ~64.
     #[test]
+    fn una_palabra_enorme_no_cuesta_cuadratico() {
+        let corpus = corpus_de_prueba(40_000);
+        let bpe = Bpe::entrenar(&corpus, 900);
+        let contar = |n: usize| {
+            pasos::tomar();
+            let ids = bpe.codificar_bytes(&vec![b'a'; n]);
+            assert_eq!(bpe.decodificar_bytes(&ids).unwrap().len(), n);
+            pasos::tomar()
+        };
+        let (chico, grande) = (contar(50_000), contar(400_000));
+        let veces = grande as f64 / chico.max(1) as f64;
+        eprintln!("8 veces el texto: {veces:.2} veces más pasos ({chico} y {grande})");
+        assert!(
+            veces < 12.0,
+            "8 veces el texto costó {veces:.1} veces más pasos: {chico} y {grande}"
+        );
+        // Una palabra corta también: el barrido es cuadrático en su largo, y
+        // por eso solo vale hasta PALABRA_CORTA.
+        assert!(contar(PALABRA_CORTA) > 0);
+    }
+
+    /// Lo mismo, en segundos. Solo en release: en debug y en un runner
+    /// compartido el tiempo no es buen juez —el de macOS daba 8,4-8,6 veces con
+    /// 4 veces el texto sin nada cuadrático—, y para eso está el de arriba.
+    ///
+    /// Se mide cómo crece y no cuántos segundos tarda: con 8 veces más texto,
+    /// lineal tarda unas 8 veces más y cuadrático 64, y el límite, 32, queda
+    /// lejos de los dos. Un límite en segundos fallaba en CI, que compila sin
+    /// optimizar (5 a 7,7 s contra 0,1 en release); y uno de 8 con 4 veces el
+    /// texto también: el runner de macOS daba 8,4-8,6 sin nada cuadrático, en
+    /// debug y con los demás tests corriendo a la vez.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "el tiempo solo es estable en release")]
     fn una_palabra_enorme_no_es_cuadratica() {
         let corpus = corpus_de_prueba(40_000);
         let bpe = Bpe::entrenar(&corpus, 900);
         let medir = |n: usize| {
-            // El mejor de dos, para que una pausa del sistema no decida.
-            (0..2)
+            // El mejor de tres, para que una pausa del sistema no decida.
+            (0..3)
                 .map(|_| {
                     let t = std::time::Instant::now();
                     let ids = bpe.codificar_bytes(&vec![b'a'; n]);
@@ -1363,11 +1421,12 @@ mod tests {
                 })
                 .fold(f64::MAX, f64::min)
         };
-        let (chico, grande) = (medir(100_000), medir(400_000));
+        let (chico, grande) = (medir(50_000), medir(400_000));
         let veces = grande / chico.max(1e-6);
+        eprintln!("8 veces el texto: {veces:.1} veces ({chico:.3} s y {grande:.3} s)");
         assert!(
-            veces < 8.0,
-            "4 veces el texto tardó {veces:.1} veces: {chico:.3} s y {grande:.3} s"
+            veces < 32.0,
+            "8 veces el texto tardó {veces:.1} veces: {chico:.3} s y {grande:.3} s"
         );
     }
 }
