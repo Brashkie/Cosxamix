@@ -6,7 +6,7 @@
 //! grupo B, y se mide el de B. Con `COSXAMIX_SIN_PRESTAMO` el grupo B lee su
 //! *system* entero; sin ella, copia de A el tramo común.
 //!
-//!     cargo run --release --features candle --example measure_shared_prefix
+//!     cargo run --release --example measure_shared_prefix
 //!     set COSXAMIX_SIN_PRESTAMO=1 & cargo run ... (para comparar)
 //!
 //! Imprime también la respuesta de B, que tiene que salir igual en las dos

@@ -11,9 +11,9 @@
 //!     COSXAMIX_VOCAB=bytes cargo run --release --features training,zig,c --example train_daiss -- corpus.txt
 //!
 //! `COSXAMIX_VOCAB` es `bytes` o un número (BPE de ese tamaño). `COSXAMIX_MINUTOS`,
-//! `COSXAMIX_LOTE`, `COSXAMIX_LARGO`, `COSXAMIX_LR`, `COSXAMIX_PARTES` (en cuántos
-//! tramos paralelos se reparte el lote), `COSXAMIX_SALIDA` (GGUF) y `COSXAMIX_TT`
-//! (rango: las tablas de vocabulario en Tensor-Train desde el principio).
+//! `COSXAMIX_LOTE`, `COSXAMIX_LARGO`, `COSXAMIX_LR`, `COSXAMIX_SALIDA` (GGUF) y
+//! `COSXAMIX_TT` (rango: las tablas de vocabulario en Tensor-Train desde el
+//! principio). Las secuencias del lote se reparten solas entre los núcleos.
 //!
 //! Los minutos cuentan solo el entrenamiento: medir no le quita tiempo, así que un
 //! modelo con ventanas largas, que tarda más en medirse, no sale perjudicado. La
@@ -23,14 +23,13 @@
 use std::path::Path;
 use std::time::Instant;
 
-use candle_core::{Device, Tensor};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use rayon::prelude::*;
 
 use cosxamix::daiss::{Azar, Config};
 use cosxamix::gguf::TipoGgml;
 use cosxamix::tokenizer::Bpe;
 use cosxamix::training::full::ModeloCompleto;
+use cosxamix::training::AdamW;
 
 fn env<T: std::str::FromStr>(k: &str, defecto: T) -> T {
     std::env::var(k)
@@ -51,44 +50,25 @@ fn cuerpo(t: &str) -> &str {
 }
 
 /// Un lote de ventanas del corpus.
-fn lote(
-    ids: &[u32],
-    b: usize,
-    t: usize,
-    azar: &mut Azar,
-    dev: &Device,
-) -> candle_core::Result<Tensor> {
-    let mut v = Vec::with_capacity(b * t);
-    for _ in 0..b {
-        let i = (azar.siguiente() % (ids.len() - t) as u64) as usize;
-        v.extend_from_slice(&ids[i..i + t]);
-    }
-    Tensor::from_vec(v, (b, t), dev)
+fn lote(ids: &[u32], b: usize, t: usize, azar: &mut Azar) -> Vec<Vec<u32>> {
+    (0..b)
+        .map(|_| {
+            let i = (azar.siguiente() % (ids.len() - t) as u64) as usize;
+            ids[i..i + t].to_vec()
+        })
+        .collect()
 }
 
 /// Bits por byte sobre **todo** el texto de prueba, en ventanas de `t` sin solapar:
 /// sin azar, y cada token predicho pesa lo mismo. Las primeras posiciones de cada
 /// ventana tienen poco contexto, y por eso importa cuánto texto cubre una ventana.
-fn bits_en_todo(
-    m: &ModeloCompleto,
-    ids: &[u32],
-    t: usize,
-    bytes_por_token: f64,
-    dev: &Device,
-) -> candle_core::Result<f64> {
-    let ventanas: Vec<&[u32]> = ids.chunks_exact(t).collect();
-    // Tandas chicas: candle guarda el grafo de cada una hasta terminarla, y por hilo
-    // son cientos de MB. Con 16 ventanas de 484 no alcanzan 16 GB.
-    let sumas = ventanas
-        .par_chunks((512 / t).max(1))
-        .map(|tanda| {
-            let planos: Vec<u32> = tanda.iter().flat_map(|v| v.iter().copied()).collect();
-            let l = Tensor::from_vec(planos, (tanda.len(), t), dev)?;
-            Ok(f64::from(m.perdida(&l)?.to_scalar::<f32>()?) * tanda.len() as f64)
-        })
-        .collect::<candle_core::Result<Vec<f64>>>()?;
-    let media = sumas.iter().sum::<f64>() / ventanas.len() as f64;
-    Ok(media / std::f64::consts::LN_2 / bytes_por_token)
+fn bits_en_todo(m: &ModeloCompleto, ids: &[u32], t: usize, bytes_por_token: f64) -> f64 {
+    let ventanas: Vec<Vec<u32>> = ids.chunks_exact(t).map(|v| v.to_vec()).collect();
+    let sumas: f64 = ventanas
+        .par_chunks(64)
+        .map(|tanda| f64::from(m.perdida(tanda)) * tanda.len() as f64)
+        .sum();
+    sumas / ventanas.len() as f64 / std::f64::consts::LN_2 / bytes_por_token
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -131,22 +111,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vocab: tok.tamano(),
         ..*base
     };
-    let (minutos, b, t, lr): (f64, usize, usize, f64) = (
+    let (minutos, b, t, lr): (f64, usize, usize, f32) = (
         env("COSXAMIX_MINUTOS", 10.0),
         env("COSXAMIX_LOTE", 16),
         env("COSXAMIX_LARGO", 128),
         env("COSXAMIX_LR", 1e-3),
     );
-    let partes: usize = env("COSXAMIX_PARTES", 6);
-    let dev = Device::Cpu;
     let rango_tt: usize = env("COSXAMIX_TT", 0);
-    let m = if rango_tt > 0 {
-        ModeloCompleto::con_tensor_train(&cfg, 2026, t, rango_tt, &dev)?
+    let mut m = if rango_tt > 0 {
+        ModeloCompleto::con_tensor_train(&cfg, 2026, t, rango_tt)?
     } else {
-        ModeloCompleto::nuevo(&cfg, 2026, t, &dev)?
+        ModeloCompleto::nuevo(&cfg, 2026, t)
     };
-    let sin_tablas =
-        ModeloCompleto::nuevo(&cfg, 0, 1, &dev)?.parametros() - 2 * cfg.vocab * cfg.dim;
+    let sin_tablas = ModeloCompleto::nuevo(&cfg, 0, 1).parametros() - 2 * cfg.vocab * cfg.dim;
     let tablas = m.parametros() - sin_tablas;
     println!(
         "  {:.2} M parámetros, {:.1}% en las tablas de vocabulario{}; lote {b} x {t}",
@@ -159,33 +136,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
-    let mut opt = AdamW::new(
-        m.variables(),
-        ParamsAdamW {
-            lr,
-            weight_decay: 0.01,
-            ..Default::default()
-        },
-    )?;
+    let mut opt = AdamW::nuevo(lr);
 
     // Siempre las mismas ventanas de prueba, para que las medidas se comparen; unos
     // 16 K tokens, sea cual sea el largo.
-    let lotes_prueba: Vec<Tensor> = {
+    let lotes_prueba: Vec<Vec<Vec<u32>>> = {
         let mut azar = Azar::con_semilla(99);
         let por_lote = (2048 / t).max(1);
         (0..8)
-            .map(|_| lote(&ids_prueba, por_lote, t, &mut azar, &dev))
-            .collect::<candle_core::Result<_>>()?
+            .map(|_| lote(&ids_prueba, por_lote, t, &mut azar))
+            .collect()
     };
-    let bits_por_byte = |m: &ModeloCompleto| -> candle_core::Result<f64> {
-        let mut s = 0f64;
-        for l in &lotes_prueba {
-            s += f64::from(m.perdida(l)?.to_scalar::<f32>()?);
-        }
-        Ok(s / lotes_prueba.len() as f64 / std::f64::consts::LN_2 / bytes_por_token)
+    let bits_por_byte = |m: &ModeloCompleto| -> f64 {
+        let s: f64 = lotes_prueba.iter().map(|l| f64::from(m.perdida(l))).sum();
+        s / lotes_prueba.len() as f64 / std::f64::consts::LN_2 / bytes_por_token
     };
 
-    println!("  al empezar: {:.3} bits por byte", bits_por_byte(&m)?);
+    println!("  al empezar: {:.3} bits por byte", bits_por_byte(&m));
     println!();
     println!(
         "  {:>7}{:>8}{:>10}{:>11}{:>12}",
@@ -202,14 +169,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Sube los primeros 30 s y baja en coseno hasta el final.
         let p = entrenado / total;
         let calentar = (entrenado / 30.0).min(1.0);
-        opt.set_learning_rate(
-            lr * calentar * (0.5 * (1.0 + (std::f64::consts::PI * p).cos())).max(0.02),
-        );
+        opt.lr =
+            lr * (calentar * (0.5 * (1.0 + (std::f64::consts::PI * p).cos())).max(0.02)) as f32;
 
         let paso = Instant::now();
-        let l = lote(&ids, b, t, &mut azar, &dev)?;
-        let (perdida, gradientes) = m.perdida_y_gradientes(&l, partes)?;
-        opt.step(&gradientes)?;
+        let l = lote(&ids, b, t, &mut azar);
+        let (perdida, gradientes) = m.perdida_y_gradientes(&l);
+        m.aplicar(&mut opt, &gradientes);
         let duro = paso.elapsed().as_secs_f64();
         entrenado += duro;
         tiempo_medida += duro;
@@ -223,7 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "  {:>7.1}{pasos:>8}{ms:>10.0}{:>11.3}{:>12.3}",
                 entrenado / 60.0,
                 suma / desde_medida as f64,
-                bits_por_byte(&m)?
+                bits_por_byte(&m)
             );
             proxima += cada;
             tiempo_medida = 0.0;
@@ -231,11 +197,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             desde_medida = 0;
         }
     }
-    let final_ = bits_por_byte(&m)?;
+    let final_ = bits_por_byte(&m);
     println!();
     println!("  final: {final_:.3} bits por byte, en {pasos} pasos");
     println!("  por token: {:.3} bits", final_ * bytes_por_token);
-    let todo = bits_en_todo(&m, &ids_prueba, t, bytes_por_token, &dev)?;
+    let todo = bits_en_todo(&m, &ids_prueba, t, bytes_por_token);
     println!(
         "  en todo el texto de prueba: {todo:.3} bits por byte, ventanas de {:.0} bytes",
         t as f64 * bytes_por_token
@@ -252,13 +218,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut azar = Azar::con_semilla(11);
     for _ in 0..total_tokens {
         let desde = sec.len().saturating_sub(t);
-        let n = sec.len() - desde;
-        let ids = Tensor::new(&sec[desde..], &dev)?.unsqueeze(0)?;
-        let log = m
-            .forward(&ids)?
-            .narrow(1, n - 1, 1)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
+        let todos = m.logits(&sec[desde..]);
+        let log = &todos[todos.len() - cfg.vocab..];
         let temp = 0.7f32;
         let maximo = log.iter().cloned().fold(f32::MIN, f32::max);
         let pr: Vec<f32> = log.iter().map(|v| ((v - maximo) / temp).exp()).collect();

@@ -76,6 +76,10 @@ pub mod classify;
 pub mod q2k;
 pub mod q5k;
 
+/// Multiplicación de matrices en f32 (`C += A · B`), con pesos en f16 o f32:
+/// lo que usan las imágenes.
+pub mod sgemm;
+
 /// El fusionado de Q3_K en ensamblador. Ver la cabecera del módulo.
 #[cfg(all(feature = "asm_q3k", target_arch = "x86_64"))]
 pub mod q3k_asm;

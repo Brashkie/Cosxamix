@@ -218,16 +218,18 @@ infiere. Ya está medido que **es viable**, y con qué límites.
 | parámetros entrenables | 540.672, el 0,1% del modelo |
 
 El límite es la memoria, y define el alcance: la base hay que tenerla en f32
-porque **`QMatMul` no implementa `bwd`** y el gradiente no atraviesa una
-multiplicación cuantizada. El 0,5B en f32 son ~2 GB y entra; el 3B serían
-~12 GB y no.
+porque el backward multiplica por `W` sin transponer y los kernels cuantizados
+solo hacen `x · Wᵀ` (con candle era lo mismo: **`QMatMul` no implementa
+`bwd`**). El 0,5B en f32 son ~2 GB y entra; el 3B serían ~12 GB y no.
 
 ~~1. **El entrenador**~~ y ~~2. **Guardar y cargar adaptadores**~~ están
 hechos en la 0.3.0: `src/training/`, feature `training`. Entrena de verdad —la
 pérdida baja— y el adaptador sale de 2,1 MB. El paso real son **~5,2 s**, no
 los 3,3 s proyectados: aquella cifra era un piso declarado y se quedó en el
 63% de la realidad, porque dejaba fuera la atención, RoPE, las normalizaciones
-y la capa de salida sobre 151.936 palabras.
+y la capa de salida sobre 151.936 palabras. Desde la 0.11.0, con el backward
+propio, son **~2,8 s**: no calcula `dL/dW` de la base congelada ni el gradiente
+de las tablas de vocabulario.
 
 Lo que falta:
 
@@ -291,7 +293,7 @@ Fusionar es el que se puede hacer **ya**: no necesita gradientes, solo leer
 GGUF, combinar y escribir. Y produce un modelo que no existía.
 
 Para los que sí entrenan, el límite medido es la memoria: la base tiene que
-estar en f32 porque `QMatMul` no implementa `bwd`, y el 3B en f32 son ~12 GB
+estar en f32 porque los kernels cuantizados no multiplican por `W` sin transponer, y el 3B en f32 son ~12 GB
 contra 7,3 libres. Eso lo levanta el backward cuantizado del §7, no más RAM.
 
 Lo que decide el orden del trabajo es esta cuenta, que es aritmética y no
@@ -325,11 +327,12 @@ búsqueda**: el transformer sería el 13% de los parámetros. Así que el orden 
    especialización ([DECISIONES](DECISIONES.md) §19). **Lo que falta ahora es
    un corpus**, no código.
 4. ~~**Medir un paso**~~ **hecho**: `src/training/full.rs`. En daiss-mini con lote
-   16 × 128, 1,3 a 2 s por paso, y en 10 minutos de CPU baja de `xz`
+   16 × 128, 1,3 a 2 s por paso con candle —~0,55 s desde la 0.11.0, con el
+   backward propio—, y en 10 minutos de CPU baja de `xz`
    ([DECISIONES](DECISIONES.md) §32).
 
-**Chavín** existe desde la versión sin publicar: `chavin-30b`, 29,5B, 9,02 GB en
-Q2_K, escrito, leído por candle y corriendo a 2,38 tok/s, el 71% del techo de
+**Chavín** existe desde la 0.8.0: `chavin-30b`, 29,5B, 9,02 GB en
+Q2_K, escrito, leído por candle (desde la 0.11.0, por el motor propio) y corriendo a 2,38 tok/s, el 71% del techo de
 memoria medido (§33), con pesos al azar ([DECISIONES](DECISIONES.md) §29 y §30). Lo que sigue,
 en orden:
 
@@ -371,8 +374,32 @@ se usa es estrecha.
 | **1** | lector de GGUF propio | **hecho**: coincide con candle en los 5 modelos, incluidos bytes crudos y offsets |
 | 1b | descuantización de los k-quants y de Q5_0/Q8_0 | **hecho**: los 8 formatos, **valor por valor idénticos** a candle en 21 tensores de los 5 modelos. El desempaquetado directo a `i8` cubre los 7 cuantizados, con sub-bloque de 16 y de 32 |
 | **2** | las operaciones: matmul cuantizada, RoPE, softmax | **hecha**: la matmul le gana a candle en lote, y con una fila —el decode— quedó **pareja** desde que los `f16` se convierten con `vcvtph2ps`; RoPE y softmax coinciden con candle **valor por valor** |
-| **3** | el forward de Qwen2 sobre la pila propia | **anda y genera texto**: idéntico a candle token por token, prefill 2,8x más rápido, decode a la par y 1,26x de punta a punta. **Enchufado al servidor y el de por defecto desde la 0.6.0**: 1,6-1,9x más rápido que candle por mensaje usado como lo usa WinsiBot, y 11/15 contra 10/15 en la batería ([DECISIONES](DECISIONES.md) §23). `COSXAMIX_MOTOR=candle` vuelve al de antes |
+| **3** | el forward de Qwen2 sobre la pila propia | **anda y genera texto**: idéntico a candle token por token, prefill 2,8x más rápido, decode a la par y 1,26x de punta a punta. **Enchufado al servidor y el de por defecto desde la 0.6.0**: 1,6-1,9x más rápido que candle por mensaje usado como lo usa WinsiBot, y 11/15 contra 10/15 en la batería ([DECISIONES](DECISIONES.md) §23). **El motor de candle salió en la 0.11.0**: el texto lo sirve solo el propio |
 | 4 | el backward cuantizado | es lo que candle no tiene y lo que desbloquea entrenar el 3B |
+
+**Sacar candle del todo (pedido para la 0.11.0: 100% propio): hecho.** Las
+cuatro etapas, cada una medida antes de pasar a la siguiente:
+
+1. ~~**El motor de texto**~~ **hecho en la 0.11.0**: salieron `engine_candle.rs`,
+   el `qwen2.rs` copiado y `COSXAMIX_MOTOR=candle`; sin la feature el binario
+   pesa 3,0 MB contra 7,3, con 80 crates contra 139.
+2. ~~**Las imágenes**~~ **hecho**: CLIP, el UNet de SD y TAESD propios
+   (`src/image_gen/`), sobre una GEMM al estilo BLIS (`kernels/sgemm.rs`) y un
+   lector de safetensors que deja el f16 en el mapeo. 512×512 en **7,2 s
+   contra ~16,5** (el UNet, 5,4 contra 12,6) y 2,6 GB de pico, 1,6 menos. Sin
+   el error de candle con canales = alto = ancho: hay un test para ese caso.
+3. ~~**El entrenamiento**~~ **hecho**: no un autograd general sino el backward
+   del transformer escrito a mano (`training/transformer.rs`), comprobado
+   contra diferencias finitas, AdamW propio y el Tensor-Train con su vuelta.
+   LoRA en el 0,5B: **2,8 s por paso contra ~5,2**; daiss-mini, ~545 ms contra
+   ~1.215.
+4. ~~**Los tests**~~ **hecho**: RoPE, softmax y atención comparan contra lo
+   que calculó candle 0.9.2, guardado antes de quitarlo
+   (`tests/fixtures/ops_candle.json`).
+
+Lo siguiente es **velocidad bruta en CPU** (tokens/s): el prefill, los kernels
+de Q4_K y Q6_K, y el UNet (las GroupNorm y las transposiciones todavía no
+pasaron por el perfilador).
 
 **La matmul propia ya le gana a candle en lote.** Medida sobre el `ffn_gate`
 del 3B, dos pasadas por formato y todo dentro del mismo proceso — las cifras de

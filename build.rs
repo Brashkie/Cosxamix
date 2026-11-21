@@ -135,7 +135,7 @@ fn zig_target(rust_target: &str) -> (&'static str, &'static str) {
         otro => panic!(
             "no sé traducir el target {otro} al de Zig.\n\
              Agregalo en `zig_target()` de build.rs, o compilá sin la feature:\n\
-             \n    cargo build --release --features candle\n\n\
+             \n    cargo build --release\n\n\
              Sin `zig` el motor usa el camino de Rust: AVX2 en x86-64 y la\n\
              referencia escalar en todo lo demás."
         ),

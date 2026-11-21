@@ -137,10 +137,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "  Ahora: COSXAMIX_GGUF={} cargo run --release \\",
-        destino.file_name().unwrap().to_string_lossy()
+        "  Ahora: cargo run --release --features training --example check_training_model -- {}",
+        destino.display()
     );
-    println!("    --features candle --example compare_forward");
     println!();
     println!("  Con los pesos en F32 ninguno de los dos cuantiza nada. Si los");
     println!("  logits coinciden hasta el ruido de f32, el forward propio es");

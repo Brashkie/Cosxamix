@@ -1,16 +1,15 @@
-//! El motor propio, detrás del mismo trait que el de candle.
+//! El motor propio, detrás del trait [`crate::engine::Motor`].
 //!
-//! [`crate::forward::Modelo`] ya generaba texto —idéntico a candle token por
-//! token, con el prefill 2,8x más rápido (ROADMAP §9)— pero solo desde
-//! `examples/generate`. Esto es lo que faltaba para que lo use el servidor:
-//! sesiones con su caché de atención, el prefijo común reaprovechado, el texto
-//! saliendo en partes, y el corte en `<|im_end|>`.
+//! [`crate::forward::Modelo`] genera el texto —idéntico a candle token por
+//! token cuando se comparaban, con el prefill 2,8x más rápido (ROADMAP §9)—;
+//! esto es lo que lo pone detrás del servidor: sesiones con su caché de
+//! atención, el prefijo común reaprovechado, el texto saliendo en partes, y el
+//! corte en `<|im_end|>`.
 //!
-//! Copia a propósito el contrato de [`crate::engine_candle::MotorCandle`]
-//! donde decide el resultado —la misma plantilla de chat ([`crate::engine::formatear`]), el
-//! mismo muestreo (semilla 42, top-p 0,9), el mismo tope de sesiones y de
-//! tokens por sesión—, porque elegir entre los dos tiene que ser cambiar
-//! `COSXAMIX_MOTOR`, no cambiar de comportamiento.
+//! Hasta la 0.10.0 convivía con el motor de candle y copiaba su contrato donde
+//! decide el resultado —la misma plantilla de chat ([`crate::engine::formatear`]),
+//! el mismo muestreo (semilla 42, top-p 0,9), el mismo tope de sesiones y de
+//! tokens por sesión—. Desde la 0.11.0 es el único.
 //!
 //! ## Lo que es más simple que en candle
 //!
@@ -32,7 +31,8 @@ use crate::forward::{Cache, Modelo};
 use crate::sampler::Muestreador;
 use crate::tokenizer_json::TokenizadorJson;
 
-/// Los mismos topes que el motor de candle, por lo mismo: ver allí.
+/// Los topes que traía el motor de candle: un caché de 4.096 tokens por sesión
+/// y 16 sesiones, para que la memoria no crezca sin techo con cada conversación.
 const MAX_CACHE_TOKENS: usize = 4096;
 const MAX_SESIONES: usize = 16;
 

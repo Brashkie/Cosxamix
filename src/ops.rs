@@ -1051,8 +1051,7 @@ pub const BLOQUES_DESDE: usize = 24;
 ///
 /// Los umbrales salen de **un tensor y esta máquina**. Son un valor por
 /// defecto medido, no una ley: en otro hardware el cruce se mueve, y la forma
-/// de saberlo es `cargo run --release --features candle --example
-/// measure_own_matmul`.
+/// de saberlo es medirlo ahí, con `examples/measure_sgemm.rs` de modelo.
 pub fn matmul_auto(
     (m, k, n): (usize, usize, usize),
     lhs: &[f32],
@@ -1844,114 +1843,6 @@ mod tests {
         assert!(rope(&mut [0.0; 6], (1, 1, 3), &cos, &sin, 0).is_err());
     }
 
-    /// RoPE y softmax tienen que coincidir con candle **valor por valor**.
-    ///
-    /// Es la prueba que de verdad importa en RoPE: hay dos convenciones —la de
-    /// mitades partidas y la intercalada— y elegir la equivocada no da ningun
-    /// error. El modelo carga, genera y dice cosas sin sentido.
-    #[cfg(feature = "candle")]
-    #[test]
-    fn rope_y_softmax_coinciden_con_candle() {
-        use candle_core::{DType, Device, Tensor};
-
-        let dev = Device::Cpu;
-        let (cabezas, dim, tokens, contexto) = (4usize, 64usize, 5usize, 32usize);
-        let base = 1_000_000f32;
-        let posicion = 7usize;
-
-        // Las tablas, calculadas como las calcula el modelo.
-        let (cos, sin) = frecuencias_rope(dim, base, contexto);
-        let mitad = dim / 2;
-        let theta: Vec<f32> = (0..dim)
-            .step_by(2)
-            .map(|i| 1f32 / base.powf(i as f32 / dim as f32))
-            .collect();
-        let theta_t = Tensor::new(theta.as_slice(), &dev).unwrap();
-        let idx = Tensor::arange(0, contexto as u32, &dev)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .reshape((contexto, 1))
-            .unwrap()
-            .matmul(&theta_t.reshape((1, mitad)).unwrap())
-            .unwrap();
-        let cos_c = idx.cos().unwrap();
-        let sin_c = idx.sin().unwrap();
-
-        // Las tablas propias tienen que coincidir con las suyas.
-        let suyos = cos_c.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let peor = cos
-            .iter()
-            .zip(&suyos)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
-        assert!(peor < 1e-5, "las tablas de coseno difieren en {peor}");
-
-        // Y la rotacion.
-        let datos: Vec<f32> = (0..tokens * cabezas * dim)
-            .map(|i| (i as f32 * 0.013).cos())
-            .collect();
-
-        // candle quiere (lote, cabezas, tokens, dim); lo nuestro es
-        // tokens x (cabezas*dim), asi que hay que transponer para comparar.
-        let mut suyo = vec![0f32; datos.len()];
-        for t in 0..tokens {
-            for h in 0..cabezas {
-                for d in 0..dim {
-                    suyo[h * tokens * dim + t * dim + d] = datos[t * cabezas * dim + h * dim + d];
-                }
-            }
-        }
-        let x_c = Tensor::from_vec(suyo, (1, cabezas, tokens, dim), &dev).unwrap();
-        let cos_n = cos_c.narrow(0, posicion, tokens).unwrap();
-        let sin_n = sin_c.narrow(0, posicion, tokens).unwrap();
-        let salida_c = candle_nn::rotary_emb::rope(&x_c.contiguous().unwrap(), &cos_n, &sin_n)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-
-        let mut nuestro = datos.clone();
-        rope(&mut nuestro, (tokens, cabezas, dim), &cos, &sin, posicion).unwrap();
-
-        let mut peor = 0f32;
-        for t in 0..tokens {
-            for h in 0..cabezas {
-                for d in 0..dim {
-                    let a = nuestro[t * cabezas * dim + h * dim + d];
-                    let b = salida_c[h * tokens * dim + t * dim + d];
-                    peor = peor.max((a - b).abs());
-                }
-            }
-        }
-        assert!(
-            peor < 1e-5,
-            "RoPE difiere de candle en {peor}: puede ser la convencion intercalada"
-        );
-
-        // Softmax, sobre valores con rango amplio.
-        let logits: Vec<f32> = (0..3 * 128)
-            .map(|i| (i as f32 * 0.17).sin() * 20.0)
-            .collect();
-        let suyo = candle_nn::ops::softmax_last_dim(
-            &Tensor::from_vec(logits.clone(), (3, 128), &dev).unwrap(),
-        )
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
-        let mut nuestro = logits;
-        softmax(&mut nuestro, 128).unwrap();
-        let peor = nuestro
-            .iter()
-            .zip(&suyo)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
-        assert!(peor < 1e-6, "softmax difiere de candle en {peor}");
-    }
-
     /// La atencion tiene que cumplir tres propiedades que no dependen de
     /// ninguna otra implementacion, y que juntas atrapan los errores de
     /// mascara, de reparto de GQA y de escala.
@@ -2061,34 +1952,113 @@ mod tests {
         assert!(atencion(&q, &k, &v, (7, 6, cabezas, cabezas_kv, dim), &mut salida).is_err());
     }
 
-    /// Y la atencion tiene que coincidir con candle, armada con sus tensores.
-    ///
-    /// Es la prueba que vale: las propiedades de arriba no distinguen un
-    /// reparto de GQA con `%` de uno con `/`, porque las dos reparten "algo" a
-    /// cada cabeza. Esta si.
-    #[cfg(feature = "candle")]
-    #[test]
-    fn la_atencion_coincide_con_candle() {
-        use candle_core::{Device, Tensor};
+    // ── Contra candle, sin candle ────────────────────────────────────────────
+    //
+    // RoPE, softmax y la atención se comprobaban contra candle, que es una
+    // implementación independiente: así se atrapó, por ejemplo, que RoPE tiene
+    // dos convenciones —mitades partidas o intercalada— y la equivocada no da
+    // ningún error, solo un modelo que dice cosas sin sentido. Desde la 0.11.0
+    // Cosxamix no depende de candle, así que lo que calculó candle para estas
+    // entradas quedó guardado en `tests/fixtures/ops_candle.json` (lo escribió
+    // candle 0.9.2 con `candle_nn::rotary_emb::rope`, `softmax_last_dim` y
+    // `matmul`, antes de quitarlo) y se compara contra eso, con las mismas
+    // tolerancias.
 
-        let dev = Device::Cpu;
-        let (cabezas, cabezas_kv, dim) = (16usize, 2usize, 64usize);
-        let (tokens, total) = (4usize, 9usize);
-        let ancho_q = cabezas * dim;
-        let ancho_kv = cabezas_kv * dim;
-        let por_grupo = cabezas / cabezas_kv;
+    const CABEZAS_R: usize = 4;
+    const DIM_R: usize = 64;
+    const TOKENS_R: usize = 5;
+    const CONTEXTO_R: usize = 32;
+    const BASE_R: f32 = 1_000_000.0;
+    const POS_R: usize = 7;
 
-        let q: Vec<f32> = (0..tokens * ancho_q)
+    fn datos_rope() -> Vec<f32> {
+        (0..TOKENS_R * CABEZAS_R * DIM_R)
+            .map(|i| (i as f32 * 0.013).cos())
+            .collect()
+    }
+
+    fn logits_softmax() -> Vec<f32> {
+        (0..3 * 128)
+            .map(|i| (i as f32 * 0.17).sin() * 20.0)
+            .collect()
+    }
+
+    const AT: (usize, usize, usize, usize, usize) = (4, 9, 16, 2, 64); // tokens, total, cabezas, kv, dim
+
+    fn qkv_atencion() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let (tokens, total, cabezas, cabezas_kv, dim) = AT;
+        let q = (0..tokens * cabezas * dim)
             .map(|i| (i as f32 * 0.011).sin())
             .collect();
-        let k: Vec<f32> = (0..total * ancho_kv)
+        let k = (0..total * cabezas_kv * dim)
             .map(|i| (i as f32 * 0.017).cos())
             .collect();
-        let v: Vec<f32> = (0..total * ancho_kv)
+        let v = (0..total * cabezas_kv * dim)
             .map(|i| (i as f32 * 0.023).sin())
             .collect();
+        (q, k, v)
+    }
 
-        let mut nuestro = vec![0f32; tokens * ancho_q];
+    fn referencias() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/fixtures/ops_candle.json"))
+            .expect("tests/fixtures/ops_candle.json")
+    }
+
+    fn vector(v: &serde_json::Value, clave: &str) -> Vec<f32> {
+        v[clave]
+            .as_array()
+            .unwrap_or_else(|| panic!("falta {clave}"))
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
+    }
+
+    fn peor(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    }
+
+    /// RoPE y softmax tienen que dar lo que dio candle **valor por valor**.
+    #[test]
+    fn rope_y_softmax_como_candle() {
+        let r = referencias();
+        let (cos, sin) = frecuencias_rope(DIM_R, BASE_R, CONTEXTO_R);
+        let e = peor(&cos, &vector(&r, "cos"));
+        assert!(e < 1e-5, "las tablas de coseno difieren en {e}");
+        let _ = &sin;
+
+        let mut nuestro = datos_rope();
+        rope(
+            &mut nuestro,
+            (TOKENS_R, CABEZAS_R, DIM_R),
+            &cos,
+            &sin,
+            POS_R,
+        )
+        .unwrap();
+        let e = peor(&nuestro, &vector(&r, "rope"));
+        assert!(
+            e < 1e-5,
+            "RoPE difiere de candle en {e}: puede ser la convencion intercalada"
+        );
+
+        let mut nuestro = logits_softmax();
+        softmax(&mut nuestro, 128).unwrap();
+        let e = peor(&nuestro, &vector(&r, "softmax"));
+        assert!(e < 1e-6, "softmax difiere de candle en {e}");
+    }
+
+    /// Y la atención —con GQA, escala y máscara causal con caché caliente—
+    /// tiene que dar lo que dio candle armada con sus tensores. Las propiedades
+    /// de arriba no distinguen un reparto de GQA con `%` de uno con `/`; esta sí.
+    #[test]
+    fn la_atencion_como_candle() {
+        let (q, k, v) = qkv_atencion();
+        let (tokens, total, cabezas, cabezas_kv, dim) = AT;
+        let mut nuestro = vec![0f32; tokens * cabezas * dim];
         atencion(
             &q,
             &k,
@@ -2097,73 +2067,7 @@ mod tests {
             &mut nuestro,
         )
         .unwrap();
-
-        // Lo mismo con candle: (cabezas, tokens, dim) y (cabezas, total, dim),
-        // con las cabezas de kv repetidas para cubrir el grupo.
-        let mut qc = vec![0f32; tokens * ancho_q];
-        for t in 0..tokens {
-            for h in 0..cabezas {
-                for d in 0..dim {
-                    qc[h * tokens * dim + t * dim + d] = q[t * ancho_q + h * dim + d];
-                }
-            }
-        }
-        let mut kc = vec![0f32; cabezas * total * dim];
-        let mut vc = vec![0f32; cabezas * total * dim];
-        for h in 0..cabezas {
-            let grupo = h / por_grupo;
-            for p in 0..total {
-                for d in 0..dim {
-                    kc[h * total * dim + p * dim + d] = k[p * ancho_kv + grupo * dim + d];
-                    vc[h * total * dim + p * dim + d] = v[p * ancho_kv + grupo * dim + d];
-                }
-            }
-        }
-        let qt = Tensor::from_vec(qc, (cabezas, tokens, dim), &dev).unwrap();
-        let kt = Tensor::from_vec(kc, (cabezas, total, dim), &dev).unwrap();
-        let vt = Tensor::from_vec(vc, (cabezas, total, dim), &dev).unwrap();
-
-        let escala = 1.0 / (dim as f64).sqrt();
-        let puntos = (qt.matmul(&kt.transpose(1, 2).unwrap()).unwrap() * escala).unwrap();
-
-        // La mascara causal con cache caliente: el token t esta en la posicion
-        // total-tokens+t.
-        let desplazamiento = total - tokens;
-        let mascara: Vec<f32> = (0..tokens)
-            .flat_map(|t| {
-                (0..total).map(move |p| {
-                    if p <= desplazamiento + t {
-                        0.0
-                    } else {
-                        f32::NEG_INFINITY
-                    }
-                })
-            })
-            .collect();
-        let mascara = Tensor::from_vec(mascara, (tokens, total), &dev)
-            .unwrap()
-            .broadcast_as((cabezas, tokens, total))
-            .unwrap();
-        let puntos = puntos.broadcast_add(&mascara).unwrap();
-        let pesos = candle_nn::ops::softmax_last_dim(&puntos).unwrap();
-        let suyo = pesos
-            .matmul(&vt)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-
-        let mut peor = 0f32;
-        for t in 0..tokens {
-            for h in 0..cabezas {
-                for d in 0..dim {
-                    let a = nuestro[t * ancho_q + h * dim + d];
-                    let b = suyo[h * tokens * dim + t * dim + d];
-                    peor = peor.max((a - b).abs());
-                }
-            }
-        }
-        assert!(peor < 1e-5, "la atencion difiere de candle en {peor}");
+        let e = peor(&nuestro, &vector(&referencias(), "atencion"));
+        assert!(e < 1e-5, "la atencion difiere de candle en {e}");
     }
 }

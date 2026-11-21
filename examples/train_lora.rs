@@ -18,23 +18,22 @@
 //!
 //! ## Qué esperar
 //!
-//! Medido en un i5-10400 sin GPU con secuencias de 256 tokens: **~3 s por
-//! paso**. Cincuenta pasos son dos minutos y medio, y sirven para ver que la
-//! pérdida baja; mil pasos son menos de una hora y empiezan a servir para
-//! algo. No es entrenar un modelo: es moverle el estilo a uno que ya sabe.
+//! Cincuenta pasos sirven para ver que la pérdida baja; mil empiezan a servir
+//! para algo. No es entrenar un modelo: es moverle el estilo a uno que ya sabe.
+//! El tiempo por paso lo imprime el propio bucle, y `measure_lora` lo mide
+//! aparte.
 
 use std::path::Path;
 use std::time::Instant;
 
-use candle_core::{Device, Tensor};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW};
-use cosxamix::training::{guardar, ModeloEntrenable};
+use cosxamix::tokenizer_json::TokenizadorJson;
+use cosxamix::training::{guardar, AdamW, ModeloEntrenable};
 
 /// Tokens por secuencia. Más largo entrena mejor y cuesta más que lineal,
 /// porque la atención es cuadrática en el largo.
 const LARGO: usize = 256;
 
-fn main() -> candle_core::Result<()> {
+fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let corpus = args.next().unwrap_or_else(|| {
         eprintln!("falta el corpus: cargo run ... --example train_lora -- corpus.txt");
@@ -48,17 +47,10 @@ fn main() -> candle_core::Result<()> {
         .next()
         .unwrap_or_else(|| "modelos/tokenizer.json".into());
 
-    let dev = Device::Cpu;
-
     // ── El corpus ────────────────────────────────────────────────────────
-    let texto = std::fs::read_to_string(&corpus)?;
-    let tok = tokenizers::Tokenizer::from_file(&tok_ruta)
-        .map_err(|e| candle_core::Error::Msg(format!("tokenizador: {e}")))?;
-    let ids: Vec<u32> = tok
-        .encode(texto.as_str(), false)
-        .map_err(|e| candle_core::Error::Msg(format!("tokenizar: {e}")))?
-        .get_ids()
-        .to_vec();
+    let texto = std::fs::read_to_string(&corpus).map_err(|e| format!("{corpus}: {e}"))?;
+    let tok = TokenizadorJson::para_modelo(Path::new(&gguf), Path::new(&tok_ruta))?;
+    let ids = tok.codificar(&texto);
 
     // Hace falta un token mas que el largo: el ultimo es el objetivo del
     // anteultimo y no tiene entrada propia.
@@ -80,23 +72,13 @@ fn main() -> candle_core::Result<()> {
     // ── El modelo ────────────────────────────────────────────────────────
     println!("  cargando el modelo y descuantizando a f32...");
     let t0 = Instant::now();
-    let modelo = ModeloEntrenable::cargar(Path::new(&gguf), 8, 16.0, &dev)?;
-    let vars = modelo.variables();
-    let entrenables: usize = vars.iter().map(|v| v.elem_count()).sum();
+    let mut modelo = ModeloEntrenable::cargar(Path::new(&gguf), 8, 16.0)?;
+    let (entrenables, matrices) = modelo.entrenables();
     println!("  listo en {:.1} s", t0.elapsed().as_secs_f64());
-    println!(
-        "  entrenables {entrenables} parametros en {} matrices",
-        vars.len()
-    );
+    println!("  entrenables {entrenables} parametros en {matrices} matrices");
     println!();
 
-    let mut opt = AdamW::new(
-        vars,
-        ParamsAdamW {
-            lr: 1e-4,
-            ..Default::default()
-        },
-    )?;
+    let mut opt = AdamW::nuevo(1e-4);
 
     // ── El bucle ─────────────────────────────────────────────────────────
     println!(
@@ -114,17 +96,14 @@ fn main() -> candle_core::Result<()> {
         // punta. Repetir siempre la misma haria bajar la perdida sin que el
         // modelo aprenda nada mas que esa ventana.
         let desde = (paso - 1) * (ventanas.max(1) / pasos.max(1)).max(1) % ventanas;
-        let entrada = Tensor::new(&ids[desde..desde + LARGO], &dev)?;
-        let objetivo = Tensor::new(&ids[desde + 1..desde + 1 + LARGO], &dev)?;
+        // LARGO + 1 tokens: el último es el objetivo del anteúltimo.
+        let lote = [ids[desde..desde + LARGO + 1].to_vec()];
 
         let t = Instant::now();
-        let logits = modelo.forward(&entrada)?;
-        let perdida = candle_nn::loss::cross_entropy(&logits, &objetivo)?;
-        let grads = perdida.backward()?;
-        opt.step(&grads)?;
+        let (p, grads) = modelo.perdida_y_gradientes(&lote);
+        modelo.aplicar(&mut opt, &grads);
         let ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        let p = perdida.to_scalar::<f32>()?;
         if paso == 1 {
             primera = p;
         }
@@ -144,7 +123,7 @@ fn main() -> candle_core::Result<()> {
 
     // ── El resultado ─────────────────────────────────────────────────────
     let salida = Path::new("adaptador.safetensors");
-    let n = guardar(&modelo.adaptadores(), salida)?;
+    let n = guardar(modelo.params(), salida)?;
     let bytes = std::fs::metadata(salida).map(|m| m.len()).unwrap_or(0);
 
     println!();

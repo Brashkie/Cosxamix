@@ -5,7 +5,7 @@
 //!
 //! ## Cómo está hecho
 //!
-//! No reescribe nada: compone. El gestor sostiene un [`MotorCandle`] por cada
+//! No reescribe nada: compone. El gestor sostiene un [`MotorPropio`] por cada
 //! GGUF que encuentra —cada uno con su tokenizador, su caché de atención y sus
 //! sesiones— y decide cuáles están en RAM. La inferencia y el caché por sesión,
 //! que es la parte difícil y la que está medida, no se tocan.
@@ -32,7 +32,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::engine::{ErrorMotor, ModeloDisponible, Motor, Peticion, Respuesta};
-use crate::engine_candle::MotorCandle;
 use crate::engine_own::MotorPropio;
 
 /// Lo que el gestor necesita de un motor además de generar: poder cargarlo y
@@ -41,18 +40,6 @@ pub trait MotorCargable: Motor {
     fn precalentar(&self) -> Result<(), ErrorMotor>;
     fn descargar(&self);
     fn esta_caliente(&self) -> bool;
-}
-
-impl MotorCargable for MotorCandle {
-    fn precalentar(&self) -> Result<(), ErrorMotor> {
-        MotorCandle::precalentar(self)
-    }
-    fn descargar(&self) {
-        MotorCandle::descargar(self)
-    }
-    fn esta_caliente(&self) -> bool {
-        MotorCandle::esta_caliente(self)
-    }
 }
 
 impl MotorCargable for MotorPropio {
@@ -64,27 +51,6 @@ impl MotorCargable for MotorPropio {
     }
     fn esta_caliente(&self) -> bool {
         MotorPropio::esta_caliente(self)
-    }
-}
-
-/// Con qué motor se sirven los modelos.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TipoMotor {
-    Candle,
-    /// El de la casa: `forward.rs` y los kernels de `src/kernels/`.
-    Propio,
-}
-
-impl TipoMotor {
-    /// `COSXAMIX_MOTOR=propio|candle`. Sin la variable, el propio: desde la
-    /// 0.6.0, cuando acertó 11 de 15 en la batería con la que se eligió el 3B,
-    /// contra 10 de candle, y respondió 1,6-1,9x más rápido por mensaje
-    /// (DECISIONES §23). `candle` vuelve al de antes.
-    pub fn del_entorno() -> Self {
-        match std::env::var("COSXAMIX_MOTOR").as_deref() {
-            Ok("candle") => Self::Candle,
-            _ => Self::Propio,
-        }
     }
 }
 
@@ -148,18 +114,13 @@ fn tokenizador_de(gguf: &Path, dir: &Path) -> Option<PathBuf> {
 impl GestorModelos {
     /// Recorre el directorio y registra un motor por cada GGUF emparejado.
     ///
-    /// No carga ninguno: igual que `MotorCandle`, descubrir es barato y cargar
-    /// no.
+    /// No carga ninguno: descubrir es barato y cargar no.
     pub fn descubrir(dir: &Path, presupuesto_mb: u64) -> Result<Self, ErrorMotor> {
-        Self::descubrir_con(dir, presupuesto_mb, TipoMotor::del_entorno())
+        Self::descubrir_con(dir, presupuesto_mb)
     }
 
     /// Lo mismo, eligiendo el motor.
-    pub fn descubrir_con(
-        dir: &Path,
-        presupuesto_mb: u64,
-        tipo: TipoMotor,
-    ) -> Result<Self, ErrorMotor> {
+    pub fn descubrir_con(dir: &Path, presupuesto_mb: u64) -> Result<Self, ErrorMotor> {
         let mut entradas = HashMap::new();
 
         let leidos = std::fs::read_dir(dir)
@@ -184,14 +145,8 @@ impl GestorModelos {
             };
             let bytes = item.metadata().map(|m| m.len()).unwrap_or(0);
 
-            let motor: Result<Arc<dyn MotorCargable>, ErrorMotor> = match tipo {
-                TipoMotor::Candle => {
-                    MotorCandle::nuevo(&nombre, &ruta, &tok).map(|m| Arc::new(m) as _)
-                }
-                TipoMotor::Propio => {
-                    MotorPropio::nuevo(&nombre, &ruta, &tok).map(|m| Arc::new(m) as _)
-                }
-            };
+            let motor: Result<Arc<dyn MotorCargable>, ErrorMotor> =
+                MotorPropio::nuevo(&nombre, &ruta, &tok).map(|m| Arc::new(m) as _);
             match motor {
                 Ok(m) => {
                     tracing::info!(

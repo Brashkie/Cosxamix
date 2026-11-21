@@ -1,6 +1,6 @@
 //! Cuánto cuesta el tokenizador: entrenar, pre-tokenizar, codificar y
-//! decodificar, y con `--features candle` lo mismo con el crate `tokenizers`,
-//! que es el que sirve hoy los modelos de Qwen.
+//! decodificar, y lo mismo con el crate `tokenizers` de Hugging Face, que solo
+//! está como dependencia de desarrollo, para comparar.
 //!
 //! El corpus son los documentos del proyecto, como en `train_tokenizer`.
 //!

@@ -35,10 +35,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        # Sin features: solo la capa HTTP, 6 crates. Con `candle`: el motor de
-        # verdad, 155 crates. Se prueban las dos porque la capa HTTP tiene que
-        # seguir compilando sola — es lo que permite tocarla sin pagar el
-        # minuto y medio del motor.
+        # Sin features: el servidor con el motor, las imágenes y todo lo propio
+        # (80 crates; candle salió en la 0.11.0). `training` suma el
+        # entrenamiento, que quien solo sirve no compila.
         #
         # `asm_q4k` EJECUTA el kernel fusionado de Q4_K escrito en ensamblador
         # contra la referencia. Es la unica forma de correr el de System V: se
@@ -49,7 +48,7 @@ jobs:
         #
         # `asm_q3k` hace lo mismo con el de Q3_K, que ademas se compara bit a bit
         # contra los intrinsecos: es el mismo algoritmo en el mismo orden.
-        features: ['', 'candle', 'training', 'asm_q4k', 'asm_q3k']
+        features: ['', 'training', 'asm_q4k', 'asm_q3k']
     steps:
       - uses: actions/checkout@v4
 
@@ -120,7 +119,7 @@ jobs:
       - uses: ./.github/actions/instalar-zig
 
       - name: Clippy
-        run: cargo clippy --features zig,candle,c --all-targets -- -D warnings
+        run: cargo clippy --features zig,c,training --all-targets -- -D warnings
 
       # Entre los 22 hay seis que comparan cada backend contra la referencia
       # escalar con la misma entrada. Son los que demuestran que el kernel de
@@ -128,14 +127,12 @@ jobs:
       # tenerlo.
       # Con `c`, tambien el kernel de C (`zig cc`, el mismo Zig de arriba).
       - name: Tests
-        run: cargo test --features zig,candle,c
+        run: cargo test --features zig,c,training
 
       # La compilación para las CPU sin AVX2: Rust en el x86-64 básico, y Zig
       # con sus dos copias. Aquí SÍ va RUSTFLAGS, a propósito: es la forma de
       # sacar el `target-cpu` del config. COSXAMIX_SIN_AVX2 hace que el runner,
-      # que tiene AVX2, corra el camino de una CPU que no lo tiene. Sin candle:
-      # recompilarlo sin target-cpu son minutos, y lo que se prueba son los
-      # kernels.
+      # que tiene AVX2, corra el camino de una CPU que no lo tiene.
       - name: Tests sin AVX2 (Rust y Zig en baseline)
         env:
           RUSTFLAGS: -C target-cpu=x86-64
@@ -197,12 +194,12 @@ jobs:
       - name: Clippy para ARM
         run: |
           cargo clippy --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
-          cargo clippy --features zig,candle --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+          cargo clippy --features zig,training --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
 
       - name: Compilar
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --features zig,candle --target aarch64-unknown-linux-gnu
+        run: cargo build --release --features zig --target aarch64-unknown-linux-gnu
 
       # Que compile no prueba que el kernel sea de ARM: con el bug del
       # `-target`, Zig producia un .a de x86-64 igual de valido para el

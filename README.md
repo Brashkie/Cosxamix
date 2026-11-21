@@ -44,7 +44,7 @@ away:
 | layer | who does it | ours? |
 |---|---|---|
 | HTTP API, model management, cache, scheduler | **Cosxamix** | **yes** |
-| Graph execution, attention, quantization | **Cosxamix** — in progress, replacing `candle` piece by piece | **yes** |
+| Graph execution, attention, quantization, images, training | **Cosxamix** — no `candle` since 0.11.0 | **yes** |
 | Individual hot-path kernels | Cosxamix, **only where profiling justifies it** | maybe |
 
 **That second row said "no" until 0.3.0, and what changed it was
@@ -63,10 +63,11 @@ None of the five is fixable from the outside. And the surface actually in use
 is narrow — `Tensor`, `QMatMul`, the GGUF reader and a dozen loose functions —
 so replacing it is a bounded job, not a rewrite of `llama.cpp`.
 
-It happens **piece by piece, with candle as the oracle**: each part of ours is
-compared against theirs on the real models before it replaces anything, and
-candle stays as a dev-dependency even after it leaves the binary. Owning the
-engine is no reason to throw away the cheapest way to know whether it's right.
+It was done **piece by piece, with candle as the oracle**: each part of ours
+was compared against theirs on the real models before replacing anything. In
+0.11.0 it left entirely, tests included: what candle computed for them was saved
+(`tests/fixtures/ops_candle.json`), and training is checked against finite
+differences, which need nobody.
 
 The service layer is still where the decisions that move perceived latency the
 most live: that the model isn't unloaded, that the prompt isn't recomputed in
@@ -152,13 +153,10 @@ Environment variables:
 | `COSXAMIX_GGUF` | `qwen2.5-3b-instruct-q3_k_m.gguf` | Which one gets pre-warmed at startup |
 | `COSXAMIX_RAM_MB` | `4096` | Memory budget for loaded models |
 | `RAYON_NUM_THREADS` | physical cores | Threads for the matrix math |
-| `COSXAMIX_MOTOR` | `propio` | The in-house engine and its kernels: 1.6-1.9x faster than candle per message as WinsiBot uses it, and 11/15 vs 10/15 on the battery ([DECISIONES §23](DECISIONES.md)). `candle` goes back to the old one |
 | `COSXAMIX_SIN_BLOQUES`, `COSXAMIX_SIN_Q6K_FUSIONADO`, `COSXAMIX_SIN_VARIAS`, `COSXAMIX_SIN_PRESTAMO` | unset | Each one turns off a 0.7.0 optimization —the blocked prefill matmul, the Q6_K kernel, q-k-v in one pass, the prefix shared across conversations— to measure with and without it ([DECISIONES §24-26](DECISIONES.md)) |
 | `COSXAMIX_PRECARGA` | `2` | Rows ahead that the decode asks the cache for while it computes one; `0` turns it off ([DECISIONES §33](DECISIONES.md)) |
 | `COSXAMIX_SIN_Q5K_FUSIONADO` | unset | Turns off the Q5_K fused kernel, to measure with and without it ([DECISIONES §34](DECISIONES.md)) |
-| `COSXAMIX_IMAGEN_TIPO` | `f16` | SD-Turbo weights for `/api/image`: `f32` is 25% faster and uses 2.4 GB more |
-| `COSXAMIX_IMAGEN_VAE` | `taesd` | `completo` decodes with SD's VAE: 27 s against 3 |
-| `COSXAMIX_IMAGEN_LIBERAR_MIN` | `10` | Minutes without image requests before the model (4.2 GB) is released |
+| `COSXAMIX_IMAGEN_LIBERAR_MIN` | `10` | Minutes without image requests before the model (2.6 GB peak) is released |
 
 **Every `.gguf` in the directory is registered**, not only the one in
 `COSXAMIX_GGUF`: that variable says which one is pre-warmed, not which one
@@ -182,17 +180,15 @@ tokenizer doesn't raise an error: it produces nonsense.
 ## Building, testing and publishing
 
 ```bash
-cargo run --release                                  # HTTP layer only, 6 crates
-cargo run --release --features candle                # the real engine, 155 crates
-cargo build --release --features zig,candle          # with the Zig kernels
+cargo run --release --features zig,c                # text and images, with the Zig and C kernels: 80 crates
 ```
 
 What each thing checks, and it all runs the same locally as in CI:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --features zig,candle --all-targets -- -D warnings
-cargo test --features zig,candle                     # 22 tests, none needs a model
+cargo clippy --features zig,c,training --all-targets -- -D warnings
+cargo test --features zig,c,training                 # none needs a model
 python scripts/check_docs.py                         # tables, links and old names
 python scripts/check_kernel_arch.py "" x86_64        # that the kernel matches the target
 ```
@@ -320,490 +316,78 @@ which is the precondition for any training. What's missing is in
 
 ---
 
-## The engine: candle, and why
+## The engine: our own, and where it comes from
 
-The decision was made by measuring, not by reading comparisons.
+Cosxamix was born on **candle** (from Hugging Face), picked by measuring: pure
+Rust, without the C++ toolchain llama.cpp asks for, which on Termux is exactly
+the requirement we wanted gone. From 0.3.0 on it was replaced piece by piece
+—the GGUF reader, quantization, matrix multiplications, attention, the
+forward— always comparing against candle until they matched. In 0.6.0 our
+engine became the default: 11 of 15 on the question battery against 10, and
+1.6-1.9x faster per message ([DECISIONES §23](DECISIONES.md)). **In 0.11.0 the
+candle left entirely**: text, images (CLIP, the SD UNet and TAESD on our own
+GEMM, 2.3x faster and 1.6 GB lighter) and training (a hand-written backward,
+1.9x faster for LoRA) are ours. The binary weighs 3.25 MB instead of 7.3, images included, with
+80 crates instead of 139.
 
-| | candle | llama.cpp |
-|---|---|---|
-| dependencies | 155 crates, **pure Rust** | + a C++ toolchain per platform |
-| release build | 84 s | minutes, and you need a compiler |
-| crosses to `aarch64-linux-android` | **yes** | with the NDK and a fight |
-
-The last row is what decides it. Termux is a target of this project, and an
-engine that needs a C++ compiler on the phone reintroduces the very requirement
-we were removing — moved elsewhere, but the same one.
-
-**The engine doesn't use the `tokenizers` crate anymore.** `src/tokenizer_json.rs`
-reads the same `tokenizer.json` and gives the same tokens, checked against the
-crate over all of Unicode: 12.7 ms to load instead of 278, 34 MB/s to encode
-instead of 1.6. And a GGUF that carries its vocabulary inside, like the official
-ones, needs no JSON at all. The crate stays only for that test, with `default-features =
-false`, because its default `onig` feature is a C library that breaks the cross
-to Android.
+The measurements of that era —the attention cache, the embeddings table, the
+speculative decoding that was deleted— are in [DECISIONES.md](DECISIONES.md)
+and in the [CHANGELOG](CHANGELOG.md), from 0.1.0 to 0.10.0. What still holds:
 
 ### The biggest find: `target-cpu`
 
-With the engine running, the first measurement gave **1.8 tokens/s** — unusable
-for a 0.5B model. The reason wasn't candle: **Rust compiles by default for the
-basic x86-64 of 2003**, so the matrix multiplications weren't using AVX2.
+The first measurement gave **1.8 tokens/s** with a 0.5B model. **Rust compiles
+for the basic x86-64 of 2003 by default**, without AVX2. Same code, same
+model, only the flag changes:
 
-It's exactly the same trap we'd hit with Zig and `-mcpu`, now in the other
-language. Same code, same model, only the flag changes:
-
-| | per response | tokens/s |
+| | per answer | tokens/s |
 |---|---:|---:|
 | generic (default) | 4428 ms | 1.8 |
 | **`x86-64-v3`** (AVX2+FMA) | **1094 ms** | **6.1** |
 | `native` | 1066 ms | 6.3 |
 
-`x86-64-v3` was chosen over `native`, and it's pinned in `.cargo/config.toml`.
-`native` looks at the CPU doing the compiling and ties the binary to it: one
-built on a server with AVX-512 dies with an illegal instruction on a machine
-without it. `x86-64-v3` is AVX2+FMA — any CPU from 2015 onward — and delivers
-97% of the performance.
-
-**The cost, stated plainly**: the binary does not start on an x86 older than
-2015. Those need a build without that line, and it will run 4 times slower. The
-kernels in `src/kernels/` do choose at runtime, but candle's internals do not.
+`x86-64-v3` is pinned in `.cargo/config.toml`, not `native`, which ties the
+binary to the CPU that built it. **The cost**: it does not start on an x86
+older than 2015. For those:
 
 ```bash
 # For a CPU without AVX2 (Celeron, Pentium, Atom...). RUSTFLAGS replaces the config.
-RUSTFLAGS="-C target-cpu=x86-64" cargo build --release --features candle,zig
+RUSTFLAGS="-C target-cpu=x86-64" cargo build --release --features zig
 ```
 
-With `zig`, that build carries the Zig kernels twice — SSE2 and AVX2 — and picks
-one at startup: on an old CPU the in-house engine uses the SSE2 copy, **2.4x to
-12x** faster than the scalar reference ([DECISIONES §20](DECISIONES.md)).
+With `zig`, that build carries the Zig kernels twice —SSE2 and AVX2— and picks
+at startup: on an old CPU it uses the SSE2 one, **2.4x to 12x** faster than the
+scalar reference ([DECISIONES §20](DECISIONES.md)).
 
-### Measured end to end
+### Which model and which quantization
 
-Qwen2.5-0.5B-Instruct Q4_K_M (491 MB), CPU, no GPU:
+The 3B in Q3_K_M, measured with the same 15 questions with checkable answers
+(`examples/compare_models.rs`):
 
-```
-model load           ~1.9 s   (once, at startup)
-first response        3.0 s   cold
-typical response      1.1 s   warm
-speed                 6.1 tokens/s
-```
-
-Cosxamix **pre-warms at startup**: the user doesn't pay the 2 s load on their
-first question. That's the reason this project exists — Ollama unloads the
-model after 5 minutes of inactivity, and a bot with spaced-out messages pays
-that reload almost every time.
-
-With no model in `modelos/`, or built without `--features candle`, it starts
-with the demo engine and the HTTP contract still holds.
-
-```bash
-cargo run --release --features candle
-```
-### Reusing the attention cache
-
-Prefill dominates latency: generating **one** token cost 857 ms, of which ~817
-were processing the prompt. And in a conversation that work repeats almost
-entirely on every turn, because turn N's prompt starts exactly like turn N-1's.
-
-Cosxamix reuses the **longest common prefix** between the new prompt and what's
-in the cache, truncates the cache to that part, and processes only the rest.
-
-The first version required the new prompt to start with *everything* cached.
-That works in a conversation that grows, but not in WinsiBot's real case, which
-sends `system + question` with no history: turn 2 shares the system with turn 1
-and then diverges. Measured against the real bot, it gave **`cacheados=0`
-always**. With the common prefix it goes to **131**, which is the whole system
-prompt — style profiles and command catalog that used to be reprocessed on
-every message.
-
-That was only possible because `truncar_cache` already existed, from the
-speculative-decoding attempt.
-
-| turn 2 of a conversation | |
-|---|---:|
-| no cache | 2454 ms |
-| **with cache** (53 of 69 tokens reused) | **1562 ms** |
-| saved | 892 ms · **1.6x** |
-
-The advantage grows with the conversation: the longer the history, the larger
-the part that doesn't need reprocessing.
-
-#### A candle limitation, and why the delta goes one token at a time
-
-`ModelWeights::forward` builds the causal mask as **seq_len × seq_len**, which
-is only correct with an empty cache: with a cache, attention is
-seq_len × (cached + seq_len) and the shapes don't line up — the attempt gives
-`cannot broadcast [16, 16] to [1, 14, 16, 69]`. Candle supports either a full
-prefill or decoding one token at a time, not a block with a cache in play.
-
-One at a time there is no mask (`seq_len == 1` skips it) and it works. It costs
-twice per token what block prefill does — ~40 ms against ~21 — but it skips the
-entire cached prefix. The arithmetic: reusing C tokens and feeding D one at a
-time wins while **D < 1.1·C**, which holds comfortably from the second turn on.
-
-#### Why the answer changes, and why that is NOT a bug
-
-With the cache in place, the same prompt produces different text. The first
-reading is that the cache is broken. It isn't, and telling the difference took
-isolating the variable.
-
-Comparing text is useless: with argmax, a one-bit difference in the logits
-changes a token and everything diverges from there, so two different outputs
-don't distinguish a broken cache from floating-point noise. Two experiments
-were needed.
-
-**The first** fixes the prompt at 69 tokens and compares three paths:
-
-| | cache | prefill | output |
-|---|---|---|---|
-| A | no | in a block | *…enviar mensajes, **controlar chats** y mucho más* |
-| B | no | one token at a time | *…enviar mensajes, **controlar tu conversación** y mucho más* |
-| C | **yes** | one token at a time | *…enviar mensajes, **y mucho más*** |
-
-**A and B differ, and neither uses the cache.** The only thing that changes
-between them is the shape of the matrix, because `gemm` accumulates in a
-different order depending on the block. That rules the cache out as the cause.
-The `COSXAMIX_PREFILL_INCREMENTAL=1` switch exists so B can be run; it is not
-for production, only for isolating this variable.
-
-**The second** compares the logits, which is the quantity the model actually
-produces, using a real prompt — not made-up ids, which give a flat distribution
-where the most likely token is decided by noise:
-
-```
-rango de los logits  33,42
-diferencia maxima     0,68   (2,0% del rango)
-token mas probable   68012 sin cache | 68012 con cache  ->  IGUAL
-```
-
-A cache attending to the wrong tokens wouldn't produce similar logits: it would
-produce different ones, and the maximum would move. It picks the same token.
-
-```bash
-cargo run --release --features candle --example compare_logits   # correctness
-cargo run --release --features candle --example check_cache      # performance
-```
-#### The real limit: there is only one cache
-
-The cache lives inside the model, so there is **one**. While a single
-conversation moves forward it works very well; when several arrive interleaved
-— which is normal on WhatsApp — each one invalidates the other's.
-
-Measured with two three-turn conversations, the same six requests, with only
-the order changing:
-
-| | time | tokens reused |
+| | disk | correct |
 |---|---:|---:|
-| sequential (all of A, then B) | 5541 ms | 244 |
-| interleaved (A1 B1 A2 B2 A3 B3) | 9770 ms | **0** |
-| | **+76%** | |
-
-In the good case you can watch the advantage grow: turn 3 reused **93 of 107**
-tokens and took 871 ms, *less* than turn 2 despite a longer prompt. In the
-interleaved case it never hits once.
-
-**The cache is fragile to a mismatched history.** It only reuses if the new
-tokens extend the cached ones exactly, and the cached ones include what the
-model generated. If the caller returns text different from what was generated —
-a trim, a replacement, a summary — the prefix doesn't fit and nothing is reused.
-The first version of this measurement built the history from invented text and
-reported zero reuse **in the sequential case too**; it looked like the cache was
-useless, and what was useless was the measurement.
-
-#### Which model: measured, not estimated
-
-Three models from the same family, same quantization (Q4_K_M), same machine.
-Speed as the median of 3 runs — a single run once gave 21.6 and 32.3 tok/s for
-the same model — and quality over 15 questions with verifiable answers: chained
-arithmetic, following a requested format, knowledge, trick questions and
-negations.
-
-| | 0.5B | 1.5B | 3B |
-|---|---:|---:|---:|
-| on disk | 468 MB | 1066 MB | 2007 MB |
-| resident | 504 MB | 1108 MB | 2051 MB |
-| RAM/disk ratio | x1.08 | x1.04 | x1.02 |
-| decode | ~32 tok/s | 19.3 | 10.0 |
-| prefill | 846 ms | 814 ms | 1561 ms |
-| 40-token response | ~2.1 s | ~2.9 s | ~5.6 s |
-| correct | 7/15 | 8/15 | **10/15** |
-
-**The 1.5B is not the sweet spot.** It costs 1.7x in speed and wins one
-question out of fifteen, which is noise. The real jump is the 3B: it gets right
-the ones the other two miss — a kilo of lead versus a kilo of feathers, the 206
-bones, Canberra — and answers "penguin" where the 0.5B says "giraffes" and the
-1.5B says "Uralic".
-
-The choice is between **0.5B and 3B**, depending on whether latency or accuracy
-weighs more. Neither is good: 10 out of 15 on basic questions is still weak.
-
-The RAM/disk ratio dropped to **x1.02-x1.08** after removing the embedding
-dequantization. It used to be x2, and on the 3B that would have been 4 GB
-instead of 2.
-
-```bash
-cargo run --release --features candle --example compare_models
-cargo run --release --features candle --example measure_memory -- <gguf> <tokenizer>
-```
-
-#### Quantization: Q3_K_M, not IQ3
-
-**candle does not support the IQ formats.** Its type enumeration stops at the
-classic k-quants — `Q2K Q3K Q4K Q5K Q6K Q8K` — and the IQ ones (IQ3_M, IQ2_XXS)
-belong to llama.cpp. They're better per bit, but they're not available here.
-
-Q3K is the closest thing that is. Same 3B model, same 15 questions:
-
-| | on disk | resident | decode | 40 tokens | correct |
-|---|---:|---:|---:|---:|---:|
-| Q2_K | 1313 MB | — | 13.7 tok/s | ~4.0 s | **6/15** |
-| **Q3_K_M** | **1644 MB** | **1687 MB** | **11.9 tok/s** | **~4.7 s** | **10/15** |
-| Q4_K_M | 2007 MB | 2051 MB | 10.8 tok/s | ~5.2 s | 10/15 |
-
-**Q3 gets as many right as Q4 with 363 MB less and 10% faster.** Fewer bytes
-per weight means fewer bytes to read from RAM on every token, which is exactly
-the bottleneck of generation on CPU.
-
-Q2 no longer holds: the damage is visible at a glance. It says *"canossa"* for
-Canberra, *1972* for 1969, *"20 mandile"* where a number belongs, and drops
-French accents — *"debido à su arquitectura"* — in the middle of Spanish. That's
-how an over-quantized model breaks: it doesn't fail with an error, it answers
-things that almost look right.
-
-Hence the default is **Qwen2.5-3B Q3_K_M**: 1687 MB resident and ~4.7 s per
-40-token response.
-
-```bash
-cargo run --release --features candle --example compare_models -- --cuant
-```
-
-#### Parallelism: how many cores it really uses
-
-The theoretical ceiling on CPU is `RAM bandwidth / model size`. With an
-i5-10400 and dual-channel DDR4-2133 that's ~30 GB/s measured over 0.47 GB:
-**~64 tokens/s**.
-
-Measured separating prefill from decode — two runs with the same prompt and a
-different token count, so prefill cancels out in the subtraction:
-
-| threads | prefill | decode | effective cores | CPU consumed |
-|---:|---:|---:|---:|---:|
-| 1 | 3173 ms | 9.86 tok/s | 0.98 | 32.9 s |
-| 2 | 1639 ms | 16.94 | 1.76 | 33.8 s |
-| 4 | 1060 ms | 23.65 | 2.95 | 41.8 s |
-| **6** | 933 ms | **25.58** | 4.06 | **53.2 s** |
-| 12 | 854 ms | 26.08 | 6.23 | 81.8 s |
-
-**From 6 to 12 threads you gain 2% and spend 54% more CPU.** The two threads of
-one core compete for the same vector unit, and in work that is almost entirely
-AVX2 the second one adds nothing. On a phone or a laptop that's heat and
-battery in exchange for nothing.
-
-That's why Cosxamix pins the pool to **physical** cores at startup. `num_cpus`
-is needed because `available_parallelism()` returns 12 on a machine that has 6.
-`RAYON_NUM_THREADS` still wins if someone sets it.
-
-##### A figure that was wrong and needs correcting
-
-**6.1 tokens/s** was reported earlier, and on that basis it was concluded that
-the engine was at 7% of the ceiling and that speculative decoding wasn't worth
-considering.
-
-That figure was an artifact: it came from dividing generated tokens by the
-**total** time, on one- and two-token responses where prefill takes almost
-everything. It wasn't measuring generation speed. The real number is **~25
-tok/s**, which is **30% of the ceiling**, not 7%.
-
-It changes the conclusion: about 3x of headroom remains before hitting memory,
-so speculative decoding — which trades weight reads for arithmetic — does have
-room to pay off. Less than it would at 95% of the ceiling, but room.
-
-#### 938 MB for a 469 MB model: the embedding table
-
-§4.1 of the theory guide blames conventional loading for "doubling physical RAM
-use" and proposes `mmap`. It was measured before being accepted, and the cause
-was something else:
-
-| | |
-|---|---:|
-| file on disk | 468.6 MB |
-| quantized tensors | 463.0 MB |
-| **embedding converted to f32** | **519.3 MB** |
-| estimated | 982.3 MB |
-| measured | 938.1 MB |
-
-`from_gguf` was calling `tok_embeddings.dequantize()` on the whole table:
-151936 x 896 in f32 weighs **more than the entire model**. And a forward pass
-only needs the rows of the tokens coming in — 3.5 KB per token.
-
-Now the table stays quantized and only those rows are dequantized. The table is
-stored row-major and each row occupies a whole number of blocks (896 elements
-in blocks of 32 is 28), so the bytes can be sliced without taking anything
-apart.
-
-**938 MB → 506 MB.** Resident memory ends up close to the file, which is what's
-correct. `mmap` would have saved far less; the problem was never the copy.
-
-##### A candle bug found along the way
-
-The first version generated garbage. Isolating it: of seven rows requested, six
-came out **exact** and only the first one of the slice failed — the very same
-index 0 was fine when it wasn't first. It wasn't the index: it was the position.
-
-The cause is in `candle-core`:
-
-```rust
-fn as_t_slice<T>(data: Cow<'_, [u8]>) -> &[T] {   // takes the Cow BY VALUE
-    let ptr = data.as_ptr();
-    unsafe { std::slice::from_raw_parts(ptr as *const T, ...) }
-}                                                  // and frees the Vec here
-```
-
-With `Cow::Owned` the `Vec` is owned by the local variable and is freed on
-return: the returned slice dangles, and the caller's `.to_vec()` reads freed
-memory. Most of it is still intact — which is why six rows out of seven came
-out fine — except the first bytes, which the allocator overwrites with its free
-list.
-
-Upstream doesn't hit it because it always passes `Cow::Borrowed`. The same is
-done here, and the difference against dequantizing the whole table became
-**exactly zero**.
-
-```bash
-cargo run --release --features candle --example measure_weights   # the diagnosis
-cargo run --release --features candle --example check_embeddings  # row by row
-```
-
-#### Speculative decoding: implemented, measured and deleted
-
-The idea: the 0.5B proposes K tokens and the 3B verifies them **in a single
-pass**, reading its weights once instead of K times. It promises 2-3x.
-
-It was implemented in full — draft, verification and cache truncation — and came
-out **1.91x slower**. Rule 3 says what doesn't win gets deleted, so it was
-deleted. This is written down so nobody retries it blind.
-
-##### Why it cannot work here
-
-The technique assumes that processing K positions costs about the same as one:
-the weights are the same and get read once. Measured on the 3B:
-
-| positions | ms | vs 1 |
-|---:|---:|---:|
-| 1 | 112 | 1.00x |
-| 2 | 202 | 1.80x |
-| 4 | 368 | 3.28x |
-| 5 | 420 | 3.74x |
-| 8 | 663 | 5.91x |
-
-**It scales almost linearly.** The first suspect was the output layer — Qwen's
-vocabulary is 151936 tokens — but it turned out to be only **15%** of the model,
-and 15% does not explain 3.74x.
-
-What does explain it: if the pass were limited by reading weights from RAM, 5
-positions would cost ~1x. That they cost 3.74x means it is limited by
-**compute**. And speculative decoding only pays off when the bottleneck is
-memory — it converts weight reads into arithmetic, and here arithmetic is
-already the bottleneck.
-
-It fits the bandwidth ceiling measured separately: the engine runs at **30%** of
-that ceiling. Until it gets near 100%, batching buys nothing.
-
-On top of that, the 0.5B only agrees with the 3B on **28-50%** of tokens, so of
-every 4 proposals 1.4 survive.
-
-**It becomes worth revisiting** if the engine ever gets close to the memory
-ceiling — with better matrix-multiplication kernels, for instance — or with a
-draft model that agrees far more often. Not before.
-
-##### What did survive from that work
-
-Two pieces that were needed to attempt it and are worth having on their own:
-
-* **The causal mask accounts for the cache.** The original was square and only
-  valid with an empty cache. Fixed, a conversation's delta goes in as a batch
-  instead of token by token: the interleaving benchmark went from 5422 to
-  **4772 ms**, 12%, with individual turns halving.
-* **`truncar_cache`.** Candle offers no way to truncate the attention cache. Now
-  there is one, and it's what would enable any scheme that processes tentative
-  tokens.
-
-```bash
-cargo run --release --features candle --example measure_projection
-```
-
-#### Per-session cache
-
-The cache lives inside the model, so out of the box there is **one**. With
-several interleaved conversations — normal on WhatsApp — each invalidated the
-other's. Measured before fixing it, with two three-turn conversations and the
-same six requests, changing only the order:
-
-| | time | tokens reused |
-|---|---:|---:|
-| sequential | 5541 ms | 244 |
-| interleaved | 9770 ms | **0** |
-| | **+76%** | |
-
-The two obvious ways out were measured and both discarded. **Loading the model
-per session**: 931 MB per instance, twice the GGUF — ten chats would be 9.1 GB.
-**Using the crate's API**: `ModelWeights` is not `Clone` and its `kv_cache` is
-private inside `LayerWeights`; `quantized_qwen2` only exposes `from_gguf` and
-`forward`.
-
-So `quantized_qwen2.rs` is **in this repository**, under `src/model/`, with
-three added methods — `tomar_cache`, `poner_cache`, `limpiar_cache` — and the
-rest untouched. The model has one active cache; the other conversations' caches
-are kept aside and swapped in on entry, moving pointers without copying data.
-
-| after the change | time | tokens reused |
-|---|---:|---:|
-| sequential | 5422 ms | 244 |
-| interleaved | 5357 ms | **244** |
-| | no difference | |
-
-Isolation is verified separately, because it's the dangerous failure: restoring
-the wrong cache would make the model answer conditioned on another chat, with
-no error and with an answer that sounds fine. `check_sessions` runs conversation
-A alone and then interleaved with B, and compares: **all three turns come out
-identical**.
-
-The session travels in the request body as `cosxamix_sesion`, outside the
-OpenAI dialect — which has no such concept, since every call there is
-independent. A client that doesn't send it works the same, it just reprocesses
-the whole prompt.
-
-Capped at 16 sessions with least-recently-used eviction, and 4096 tokens per
-conversation. What it costs **depends on the model**, and measuring it
-corrected a figure this document had wrong:
-
-| | KB per token | 16 sessions of 1000 tokens |
-|---|---:|---:|
-| 0.5B | 24.0 | 0.4 GB |
-| **3B Q3** (the default) | **72.0** | **1.1 GB** |
-
-36 layers against 24, and 128 head dimensions against 64: three times more per
-token. This README said "~24 KB per token, 16 sessions are ~380 MB" without
-saying which model, and with the default one that underestimates memory by
-**three times**. Measured with `examples/measure_cache_disk.rs`.
-
-Even so the trade still holds next to the 931 MB that **each** model instance
-costs, which is the alternative that was ruled out.
-
-#### The cost of keeping the model in this repository
-
-It's 338 lines of someone else's code under our maintenance, which don't receive
-upstream's fixes. When candle is updated, it has to be diffed against the
-crate's. That's why the file starts by saying where it comes from, under what
-license — MIT OR Apache-2.0, from huggingface/candle — and every change of ours
-is marked `// COSXAMIX:`: without that marker, in six months nobody can tell our
-change from a fix we're missing.
-
-```bash
-cargo run --release --features candle --example measure_interleaved  # performance
-cargo run --release --features candle --example check_sessions       # isolation
-cargo run --release --features candle --example measure_memory       # the 931 MB
-```
----
+| 0.5B Q4_K_M | 504 MB | 7/15 |
+| 1.5B Q4_K_M | 1108 MB | 8/15 |
+| 3B Q2_K | 1313 MB | 6/15, it breaks |
+| **3B Q3_K_M** | **1644 MB** | **10/15** |
+| 3B Q4_K_M | 2007 MB | 10/15 |
+
+Q3_K_M gets as many right as Q4_K_M with 363 MB less, and fewer bytes per
+weight are fewer bytes to read from RAM on every token. The 3B is under the
+**Qwen Research License** (non-commercial); the 0.5B and 1.5B, Apache-2.0
+([THIRD-PARTY.md](THIRD-PARTY.md)).
+
+### Threads, cache and memory
+
+- **Threads: physical cores, not logical ones.** Going from 6 to 12 threads on
+  an i5-10400 the decode gains 2% for 54% more CPU: both threads of a core
+  fight for the same AVX2 unit. `RAYON_NUM_THREADS` changes it.
+- **Attention cache per session**: every conversation keeps its own, and the
+  delta of a new message goes in without recomputing what came before.
+- **Memory ≈ the file**: weights are mapped and the embeddings table is read
+  row by row; a model takes 1.02-1.08x its disk size in RAM.
+- **Speculative decoding** was implemented, measured and deleted in the candle
+  era; when it makes sense again is in the [ROADMAP](ROADMAP.md) §5.
 
 ## Several languages, one single boundary
 
@@ -873,11 +457,12 @@ the same `kernels/dot.zig`, without touching a line, compiles for
 path is `core::arch::x86_64`: **x86 only**. On a phone, today, it falls back to
 the scalar reference, which is 19 times slower.
 
-That shouldn't be read as more than it says: what falls back to scalar on ARM
-are **these** kernels, `dot` and `rmsnorm`. The quantized matrix multiply,
-where 99% of the work is, is covered by candle's own hand-written `neon.rs`.
-The engine on a phone is not scalar; these two standalone kernels would be,
-without Zig.
+And since 0.11.0, with candle gone, that also holds for the quantized matrix
+multiply, where 99% of the work is: on ARM it is done by the C kernel with
+`sdot` (feature `c`) and the Zig one (feature `zig`). Up to 0.10.0 candle's
+`neon.rs` covered it; today an ARM build without `zig` or `c` falls back to the
+scalar reference for everything. That's why the ARM binaries ship with
+`zig,c`.
 
 So what Zig contributes here isn't speed: it's **coverage**. A portable kernel
 that performs nearly as well as the specific one beats a specific kernel that
@@ -971,16 +556,20 @@ Measured on an i5-10400 with no GPU, Qwen2.5-0.5B, 256-token sequences:
 | | |
 |---|---:|
 | trainable parameters | 540,672 out of 494 million |
-| full step | ~5.2 s |
-| 1000 steps | ~1.4 h |
+| full step | ~2.8 s (with candle, ~5.2) |
+| 1000 steps | ~47 min |
 | resulting adapter | 2.1 MB |
 
-**The base is held in f32, not quantized**, and that bounds the scope. candle's
-`QMatMul` does not implement `bwd`: gradients cannot flow through a quantized
-matmul, because the backward needs `dL/dy · W` — multiplying by `W`
-untransposed — and candle only knows how to do `x · Wt`. The 0.5B in f32 is
-~2 GB and fits; the 3B would be ~12 GB and does not. Training the 3B needs a
-kernel that doesn't exist yet, and it's in the [ROADMAP](ROADMAP.md) §7.
+The forward and backward are ours (`src/training/transformer.rs`), every
+gradient checked against finite differences. With the base frozen, neither
+`dL/dW` nor the vocabulary tables' gradient is computed, which is a good part
+of why the step went from 5.2 s to 2.8.
+
+**The base is held in f32, not quantized**, and that bounds the scope: the
+backward needs `dL/dy · W` — multiplying by `W` untransposed — and the quantized
+kernels only do `x · Wt`. The 0.5B in f32 is ~2 GB and fits; the 3B would be
+~12 GB and does not. Training the 3B needs that kernel, and it's in the
+[ROADMAP](ROADMAP.md) §7.
 
 The training model is an f32 reimplementation of the inference one, and that
 they are the same **is checked**, because a mistake there — RoPE order, how KV
@@ -993,16 +582,19 @@ cargo run --release --features training --example check_training_model
 
 It compares the logits of both paths on a real prompt. It doesn't demand
 equality — one dequantizes to f32 and the other multiplies in integers — but
-that they **pick the same token**. Measured: 3.2% of the range as the largest
-difference, same token.
+that they **pick the same token**. Measured: 2.6% of the range as the largest
+difference, same token. Against candle's Qwen2 in f32, before removing it, the
+difference was 4e-5: the 2.6% is what the engine quantizes, not a mistake in
+the training model.
 
 ---
 
 ## License
 
-**MIT** — see [LICENSE](LICENSE).
+**GPL-3.0-or-later** — see [LICENSE](LICENSE): it can be used, studied,
+modified and redistributed, and whatever is distributed modified stays GPL,
+with its source. Up to 0.10.0 Cosxamix was released under MIT, and those
+versions stay MIT for whoever has them; from 0.11.0 on, GPL.
 
-One file in this repository comes from another project: `src/model/qwen2.rs`,
-copied from [candle](https://github.com/huggingface/candle) under MIT OR
-Apache-2.0, with every change marked `// COSXAMIX:`. The details, and why it's
-copied instead of using the crate's, are in [THIRD-PARTY.md](THIRD-PARTY.md).
+The models it uses that don't ship in the repository, and their licenses, are
+in [THIRD-PARTY.md](THIRD-PARTY.md).

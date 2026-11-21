@@ -22,7 +22,6 @@
 use std::path::Path;
 use std::time::Instant;
 
-use candle_core::{Device, Tensor};
 use rayon::prelude::*;
 
 use cosxamix::daiss::{tokenizador_de, Config};
@@ -40,24 +39,13 @@ fn cuerpo(t: &str) -> &str {
 }
 
 /// Bits por byte sobre todo el texto, en ventanas de `t` sin solapar.
-fn bits_en_todo(
-    m: &ModeloCompleto,
-    ids: &[u32],
-    t: usize,
-    bytes_por_token: f64,
-    dev: &Device,
-) -> candle_core::Result<f64> {
-    let ventanas: Vec<&[u32]> = ids.chunks_exact(t).collect();
-    let sumas = ventanas
-        .par_chunks((512 / t).max(1))
-        .map(|tanda| {
-            let planos: Vec<u32> = tanda.iter().flat_map(|v| v.iter().copied()).collect();
-            let l = Tensor::from_vec(planos, (tanda.len(), t), dev)?;
-            Ok(f64::from(m.perdida(&l)?.to_scalar::<f32>()?) * tanda.len() as f64)
-        })
-        .collect::<candle_core::Result<Vec<f64>>>()?;
-    let media = sumas.iter().sum::<f64>() / ventanas.len() as f64;
-    Ok(media / std::f64::consts::LN_2 / bytes_por_token)
+fn bits_en_todo(m: &ModeloCompleto, ids: &[u32], t: usize, bytes_por_token: f64) -> f64 {
+    let ventanas: Vec<Vec<u32>> = ids.chunks_exact(t).map(|v| v.to_vec()).collect();
+    let sumas: f64 = ventanas
+        .par_chunks(64)
+        .map(|tanda| f64::from(m.perdida(tanda)) * tanda.len() as f64)
+        .sum();
+    sumas / ventanas.len() as f64 / std::f64::consts::LN_2 / bytes_por_token
 }
 
 /// Autovalores y autovectores de una matriz simétrica `n × n`, por Jacobi cíclico:
@@ -319,12 +307,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bytes_por_token = prueba.len() as f64 / ids.len() as f64;
 
     let t = 128;
-    let dev = Device::Cpu;
-    let m = ModeloCompleto::nuevo(&cfg, 0, t, &dev)?;
+    let mut m = ModeloCompleto::nuevo(&cfg, 0, t);
     m.cargar_pesos(ruta)?;
     let total = m.parametros();
     let t0 = Instant::now();
-    let original = bits_en_todo(&m, &ids, t, bytes_por_token, &dev)?;
+    let original = bits_en_todo(&m, &ids, t, bytes_por_token);
     println!(
         "  {ruta_modelo}: {:.2} M parámetros, {} KB de prueba",
         total as f64 / 1e6,
@@ -337,8 +324,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pos = posiciones(v, d);
     for nombre in ["token_embd.weight", "output.weight"] {
-        let var = m.peso(nombre).ok_or("falta el peso")?;
-        let w: Vec<f32> = var.as_tensor().flatten_all()?.to_vec1()?;
+        let w: Vec<f32> = m.peso(nombre).ok_or("falta el peso")?.to_vec();
         let bytes_f32 = w.len() * 4;
         println!();
         println!(
@@ -351,10 +337,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "", "parámetros", "KB", "veces", "error", "bits/byte", "Δ"
         );
 
-        let medir = |etiqueta: String, nueva: Vec<f32>, bytes: usize, params: usize| {
+        let mut medir = |etiqueta: String, nueva: Vec<f32>, bytes: usize, params: usize| {
             let error = error_relativo(&w, &nueva);
-            var.set(&Tensor::from_vec(nueva, (v, d), &dev)?)?;
-            let bits = bits_en_todo(&m, &ids, t, bytes_por_token, &dev)?;
+            m.peso_mut(nombre)
+                .ok_or("falta el peso")?
+                .copy_from_slice(&nueva);
+            let bits = bits_en_todo(&m, &ids, t, bytes_por_token);
             println!(
                 "  {etiqueta:<12}{params:>11}{:>10}{:>8.1}x{:>9.1}%{bits:>11.4}{:>+8.4}",
                 bytes >> 10,
@@ -362,7 +350,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 error * 100.0,
                 bits - original
             );
-            Ok::<_, candle_core::Error>(())
+            Ok::<_, String>(())
         };
 
         for tipo in [TipoGgml::Q8_0, TipoGgml::Q4K, TipoGgml::Q2K] {
@@ -378,7 +366,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (nueva, params) = tensor_train(&w, &pos, r);
             medir(format!("TT r={r}"), nueva, params * 4, params)?;
         }
-        var.set(&Tensor::from_vec(w, (v, d), &dev)?)?;
+        m.peso_mut(nombre)
+            .ok_or("falta el peso")?
+            .copy_from_slice(&w);
     }
     println!();
     println!("  Los bytes de SVD y TT son en F32: cuantizados, bajarían otro tanto.");

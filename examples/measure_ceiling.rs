@@ -17,7 +17,7 @@
 //! Cada escalón se mide con 1, 2, 4, 6 y 12 hilos, en un pool propio: así se ve
 //! también cuál deja de escalar.
 //!
-//!     COSXAMIX_GGUF=qwen2.5-3b-instruct-q4_k_m.gguf cargo run --release --features candle --example measure_ceiling
+//!     COSXAMIX_GGUF=qwen2.5-3b-instruct-q4_k_m.gguf cargo run --release --example measure_ceiling
 
 use std::collections::BTreeMap;
 use std::time::Instant;

@@ -1,9 +1,9 @@
 [package]
 name = "cosxamix"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 description = "Runtime de IA que sirve modelos de lenguaje por HTTP, compatible con el dialecto de Ollama"
-license     = "MIT"
+license     = "GPL-3.0-or-later"
 repository  = "https://github.com/Brashkie/Cosxamix"
 readme      = "README.md"
 keywords    = ["llm", "inference", "gguf", "quantization", "ollama"]
@@ -30,26 +30,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `unsafe` por plataforma para ahorrar una dependencia que no arrastra nada.
 memmap2            = "0.9"
 
-# ── Motor de inferencia (opcional) ───────────────────────────────────────────
-candle-core         = { version = "0.9", optional = true }
-candle-transformers = { version = "0.9", optional = true }
-
-# Directa porque `src/model/qwen2.rs` la usa. Antes llegaba de rebote a traves
-# de candle-transformers, que no cuenta: una dependencia que se usa en el
-# codigo propio se declara, o el dia que transformers deje de traerla el build
-# se rompe por un motivo que no se parece a la causa.
-candle-nn           = { version = "0.9", optional = true }
-
-# Ya venian de rebote por candle; se declaran porque el codigo propio las usa.
-# El pool de rayon se configura a mano al arrancar y num_cpus es lo unico que
-# distingue nucleos fisicos de logicos — available_parallelism() devuelve 12
-# en un i5-10400 que tiene 6.
-# Directa y no opcional desde la 0.3.0: el motor propio reparte su trabajo en
-# hilos, asi que rayon deja de ser algo que arrastra candle y pasa a ser parte
-# de la base.
+# El motor propio reparte su trabajo en hilos. El pool de rayon se configura a
+# mano al arrancar y num_cpus es lo unico que distingue nucleos fisicos de
+# logicos — available_parallelism() devuelve 12 en un i5-10400 que tiene 6.
+# Hasta la 0.10.0 tambien estaba candle (155 crates); desde la 0.11.0 el motor,
+# las imagenes y el entrenamiento son propios y no hay candle en ninguna parte.
 rayon               = "1"
-num_cpus            = { version = "1", optional = true }
-
+num_cpus            = "1"
 
 # NFC, que es lo que un `tokenizer.json` pide antes de tokenizar. Sin
 # dependencias salvo tinyvec, y ya llegaba de rebote por `tokenizers` en otra
@@ -87,18 +74,12 @@ asm_q4k = []
 #   cargo bench --features asm_q3k --bench kernels -- q3k
 asm_q3k = []
 
-# Motor de inferencia real. Fuera del set por defecto porque son 155 crates y
-# ~85 s de compilacion: quien solo quiera tocar la capa HTTP no deberia pagar
-# eso.
-#
-#   cargo run --release --features candle
-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:num_cpus"]
-
-# Entrenamiento LoRA. Implica `candle` porque no puede existir sin el, y va
-# aparte porque quien solo quiera servir no tiene por que compilarlo.
+# Entrenamiento: LoRA sobre Qwen y daiss desde cero, con el backward escrito a
+# mano (src/training/). Va aparte porque quien solo quiera servir no tiene por
+# que compilarlo; no suma ninguna dependencia.
 #
 #   cargo run --release --features training --example train_lora
-training = ["candle"]
+training = []
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -115,88 +96,8 @@ name    = "kernels"
 harness = false
 
 [[example]]
-name = "check_engine"
-# Sin esto, `cargo test` a secas intenta compilar el ejemplo —compila todos— y
-# falla con "could not find motor_candle in cosxamix", porque el modulo esta detras
-# de la feature. El error no menciona los tests, asi que parece que estuvieran
-# rotos ellos.
-required-features = ["candle"]
-
-[[example]]
-name = "check_cache"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_image"
-required-features = ["candle"]
-
-[[example]]
-name = "generate"
-required-features = ["candle"]
-
-[[example]]
-name = "compare_forward"
-required-features = ["candle"]
-
-[[example]]
-name = "check_gguf"
-required-features = ["candle"]
-
-[[example]]
-name = "check_quant"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_own_matmul"
-required-features = ["candle"]
-
-[[example]]
-name = "compare_logits"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_interleaved"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_memory"
-required-features = ["candle"]
-
-[[example]]
-name = "check_sessions"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_weights"
-required-features = ["candle"]
-
-[[example]]
-name = "check_embeddings"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_threads"
-required-features = ["candle"]
-
-[[example]]
-name = "compare_models"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_projection"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_matmul"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_cache_disk"
-required-features = ["candle"]
-
-[[example]]
 name = "measure_lora"
-required-features = ["candle"]
+required-features = ["training"]
 
 [[example]]
 name = "check_training_model"
@@ -206,15 +107,6 @@ required-features = ["training"]
 name = "train_lora"
 required-features = ["training"]
 
-
-[[example]]
-name = "measure_response"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_precision"
-required-features = ["candle"]
-
 [[example]]
 name = "train_daiss"
 required-features = ["training"]
@@ -222,15 +114,3 @@ required-features = ["training"]
 [[example]]
 name = "measure_tensor_train"
 required-features = ["training"]
-
-[[example]]
-name = "measure_generation"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_decode"
-required-features = ["candle"]
-
-[[example]]
-name = "measure_shared_prefix"
-required-features = ["candle"]

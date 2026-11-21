@@ -16,7 +16,6 @@
 //! prueba comprime fantásticamente y no generaliza nada.
 //!
 //!     cargo run --release --example train_tokenizer
-//!     cargo run --release --features candle --example train_tokenizer
 
 use std::time::Instant;
 
@@ -142,7 +141,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── contra el de Qwen ───────────────────────────────────────────────────
-    #[cfg(feature = "candle")]
     {
         let ruta = std::path::Path::new("modelos").join("tokenizer-3b.json");
         if ruta.exists() {

@@ -1,25 +1,27 @@
-//! Entrenamiento: ajustar un modelo en una maquina sin GPU.
+//! Entrenamiento: ajustar un modelo en una máquina sin GPU.
 //!
-//! Es la mitad del objetivo del proyecto, y la que faltaba entera: hasta la
-//! 0.2.0 Cosxamix solo infiere.
+//! Dos caminos, sobre el mismo transformer entrenable ([`transformer`]), con el
+//! forward y el backward escritos a mano y comprobados contra diferencias
+//! finitas:
 //!
-//! Lo que hay aca es **LoRA**: entrenar el 0,1% de los parametros en vez del
-//! 100%. En el 0,5B son 540.672 contra 494 millones, y el adaptador resultante
-//! pesa ~2 MB en vez de 2 GB.
+//! - **LoRA** ([`model`], [`lora`]): entrenar el 0,1% de un Qwen que ya sabe. En
+//!   el 0,5B son 540.672 parámetros contra 494 millones, y el adaptador pesa
+//!   ~2 MB en vez de 2 GB. La base va descuantizada a f32 y congelada.
+//! - **Desde cero** ([`full`]): un daiss entero, con las tablas de vocabulario
+//!   densas o en Tensor-Train, que se exporta a GGUF y lo corre el motor.
 //!
-//! Medido en un i5-10400 sin GPU, con una secuencia de 256 tokens: **~3,3 s
-//! por paso**, o sea que mil pasos son menos de una hora. Esa cifra es la que
-//! hace que esto tenga sentido y esta en el ROADMAP con su contexto.
-//!
-//! La base va en **f32 y no cuantizada**, y no por gusto: `QMatMul` de candle
-//! no implementa `bwd`, asi que el gradiente no atraviesa una multiplicacion
-//! cuantizada. Eso acota el alcance a modelos que entren en RAM en f32 — el
-//! 0,5B entra, el 3B no.
+//! Hasta la 0.10.0 esto lo hacía el autograd de candle; desde la 0.11.0 no hay
+//! candle en ninguna parte.
 
 /// Entrenar todos los parámetros, desde cero.
 pub mod full;
+/// Guardar y cargar los adaptadores LoRA.
 pub mod lora;
+/// Qwen2 descuantizado, con adaptadores LoRA.
 pub mod model;
+/// El transformer entrenable, con el backward escrito a mano, y AdamW.
+pub mod transformer;
 
-pub use lora::{cargar, guardar, LinealLora};
+pub use lora::{cargar, guardar};
 pub use model::{Config, ModeloEntrenable};
+pub use transformer::AdamW;

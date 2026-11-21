@@ -1,6 +1,6 @@
 //! Cuánto tarda en cargar y generar un modelo cualquiera, con el motor propio.
 //!
-//!     cargo run --release --features candle --example measure_generation -- modelo.gguf tokenizer.json [tokens]
+//!     cargo run --release --example measure_generation -- modelo.gguf tokenizer.json [tokens]
 //!
 //! Sirve también con un modelo sin entrenar: el texto es ruido, pero leer los
 //! pesos cuesta lo mismo, y eso es lo que decide la velocidad.

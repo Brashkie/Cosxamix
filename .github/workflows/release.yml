@@ -39,16 +39,16 @@ jobs:
           # de ejecucion preferiria Zig si estuviera compilado.
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            features: candle
+            features: ''
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
-            features: candle
+            features: ''
           # El runner de macOS es ARM; para Intel se cruza desde ahi, que el
           # SDK de Apple trae las dos arquitecturas. No hace falta un runner
           # Intel, que es justo el que GitHub fue retirando.
           - runner: macos-latest
             target: x86_64-apple-darwin
-            features: candle
+            features: ''
 
           # ── ARM: con Zig y con C ────────────────────────────────────────
           #
@@ -62,7 +62,7 @@ jobs:
           # compila el mismo Zig con `zig cc`, sin libc ni SDK.
           - runner: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            features: zig,candle,c
+            features: zig,c
             zig: true
             apt: gcc-aarch64-linux-gnu
           # Android va aparte de aarch64-unknown-linux-gnu y no es lo mismo:
@@ -71,12 +71,12 @@ jobs:
           # hace falta para Termux.
           - runner: ubuntu-latest
             target: aarch64-linux-android
-            features: zig,candle,c
+            features: zig,c
             zig: true
             ndk: true
           - runner: macos-latest
             target: aarch64-apple-darwin
-            features: zig,candle,c
+            features: zig,c
             zig: true
 
     steps:
@@ -135,7 +135,8 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
 
       - name: Compilar
-        run: cargo build --release --features ${{ matrix.features }} --target ${{ matrix.target }}
+        # Sin features en x86-64: `--features` vacío se comería el `--target`.
+        run: cargo build --release ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --target ${{ matrix.target }}
 
       # Que compile no prueba que el kernel sea de la arquitectura pedida: con
       # un `-target` mal pasado, Zig produce un .a del host con los simbolos

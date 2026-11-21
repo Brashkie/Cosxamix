@@ -434,7 +434,7 @@ pub fn escritor_de(
             "general.size_label",
             cfg.nombre.split('-').nth(1).unwrap_or(cfg.nombre),
         )
-        .meta_texto("general.license", "mit")
+        .meta_texto("general.license", "GPL-3.0-or-later")
         .meta_u32("general.file_type", pesos as u32)
         .meta_u32("qwen2.block_count", cfg.capas as u32)
         .meta_u32("qwen2.context_length", cfg.contexto as u32)

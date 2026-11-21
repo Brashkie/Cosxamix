@@ -18,135 +18,67 @@
 //!
 //! `A` arranca con ruido y `B` en **cero**, que no es un detalle: así el
 //! producto `B·A` vale cero en el primer paso y el modelo adaptado empieza
-//! exactamente donde estaba el original. Si los dos arrancaran con ruido, el
-//! primer paso movería la salida a un sitio arbitrario y habría que recuperarse
-//! de eso antes de empezar a aprender.
+//! exactamente donde estaba el original.
+//!
+//! Lo de acá es guardarlos y cargarlos: un `.safetensors` con `{capa}.lora_a` y
+//! `{capa}.lora_b` en F32, que es lo que escribía la versión con candle, así que
+//! los adaptadores viejos se siguen leyendo.
 
-use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
-use candle_core::{DType, Device, Result, Tensor, Var};
+use super::transformer::Params;
+use crate::image_gen::safetensors::Safetensors;
 
-/// Las dos matrices flacas de un adaptador.
-pub struct Lora {
-    a: Var,
-    b: Var,
-    escala: f64,
+type Resultado<T> = Result<T, String>;
+
+fn es_adaptador(nombre: &str) -> bool {
+    nombre.ends_with(".lora_a") || nombre.ends_with(".lora_b")
 }
 
-impl Lora {
-    pub fn nuevo(entrada: usize, salida: usize, r: usize, alfa: f64, dev: &Device) -> Result<Self> {
-        Ok(Self {
-            a: Var::from_tensor(&Tensor::randn(0f32, 0.02f32, (r, entrada), dev)?)?,
-            b: Var::from_tensor(&Tensor::zeros((salida, r), DType::F32, dev)?)?,
-            escala: alfa / r as f64,
-        })
-    }
-
-    fn delta(&self, x: &Tensor) -> Result<Tensor> {
-        let h = x.broadcast_matmul(&self.a.t()?)?;
-        h.broadcast_matmul(&self.b.t()?)? * self.escala
-    }
-}
-
-/// Una proyección lineal con los pesos congelados y, opcionalmente, un
-/// adaptador encima.
-///
-/// Los pesos van como `Tensor` y no como `Var` a propósito: un `Var` es lo que
-/// candle considera entrenable, y la base no lo es. Lo único que devuelve
-/// [`LinealLora::variables`] son las matrices del adaptador.
-pub struct LinealLora {
-    peso: Tensor,
-    sesgo: Option<Tensor>,
-    lora: Option<Lora>,
-    nombre: String,
-}
-
-impl LinealLora {
-    /// `peso` viene como `(salida, entrada)`, que es como lo devuelve candle al
-    /// descuantizar un tensor del GGUF.
-    pub fn nueva(nombre: &str, peso: Tensor, sesgo: Option<Tensor>) -> Self {
-        Self {
-            peso,
-            sesgo,
-            lora: None,
-            nombre: nombre.to_string(),
-        }
-    }
-
-    pub fn con_lora(mut self, r: usize, alfa: f64, dev: &Device) -> Result<Self> {
-        let (salida, entrada) = self.peso.dims2()?;
-        self.lora = Some(Lora::nuevo(entrada, salida, r, alfa, dev)?);
-        Ok(self)
-    }
-
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut y = x.broadcast_matmul(&self.peso.t()?)?;
-        if let Some(s) = &self.sesgo {
-            y = y.broadcast_add(s)?;
-        }
-        match &self.lora {
-            Some(l) => y + l.delta(x)?,
-            None => Ok(y),
-        }
-    }
-
-    pub fn variables(&self) -> Vec<Var> {
-        match &self.lora {
-            Some(l) => vec![l.a.clone(), l.b.clone()],
-            None => vec![],
-        }
-    }
-
-    fn tensores(&self) -> Vec<(String, Tensor)> {
-        match &self.lora {
-            Some(l) => vec![
-                (format!("{}.lora_a", self.nombre), l.a.as_tensor().clone()),
-                (format!("{}.lora_b", self.nombre), l.b.as_tensor().clone()),
-            ],
-            None => vec![],
-        }
-    }
-
-    fn cargar(&mut self, de: &HashMap<String, Tensor>) -> Result<bool> {
-        let Some(l) = &self.lora else {
-            return Ok(false);
-        };
-        let (ka, kb) = (
-            format!("{}.lora_a", self.nombre),
-            format!("{}.lora_b", self.nombre),
+/// Guarda solo los adaptadores: ~2 MB en vez de los 2 GB de la base en f32.
+/// Devuelve cuántos tensores escribió.
+pub fn guardar(p: &Params, ruta: &Path) -> Resultado<usize> {
+    let indices: Vec<usize> = (0..p.nombres.len())
+        .filter(|&i| es_adaptador(&p.nombres[i]))
+        .collect();
+    let mut cabecera = serde_json::Map::new();
+    let mut desde = 0usize;
+    for &i in &indices {
+        let hasta = desde + 4 * p.valores[i].len();
+        cabecera.insert(
+            p.nombres[i].clone(),
+            serde_json::json!({ "dtype": "F32", "shape": p.formas[i], "data_offsets": [desde, hasta] }),
         );
-        match (de.get(&ka), de.get(&kb)) {
-            (Some(a), Some(b)) => {
-                l.a.set(a)?;
-                l.b.set(b)?;
-                Ok(true)
-            }
-            _ => Ok(false),
+        desde = hasta;
+    }
+    let mut cab = serde_json::to_vec(&cabecera).map_err(|e| e.to_string())?;
+    // Los datos empiezan alineados a 8, como pide el formato.
+    while (8 + cab.len()) % 8 != 0 {
+        cab.push(b' ');
+    }
+    let error = |e: std::io::Error| format!("{}: {e}", ruta.display());
+    let mut f = std::io::BufWriter::new(std::fs::File::create(ruta).map_err(error)?);
+    f.write_all(&(cab.len() as u64).to_le_bytes())
+        .map_err(error)?;
+    f.write_all(&cab).map_err(error)?;
+    for &i in &indices {
+        for v in &p.valores[i] {
+            f.write_all(&v.to_le_bytes()).map_err(error)?;
         }
     }
+    f.flush().map_err(error)?;
+    Ok(indices.len())
 }
 
-/// Guarda solo los adaptadores, que es lo que los hace útiles: ~2 MB en vez de
-/// los 2 GB del modelo base en f32.
-pub fn guardar(capas: &[&LinealLora], ruta: &Path) -> Result<usize> {
-    let mut mapa = HashMap::new();
-    for c in capas {
-        for (k, v) in c.tensores() {
-            mapa.insert(k, v);
-        }
-    }
-    let n = mapa.len();
-    candle_core::safetensors::save(&mapa, ruta)?;
-    Ok(n)
-}
-
-/// Devuelve cuántas capas encontraron su adaptador en el archivo.
-pub fn cargar(capas: &mut [&mut LinealLora], ruta: &Path, dev: &Device) -> Result<usize> {
-    let mapa = candle_core::safetensors::load(ruta, dev)?;
+/// Pisa los adaptadores con los del archivo. Devuelve cuántas matrices
+/// encontró; las que no estén quedan como estaban.
+pub fn cargar(p: &mut Params, ruta: &Path) -> Resultado<usize> {
+    let st = Safetensors::abrir(ruta)?;
     let mut n = 0;
-    for c in capas.iter_mut() {
-        if c.cargar(&mapa)? {
+    for i in 0..p.nombres.len() {
+        if es_adaptador(&p.nombres[i]) && st.tiene(&p.nombres[i]) {
+            p.valores[i] = st.f32(&p.nombres[i], &p.formas[i])?;
             n += 1;
         }
     }
@@ -157,62 +89,35 @@ pub fn cargar(capas: &mut [&mut LinealLora], ruta: &Path, dev: &Device) -> Resul
 mod tests {
     use super::*;
 
-    /// Lo que hace que un LoRA se pueda enchufar sin romper nada: con `B` en
-    /// cero, la salida es exactamente la de la capa original.
     #[test]
-    fn al_empezar_no_cambia_la_salida() -> Result<()> {
-        let dev = Device::Cpu;
-        let peso = Tensor::randn(0f32, 0.5f32, (6, 4), &dev)?;
-        let x = Tensor::randn(0f32, 1f32, (3, 4), &dev)?;
+    fn el_adaptador_va_y_vuelve_del_disco() {
+        let mut p = Params::default();
+        p.agregar("blk.0.attn_q.weight", vec![3, 2], vec![9.0; 6], false);
+        p.agregar(
+            "blk.0.attn_q.lora_a",
+            vec![2, 2],
+            vec![1.0, -2.5, 3.25, 0.5],
+            true,
+        );
+        p.agregar(
+            "blk.0.attn_q.lora_b",
+            vec![3, 2],
+            vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            true,
+        );
+        let ruta =
+            std::env::temp_dir().join(format!("cosxamix-lora-{}.safetensors", std::process::id()));
+        assert_eq!(guardar(&p, &ruta).unwrap(), 2);
 
-        let sin = LinealLora::nueva("p", peso.clone(), None);
-        let con = LinealLora::nueva("p", peso, None).con_lora(2, 16.0, &dev)?;
-
-        let a = sin.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
-        let b = con.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
-        assert_eq!(a, b, "el adaptador recien creado movio la salida");
-        Ok(())
-    }
-
-    #[test]
-    fn solo_el_adaptador_es_entrenable() -> Result<()> {
-        let dev = Device::Cpu;
-        let peso = Tensor::randn(0f32, 0.5f32, (6, 4), &dev)?;
-        let sin = LinealLora::nueva("p", peso.clone(), None);
-        let con = LinealLora::nueva("p", peso, None).con_lora(2, 16.0, &dev)?;
-
-        assert!(sin.variables().is_empty());
-        // Dos matrices: 2x4 y 6x2 = 20 parametros, contra los 24 de la base.
-        let v = con.variables();
-        assert_eq!(v.len(), 2);
-        assert_eq!(v.iter().map(|t| t.elem_count()).sum::<usize>(), 20);
-        Ok(())
-    }
-
-    #[test]
-    fn el_adaptador_va_y_vuelve_del_disco() -> Result<()> {
-        let dev = Device::Cpu;
-        let peso = Tensor::randn(0f32, 0.5f32, (6, 4), &dev)?;
-        let x = Tensor::randn(0f32, 1f32, (3, 4), &dev)?;
-
-        let uno = LinealLora::nueva("p", peso.clone(), None).con_lora(2, 16.0, &dev)?;
-        // Se mueve `B` fuera de cero, que si no el adaptador no cambia nada y
-        // el test pasaria aunque guardar no hiciera nada.
-        if let Some(l) = &uno.lora {
-            l.b.set(&Tensor::randn(0f32, 0.3f32, (6, 2), &dev)?)?;
-        }
-        let esperado = uno.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
-
-        let dir = std::env::temp_dir().join("cosxamix_lora_test.safetensors");
-        guardar(&[&uno], &dir)?;
-
-        let mut otro = LinealLora::nueva("p", peso, None).con_lora(2, 16.0, &dev)?;
-        let n = cargar(&mut [&mut otro], &dir, &dev)?;
-        assert_eq!(n, 1, "no encontro el adaptador en el archivo");
-
-        let obtenido = otro.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
-        assert_eq!(esperado, obtenido);
-        let _ = std::fs::remove_file(&dir);
-        Ok(())
+        let mut otro = Params::default();
+        otro.agregar("blk.0.attn_q.weight", vec![3, 2], vec![7.0; 6], false);
+        otro.agregar("blk.0.attn_q.lora_a", vec![2, 2], vec![0.0; 4], true);
+        otro.agregar("blk.0.attn_q.lora_b", vec![3, 2], vec![0.0; 6], true);
+        assert_eq!(cargar(&mut otro, &ruta).unwrap(), 2);
+        std::fs::remove_file(&ruta).unwrap();
+        assert_eq!(otro.valores[1], p.valores[1]);
+        assert_eq!(otro.valores[2], p.valores[2]);
+        // La base no se toca: no va en el archivo.
+        assert_eq!(otro.valores[0], vec![7.0; 6]);
     }
 }

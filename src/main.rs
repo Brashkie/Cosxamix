@@ -31,7 +31,6 @@ use cosxamix::kernels;
 #[derive(Clone)]
 struct Estado {
     motor: Arc<dyn Motor>,
-    #[cfg(feature = "candle")]
     imagenes: Arc<imagenes::Servicio>,
 }
 
@@ -339,7 +338,6 @@ fn error(c: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
 // con el primer pedido y se libera tras `COSXAMIX_IMAGEN_LIBERAR_MIN` minutos
 // sin uso (10). Una imagen a la vez: cada una ocupa todos los núcleos.
 
-#[cfg(feature = "candle")]
 mod imagenes {
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -401,8 +399,6 @@ mod imagenes {
 }
 
 #[derive(Deserialize)]
-// Sin `candle` la ruta contesta que no hay imágenes y no lee el pedido.
-#[cfg_attr(not(feature = "candle"), allow(dead_code))]
 struct PedidoImagen {
     prompt: String,
     #[serde(default)]
@@ -411,7 +407,6 @@ struct PedidoImagen {
     size: Option<usize>,
 }
 
-#[cfg(feature = "candle")]
 async fn imagen(State(e): State<Estado>, Json(p): Json<PedidoImagen>) -> axum::response::Response {
     let prompt = p.prompt.trim().to_string();
     if prompt.is_empty() {
@@ -461,23 +456,14 @@ async fn imagen(State(e): State<Estado>, Json(p): Json<PedidoImagen>) -> axum::r
     }
 }
 
-#[cfg(not(feature = "candle"))]
-async fn imagen(Json(_): Json<PedidoImagen>) -> axum::response::Response {
-    (
-        StatusCode::NOT_FOUND,
-        "compilado sin la feature `candle`: no hay imágenes",
-    )
-        .into_response()
-}
-
 async fn salud() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true, "servicio": "cosxamix" }))
 }
 
-/// Decide con qué motor arrancar.
-#[cfg(feature = "candle")]
+/// Decide con qué motor arrancar: el propio con los modelos de
+/// `COSXAMIX_MODELOS`, o el de prueba si no hay ninguno.
 fn elegir_motor() -> (Arc<dyn Motor>, bool) {
-    use cosxamix::engine_manager::{GestorModelos, TipoMotor, PRESUPUESTO_MB_POR_DEFECTO};
+    use cosxamix::engine_manager::{GestorModelos, PRESUPUESTO_MB_POR_DEFECTO};
     use std::path::PathBuf;
 
     let dir = PathBuf::from(env("COSXAMIX_MODELOS", "./modelos"));
@@ -504,8 +490,8 @@ fn elegir_motor() -> (Arc<dyn Motor>, bool) {
     // no: ahí el daño se ve a simple vista —dice "canossa" por Canberra y
     // 1972 por 1969—, que es como se rompe un modelo sobrecuantizado.
     //
-    // Los formatos IQ (IQ3_M, IQ2_XXS) habrían sido mejores por bit, pero
-    // candle no los soporta: su enumeración llega hasta los k-quants.
+    // Los formatos IQ (IQ3_M, IQ2_XXS) habrían sido mejores por bit; el
+    // lector y los kernels propios llegan hoy hasta los k-quants.
     let gguf = env("COSXAMIX_GGUF", "qwen2.5-3b-instruct-q3_k_m.gguf");
     let nombre = gguf.trim_end_matches(".gguf").to_string();
     let presupuesto = env("COSXAMIX_RAM_MB", "")
@@ -521,7 +507,6 @@ fn elegir_motor() -> (Arc<dyn Motor>, bool) {
             tracing::info!(
                 modelos = g.modelos().len(),
                 presupuesto_mb = presupuesto,
-                motor = ?TipoMotor::del_entorno(),
                 "catalogo listo"
             );
             // Precalentar al arrancar es la razón de ser de Cosxamix: el usuario
@@ -552,12 +537,6 @@ fn elegir_motor() -> (Arc<dyn Motor>, bool) {
     }
 }
 
-#[cfg(not(feature = "candle"))]
-fn elegir_motor() -> (Arc<dyn Motor>, bool) {
-    tracing::warn!("compilado sin la feature `candle`: solo el motor de prueba");
-    (Arc::new(MotorDemo::nuevo("cosxamix-demo")), true)
-}
-
 /// Fija cuántos hilos usa el cálculo matricial.
 ///
 /// Por defecto rayon toma los procesadores **lógicos**, que en un i5-10400 son
@@ -574,7 +553,6 @@ fn elegir_motor() -> (Arc<dyn Motor>, bool) {
 /// portátil eso es calor y batería a cambio de nada.
 ///
 /// `RAYON_NUM_THREADS` sigue mandando: si alguien lo fija, se respeta.
-#[cfg(feature = "candle")]
 fn configurar_hilos() {
     if std::env::var_os("RAYON_NUM_THREADS").is_some() {
         tracing::info!("hilos: los que fije RAYON_NUM_THREADS");
@@ -597,9 +575,6 @@ fn configurar_hilos() {
     }
 }
 
-#[cfg(not(feature = "candle"))]
-fn configurar_hilos() {}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -613,7 +588,6 @@ async fn main() {
     // HTTP sigue en pie y se puede trabajar en la capa de arriba.
     configurar_hilos();
     let (motor, estado_demo) = elegir_motor();
-    #[cfg(feature = "candle")]
     let imagenes = {
         let s = Arc::new(imagenes::Servicio::nuevo(std::path::PathBuf::from(env(
             "COSXAMIX_MODELOS",
@@ -637,11 +611,7 @@ async fn main() {
         }
         s
     };
-    let estado = Estado {
-        motor,
-        #[cfg(feature = "candle")]
-        imagenes,
-    };
+    let estado = Estado { motor, imagenes };
 
     let app = Router::new()
         .route("/api/tags", get(tags))

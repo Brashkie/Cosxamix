@@ -14,7 +14,7 @@
 //! cambie se confirma con la línea "un forward de un token", alternando con
 //! y sin el cambio.
 //!
-//!     cargo run --release --features candle --example measure_decode
+//!     cargo run --release --example measure_decode
 
 use std::collections::BTreeMap;
 use std::time::Instant;

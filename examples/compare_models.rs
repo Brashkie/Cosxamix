@@ -5,22 +5,19 @@
 //! tienen respuesta verificable, así que se puede contar aciertos en vez de
 //! opinar sobre si "suena mejor".
 //!
-//!   cargo run --release --features candle --example compare_models
-//!   cargo run --release --features candle --example compare_models -- --cuant
-//!   cargo run --release --features candle --example compare_models -- --motores
+//!   cargo run --release --example compare_models
+//!   cargo run --release --example compare_models -- --cuant
 //!
 //! `--cuantizador` compara el Q3_K_M oficial con el recuantizado por nosotros.
 //!
-//! `--motores` corre las mismas preguntas sobre el MISMO modelo —el 3B en
-//! Q3_K_M, el del bot— con candle y con el motor propio: es la batería que
-//! decide si el propio puede ser el de por defecto (DECISIONES §23).
+//! Con esta batería el motor propio reemplazó al de candle en la 0.6.0 (11 de
+//! 15 contra 10, DECISIONES §23); el de candle salió en la 0.11.0.
 
 use std::path::Path;
 use std::time::Instant;
 
 use cosxamix::engine::{Mensaje, Peticion};
-use cosxamix::engine_candle::MotorCandle;
-use cosxamix::engine_manager::{MotorCargable, TipoMotor};
+use cosxamix::engine_manager::MotorCargable;
 use cosxamix::engine_own::MotorPropio;
 
 /// Pregunta, y qué tiene que aparecer en la respuesta para darla por buena.
@@ -70,24 +67,18 @@ const PRUEBAS: &[(&str, &[&str])] = &[
                                                                  &["aguila", "pez", "rana", "serpiente", "pollo", "gallina", "loro", "tiburon", "pinguino", "lagarto", "sapo", "ave", "pajaro", "cocodrilo", "tortuga", "abeja"]),
 ];
 fn medir(nombre: &str, gguf: &str, tok: &str) {
-    medir_con(nombre, gguf, tok, TipoMotor::Candle);
+    medir_con(nombre, gguf, tok);
 }
 
-fn medir_con(nombre: &str, gguf: &str, tok: &str, tipo: TipoMotor) {
+fn medir_con(nombre: &str, gguf: &str, tok: &str) {
     let g = Path::new(gguf);
     if !g.exists() {
         println!("\n  {nombre}: no esta {gguf}, lo salteo");
         return;
     }
 
-    let construido: Result<Box<dyn MotorCargable>, _> = match tipo {
-        TipoMotor::Candle => {
-            MotorCandle::nuevo(nombre, g, Path::new(tok)).map(|m| Box::new(m) as _)
-        }
-        TipoMotor::Propio => {
-            MotorPropio::nuevo(nombre, g, Path::new(tok)).map(|m| Box::new(m) as _)
-        }
-    };
+    let construido: Result<Box<dyn MotorCargable>, _> =
+        MotorPropio::nuevo(nombre, g, Path::new(tok)).map(|m| Box::new(m) as _);
     let m = match construido {
         Ok(m) => m,
         Err(e) => {
@@ -199,21 +190,6 @@ fn main() {
     // lo único que cambia es cuántos bytes pesa cada peso.
     let cuant = std::env::args().any(|a| a == "--cuant");
 
-    if std::env::args().any(|a| a == "--motores") {
-        for (nombre, tipo) in [
-            ("3b-q3_k_m candle", TipoMotor::Candle),
-            ("3b-q3_k_m propio", TipoMotor::Propio),
-        ] {
-            medir_con(
-                nombre,
-                "modelos/qwen2.5-3b-instruct-q3_k_m.gguf",
-                "modelos/tokenizer-3b.json",
-                tipo,
-            );
-        }
-        return;
-    }
-
     // El mismo modelo, los mismos formatos por tensor: el Q3_K_M oficial contra
     // el que sale de nuestro cuantizador (`examples/requantize.rs`).
     if std::env::args().any(|a| a == "--cuantizador") {
@@ -227,16 +203,16 @@ fn main() {
                 "modelos/qwen2.5-3b-q3_k_m-cosxamix.gguf",
             ),
         ] {
-            medir_con(nombre, gguf, "modelos/tokenizer-3b.json", TipoMotor::Propio);
+            medir_con(nombre, gguf, "modelos/tokenizer-3b.json");
         }
         return;
     }
 
     if cuant {
-        // candle NO soporta los formatos IQ (IQ3_M, IQ2_XXS): su enumeración
-        // llega hasta los k-quants clásicos. Q3K y Q2K son lo más cercano
-        // disponible — misma idea de bajar bytes por peso, algo peor en
-        // calidad por bit.
+        // Los formatos IQ (IQ3_M, IQ2_XXS) no se leen todavía: el lector y los
+        // kernels propios llegan hasta los k-quants clásicos. Q3K y Q2K son lo
+        // más cercano disponible — misma idea de bajar bytes por peso, algo
+        // peor en calidad por bit.
         for q in ["q2_k", "q3_k_m", "q4_k_m"] {
             medir(
                 &format!("3b-{q}"),

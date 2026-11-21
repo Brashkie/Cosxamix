@@ -1,41 +1,27 @@
-# Codigo de terceros
+# Codigo y modelos de terceros
 
-Cosxamix se publica bajo la licencia MIT ([LICENSE](LICENSE)). Ademas de sus
-dependencias normales, que cargo resuelve y cuyas licencias quedan registradas
-en `Cargo.lock`, hay **un archivo copiado** a este repositorio.
+Cosxamix se publica bajo la **GPL-3.0-or-later** ([LICENSE](LICENSE)). Hasta
+la 0.10.0 fue MIT; esas versiones siguen siendo MIT para quien las tenga.
+
+Sus dependencias de Rust las resuelve cargo y sus licencias quedan registradas
+en `Cargo.lock`; todas son compatibles con la GPL-3.0 (MIT, Apache-2.0, BSD,
+Zlib, Unicode). Desde la 0.11.0 no hay codigo copiado de otro proyecto: el
+`src/model/qwen2.rs` que venia de candle salio junto con el motor de candle.
 
 ## Modelos que se usan, sin venir en el repositorio
 
-`/api/image` lee dos modelos que no se distribuyen con Cosxamix: quien los usa
-los baja a su carpeta de modelos.
+Quien los usa los baja a su carpeta de modelos. La licencia de un modelo es la
+de sus pesos, aparte de la del codigo que los corre.
 
-- **SD-Turbo** (huggingface.co/stabilityai/sd-turbo), bajo la **Stability AI
-  Community License**: gratis para uso no comercial; pide mostrar
-  **"Powered by Stability AI"** donde se ofrezca, seguir su política de uso
+- **Qwen2.5** (huggingface.co/Qwen), el modelo de texto por defecto. Cada
+  tamano trae su licencia en su repositorio: el 0,5B, el 1,5B y el 7B son
+  Apache-2.0; el **3B es la Qwen Research License**, para investigacion y uso
+  no comercial.
+- **SD-Turbo** (huggingface.co/stabilityai/sd-turbo), para `/api/image`, bajo la
+  **Stability AI Community License**: gratis para uso no comercial; pide mostrar
+  **"Powered by Stability AI"** donde se ofrezca, seguir su politica de uso
   (stability.ai/use-policy) y no usar lo que genera para entrenar otro modelo
-  generativo. Un uso comercial pide registrarse, y hasta USD 1 millón al año.
+  generativo. Un uso comercial pide registrarse, y hasta USD 1 millon al ano.
   La licencia completa viene con el modelo (`LICENSE.md`).
-- **TAESD** (github.com/madebyollin/taesd), bajo licencia **MIT**.
-
-## `src/model/qwen2.rs`
-
-Viene de [huggingface/candle](https://github.com/huggingface/candle) 0.9.2,
-`candle-transformers/src/models/quantized_qwen2.rs`, distribuido bajo
-**MIT OR Apache-2.0** — compatible con la MIT de este proyecto.
-
-Los textos originales estan en
-[LICENSE-MIT](https://github.com/huggingface/candle/blob/main/LICENSE-MIT) y
-[LICENSE-APACHE](https://github.com/huggingface/candle/blob/main/LICENSE-APACHE)
-de ese repositorio.
-
-**Por que esta copiado y no se usa el del crate:** el cache de atencion vive
-dentro de `ModelWeights`, es privado, y el tipo no es `Clone`. Con el crate tal
-cual hay un solo cache para todo el proceso, asi que dos conversaciones
-intercaladas se invalidan mutuamente — medido, 5541 ms y 244 tokens
-reaprovechados pasaban a 9770 ms y cero. El razonamiento completo y las dos
-alternativas que se descartaron estan en la cabecera del propio archivo y en
-[DECISIONES.md](DECISIONES.md) seccion 7.
-
-**Todos los cambios respecto al original estan marcados con `// COSXAMIX:`**,
-para que comparar contra upstream siga siendo posible y para que actualizar a
-una version nueva de candle sea un trabajo acotado y no una arqueologia.
+- **TAESD** (github.com/madebyollin/taesd), el decodificador de `/api/image`,
+  bajo licencia **MIT**.

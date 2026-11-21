@@ -15,7 +15,7 @@
 //! caché. Al final se compara el decode con lo que la RAM puede dar: recorrer
 //! los mismos bytes con todos los núcleos, sin hacer ninguna cuenta.
 //!
-//!     cargo run --release --features candle --example measure_response
+//!     cargo run --release --example measure_response
 //!
 //! `COSXAMIX_GGUF` y `COSXAMIX_TOKENIZER` cambian el modelo (por defecto, el
 //! 3B Q3_K_M que baja WinsiBot).

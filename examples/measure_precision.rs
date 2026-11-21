@@ -10,8 +10,8 @@
 //! Se corre una vez por camino, porque los caminos se eligen con variables de
 //! entorno que se leen al arrancar:
 //!
-//!     set COSXAMIX_MATMUL=f32 & cargo run --release --features candle --example measure_precision -- guardar ref.bin
-//!     cargo run --release --features candle --example measure_precision -- comparar ref.bin
+//!     set COSXAMIX_MATMUL=f32 & cargo run --release --example measure_precision -- guardar ref.bin
+//!     cargo run --release --example measure_precision -- comparar ref.bin
 //!     set COSXAMIX_SIN_BLOQUES=1 & cargo run ... -- comparar ref.bin
 //!
 //! Imprime la divergencia KL media —cuánta información se pierde, en nats— y

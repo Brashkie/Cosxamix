@@ -1,18 +1,17 @@
-//! Crear imágenes en la CPU, sin GPU y sin API: SD-Turbo con candle.
+//! Crear imágenes en la CPU, sin GPU, sin API y sin candle: SD-Turbo.
 //!
 //! SD-Turbo (huggingface.co/stabilityai/sd-turbo) es Stable Diffusion 2.1
 //! destilado para dar la imagen en **un paso**: Euler, espaciado `trailing`,
-//! predicción `epsilon` (su `scheduler_config.json`). Medido en un i5-10400 a
-//! 512×512 (`examples/measure_image.rs`): el texto 0,5 s, el UNet ~10 s en f32 y
-//! ~12,6 en f16, y el decodificado 3 s con TAESD contra 27 con el VAE completo.
-//! En f16 la memoria pico baja de 6,6 a 4,2 GB, y es lo que se usa: tiene que
-//! convivir con el modelo de texto.
+//! predicción `epsilon` (su `scheduler_config.json`). Todo es propio desde la
+//! 0.11.0, sobre la multiplicación de matrices de [`crate::kernels::sgemm`]:
 //!
-//! - El texto se tokeniza con el BPE de CLIP, escrito acá ([`Clip`]): el modelo
-//!   trae `vocab.json` y `merges.txt`, no un `tokenizer.json`.
-//! - El decodificado es **TAESD** ([`Taesd`], github.com/madebyollin/taesd,
-//!   licencia MIT): 4,9 MB que leen los mismos latentes que el VAE de SD 2.x, y
-//!   nueve veces más rápido. El VAE completo queda con `COSXAMIX_IMAGEN_VAE=completo`.
+//! - [`Clip`]: el tokenizador BPE de CLIP (el modelo trae `vocab.json` y
+//!   `merges.txt`, no un `tokenizer.json`);
+//! - [`clip_text`]: el codificador de texto, 23 capas;
+//! - [`unet`]: el UNet, ~865 millones de parámetros en f16, leídos directo del
+//!   mapeo del archivo;
+//! - [`taesd`]: el decodificador, TAESD (github.com/madebyollin/taesd, MIT), 4,9
+//!   MB y nueve veces más rápido que el VAE completo de SD.
 //!
 //! **Licencia de SD-Turbo**: Stability AI Community License. Para un uso no
 //! comercial es gratis; pide mostrar "Powered by Stability AI", seguir su
@@ -21,15 +20,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use candle_core::{DType, Device, Module, Tensor};
-use candle_transformers::models::stable_diffusion::{
-    self,
-    clip::ClipTextTransformer,
-    euler_ancestral_discrete::EulerAncestralDiscreteSchedulerConfig,
-    schedulers::{PredictionType, SchedulerConfig, TimestepSpacing},
-    unet_2d::UNet2DConditionModel,
-    vae::AutoEncoderKL,
-};
+pub mod clip_text;
+pub mod nn;
+pub mod safetensors;
+pub mod taesd;
+pub mod unet;
 
 type Resultado<T> = Result<T, String>;
 
@@ -169,121 +164,14 @@ impl Clip {
     }
 }
 
-// ─── TAESD ───────────────────────────────────────────────────────────────────
-
-/// `conv.forward(x)`, esquivando un error de candle 0.9.2.
-///
-/// `conv2d_tiled` decide si la entrada ya está en NHWC comparando sus strides
-/// con los de NHWC, y los de un NCHW contiguo coinciden cuando canales = alto =
-/// ancho. Ahí la toma como NHWC sin copiarla, y lee los píxeles en otro orden:
-/// TAESD tiene justo ese caso, 64 canales sobre latentes de 64×64, y salían
-/// franjas de colores. Con otros strides —una vista una columna más ancha— copia
-/// bien. Lo comprueba `convolucion_cuadrada_como_la_directa`.
-fn conv(c: &candle_nn::Conv2d, x: &Tensor) -> candle_core::Result<Tensor> {
-    let (_, ch, h, w) = x.dims4()?;
-    if ch == h && h == w {
-        let ancho = x.pad_with_zeros(3, 0, 1)?;
-        return c.forward(&ancho.narrow(3, 0, w)?);
-    }
-    c.forward(x)
-}
-
-/// TAESD: convoluciones de 64 canales, tres bloques por escala y tres
-/// ampliaciones ×2. Los tensores se llaman por su índice en el
-/// `nn.Sequential` del original (`taesd.py`).
-pub struct Taesd {
-    capas: Vec<Capa>,
-}
-
-enum Capa {
-    Conv(candle_nn::Conv2d),
-    Relu,
-    Bloque(candle_nn::Conv2d, candle_nn::Conv2d, candle_nn::Conv2d),
-    Ampliar,
-}
-
-impl Taesd {
-    pub fn abrir(ruta: &Path, dev: &Device) -> Resultado<Self> {
-        use candle_nn::{conv2d, conv2d_no_bias, Conv2dConfig, VarBuilder};
-        // SAFETY: el archivo de pesos no cambia mientras se usa.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[ruta], DType::F32, dev) }
-            .map_err(err)?;
-        let c = Conv2dConfig {
-            padding: 1,
-            ..Default::default()
-        };
-        let bloque = |i: usize| -> candle_core::Result<Capa> {
-            let v = vb.pp(i.to_string()).pp("conv");
-            Ok(Capa::Bloque(
-                conv2d(64, 64, 3, c, v.pp("0"))?,
-                conv2d(64, 64, 3, c, v.pp("2"))?,
-                conv2d(64, 64, 3, c, v.pp("4"))?,
-            ))
-        };
-        let armar = || -> candle_core::Result<Vec<Capa>> {
-            let mut capas = vec![Capa::Conv(conv2d(4, 64, 3, c, vb.pp("1"))?), Capa::Relu];
-            let mut i = 3;
-            for _ in 0..3 {
-                for _ in 0..3 {
-                    capas.push(bloque(i)?);
-                    i += 1;
-                }
-                capas.push(Capa::Ampliar);
-                capas.push(Capa::Conv(conv2d_no_bias(
-                    64,
-                    64,
-                    3,
-                    c,
-                    vb.pp((i + 1).to_string()),
-                )?));
-                i += 2;
-            }
-            capas.push(bloque(18)?);
-            capas.push(Capa::Conv(conv2d(64, 3, 3, c, vb.pp("19"))?));
-            Ok(capas)
-        };
-        Ok(Self {
-            capas: armar().map_err(err)?,
-        })
-    }
-
-    /// Los latentes del UNet a una imagen en [0, 1].
-    pub fn decodificar(&self, lat: &Tensor) -> candle_core::Result<Tensor> {
-        let mut x = ((lat / 3.)?.tanh()? * 3.)?;
-        for capa in &self.capas {
-            x = match capa {
-                Capa::Conv(c) => conv(c, &x)?,
-                Capa::Relu => x.relu()?,
-                Capa::Ampliar => {
-                    let (_, _, h, w) = x.dims4()?;
-                    x.upsample_nearest2d(h * 2, w * 2)?
-                }
-                Capa::Bloque(a, b, c) => {
-                    let y = conv(c, &conv(b, &conv(a, &x)?.relu()?)?.relu()?)?;
-                    (y + &x)?.relu()?
-                }
-            };
-        }
-        x.clamp(0f32, 1f32)
-    }
-}
-
 // ─── El generador ────────────────────────────────────────────────────────────
 
-/// SD-Turbo cargado.
+/// SD-Turbo cargado: el texto, el UNet y el decodificador.
 pub struct Generador {
     clip_tok: Clip,
-    relleno: String,
-    clip: ClipTextTransformer,
-    unet: UNet2DConditionModel,
-    decodificador: Decodificador,
-    tipo: DType,
-    dev: Device,
-}
-
-enum Decodificador {
-    Taesd(Taesd),
-    Completo(Box<AutoEncoderKL>),
+    texto: clip_text::TextoClip,
+    unet: unet::Unet,
+    taesd: taesd::Taesd,
 }
 
 /// Una imagen en RGB, fila por fila.
@@ -309,120 +197,74 @@ fn archivos(dir: &Path) -> Vec<PathBuf> {
     ]
 }
 
+/// El σ de Euler en el paso `t`, con los betas de SD (`scaled_linear`, de
+/// 0,00085 a 0,012 en 1000 pasos): `σ = √((1 − ᾱ) / ᾱ)`.
+pub fn sigma(t: usize) -> f64 {
+    let (b0, b1) = (0.00085f64.sqrt(), 0.012f64.sqrt());
+    let mut acumulado = 1.0;
+    for i in 0..=t {
+        let beta = (b0 + (b1 - b0) * i as f64 / 999.0).powi(2);
+        acumulado *= 1.0 - beta;
+    }
+    ((1.0 - acumulado) / acumulado).sqrt()
+}
+
 impl Generador {
-    /// Carga todo de `dir_modelos/sd-turbo` y `dir_modelos/taesd`. En f16
-    /// salvo `COSXAMIX_IMAGEN_TIPO=f32` (+25% de velocidad, +2,4 GB).
+    /// Carga todo de `dir_modelos/sd-turbo` y `dir_modelos/taesd`. Los pesos
+    /// del UNet y del texto quedan en f16 en el mapeo de los archivos.
     pub fn abrir(dir_modelos: &Path) -> Resultado<Self> {
         for a in archivos(dir_modelos) {
             if !a.exists() {
                 return Err(format!("falta {}", a.display()));
             }
         }
-        let tipo = match std::env::var("COSXAMIX_IMAGEN_TIPO").as_deref() {
-            Ok("f32") => DType::F32,
-            _ => DType::F16,
-        };
-        let dev = Device::Cpu;
         let sd = dir_modelos.join("sd-turbo");
-        let cfg = stable_diffusion::StableDiffusionConfig::v2_1(None, Some(512), Some(512));
-        let relleno = cfg
-            .clip
-            .pad_with
-            .clone()
-            .unwrap_or_else(|| "<|endoftext|>".into());
-        let clip = stable_diffusion::build_clip_transformer(
-            &cfg.clip,
-            sd.join("text_encoder/model.fp16.safetensors"),
-            &dev,
-            tipo,
-        )
-        .map_err(err)?;
-        let unet = cfg
-            .build_unet(
-                sd.join("unet/diffusion_pytorch_model.fp16.safetensors"),
-                &dev,
-                4,
-                false,
-                tipo,
-            )
-            .map_err(err)?;
-        let decodificador = if std::env::var("COSXAMIX_IMAGEN_VAE").as_deref() == Ok("completo") {
-            Decodificador::Completo(Box::new(
-                cfg.build_vae(
-                    sd.join("vae/diffusion_pytorch_model.fp16.safetensors"),
-                    &dev,
-                    tipo,
-                )
-                .map_err(err)?,
-            ))
-        } else {
-            Decodificador::Taesd(Taesd::abrir(
-                &dir_modelos.join("taesd/taesd_decoder.safetensors"),
-                &dev,
-            )?)
-        };
         Ok(Self {
             clip_tok: Clip::abrir(&sd.join("tokenizer"))?,
-            relleno,
-            clip,
-            unet,
-            decodificador,
-            tipo,
-            dev,
+            texto: clip_text::TextoClip::abrir(&sd.join("text_encoder/model.fp16.safetensors"))?,
+            unet: unet::Unet::abrir(&sd.join("unet/diffusion_pytorch_model.fp16.safetensors"))?,
+            taesd: taesd::Taesd::abrir(&dir_modelos.join("taesd/taesd_decoder.safetensors"))?,
         })
     }
 
-    /// Una imagen de `lado`×`lado` (múltiplo de 8) para `prompt`, en un paso.
-    /// La misma semilla da la misma imagen.
-    pub fn generar(&self, prompt: &str, semilla: u64, lado: usize) -> Resultado<Imagen> {
+    /// Los latentes de un prompt, sin decodificar: el texto, el ruido de la
+    /// semilla y un paso de Euler.
+    ///
+    /// Un paso con espaciado `trailing` es `t = 999`. El ruido inicial se
+    /// multiplica por `σ(999)` (Euler, `trailing`: `init_noise_sigma` es el σ
+    /// máximo), la entrada del UNet se divide por `√(σ² + 1)`, y con predicción
+    /// `epsilon` el paso a `σ = 0` deja `x₀ = x − σ·ε`.
+    pub fn latentes(&self, prompt: &str, semilla: u64, lado: usize) -> Resultado<Vec<f32>> {
         if !(64..=768).contains(&lado) || !lado.is_multiple_of(8) {
             return Err(format!(
                 "lado {lado}: tiene que ser múltiplo de 8, de 64 a 768"
             ));
         }
-        let ids = self.clip_tok.codificar(prompt, &self.relleno)?;
-        let ids = Tensor::new(ids.as_slice(), &self.dev)
-            .and_then(|t| t.unsqueeze(0))
-            .map_err(err)?;
-        let texto = self.clip.forward(&ids).map_err(err)?;
-
-        let mut sched = EulerAncestralDiscreteSchedulerConfig {
-            prediction_type: PredictionType::Epsilon,
-            timestep_spacing: TimestepSpacing::Trailing,
-            ..Default::default()
-        }
-        .build(1)
-        .map_err(err)?;
-
-        // El ruido inicial, con la semilla.
+        let ids = self.clip_tok.codificar(prompt, "!")?;
+        let texto = self.texto.codificar(&ids)?;
         let l = lado / 8;
+        let s = sigma(999) as f32;
         let mut azar = crate::daiss::Azar::con_semilla(semilla);
-        let ruido: Vec<f32> = (0..4 * l * l).map(|_| azar.normales(1.0).0).collect();
-        let mut lat = (Tensor::from_vec(ruido, (1, 4, l, l), &self.dev).map_err(err)?
-            * sched.init_noise_sigma())
-        .and_then(|t| t.to_dtype(self.tipo))
-        .map_err(err)?;
-        for t in sched.timesteps().to_vec() {
-            let entrada = sched.scale_model_input(lat.clone(), t).map_err(err)?;
-            let ruido = self.unet.forward(&entrada, t as f64, &texto).map_err(err)?;
-            lat = sched.step(&ruido, t, &lat).map_err(err)?;
-        }
+        let x: Vec<f32> = (0..4 * l * l).map(|_| azar.normales(1.0).0 * s).collect();
+        let escala = 1.0 / (s * s + 1.0).sqrt();
+        let entrada: Vec<f32> = x.iter().map(|v| v * escala).collect();
+        let ruido = self.unet.aplicar(&entrada, (l, l), 999.0, &texto);
+        Ok(x.iter().zip(&ruido).map(|(v, e)| v - s * e).collect())
+    }
 
-        let img = match &self.decodificador {
-            Decodificador::Taesd(d) => lat.to_dtype(DType::F32).and_then(|l| d.decodificar(&l)),
-            Decodificador::Completo(vae) => (&lat / 0.18215)
-                .and_then(|l| vae.decode(&l))
-                .and_then(|i| (i / 2.)? + 0.5)
-                .and_then(|i| i.clamp(0f32, 1f32)),
+    /// Una imagen de `lado`×`lado` (múltiplo de 8) para `prompt`, en un paso.
+    /// La misma semilla da la misma imagen.
+    pub fn generar(&self, prompt: &str, semilla: u64, lado: usize) -> Resultado<Imagen> {
+        let lat = self.latentes(prompt, semilla, lado)?;
+        let l = lado / 8;
+        let (img, alto, ancho) = self.taesd.decodificar(&lat, (l, l));
+        let hw = alto * ancho;
+        let mut rgb = vec![0u8; hw * 3];
+        for (p, px) in rgb.chunks_mut(3).enumerate() {
+            for (c, v) in px.iter_mut().enumerate() {
+                *v = (img[c * hw + p] * 255.0).round() as u8;
+            }
         }
-        .and_then(|i| (i * 255.)?.to_dtype(DType::U8)?.squeeze(0))
-        .map_err(err)?;
-        let (_, alto, ancho) = img.dims3().map_err(err)?;
-        let rgb = img
-            .permute((1, 2, 0))
-            .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_vec1::<u8>())
-            .map_err(err)?;
         Ok(Imagen { ancho, alto, rgb })
     }
 }
@@ -492,6 +334,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sigma_de_sd() {
+        // El σ máximo de SD con estos betas: ~14,6.
+        assert!((sigma(999) - 14.6146).abs() < 1e-3, "{}", sigma(999));
+        assert!(sigma(0) < 0.03);
+    }
+
+    #[test]
     fn crc_y_png_conocidos() {
         assert_eq!(crc32(b"IEND"), 0xAE42_6082);
         let img = Imagen {
@@ -528,53 +377,5 @@ mod tests {
         assert_eq!(&ids[..3], &[0, 7, 1]);
         assert_eq!(ids.len(), 77);
         assert!(ids[3..].iter().all(|&i| i == 2));
-    }
-
-    /// El error de candle que esquiva [`conv`]: con canales = alto = ancho, la
-    /// convolución tiene que dar lo mismo que la definición, a mano.
-    #[test]
-    fn convolucion_cuadrada_como_la_directa() {
-        let dev = Device::Cpu;
-        let n = 4usize;
-        let mut azar = crate::daiss::Azar::con_semilla(7);
-        let x: Vec<f32> = (0..n * n * n).map(|_| azar.normales(1.0).0).collect();
-        let w: Vec<f32> = (0..n * n * 9).map(|_| azar.normales(0.5).0).collect();
-        let xt = Tensor::from_vec(x.clone(), (1, n, n, n), &dev).unwrap();
-        let wt = Tensor::from_vec(w.clone(), (n, n, 3, 3), &dev).unwrap();
-        let c = candle_nn::Conv2d::new(
-            wt,
-            None,
-            candle_nn::Conv2dConfig {
-                padding: 1,
-                ..Default::default()
-            },
-        );
-        let y = conv(&c, &xt)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        for o in 0..n {
-            for i in 0..n {
-                for j in 0..n {
-                    let mut s = 0f32;
-                    for ci in 0..n {
-                        for dy in 0..3 {
-                            for dx in 0..3 {
-                                let (yy, xx) = (i as isize + dy - 1, j as isize + dx - 1);
-                                if yy < 0 || xx < 0 || yy >= n as isize || xx >= n as isize {
-                                    continue;
-                                }
-                                s += x[(ci * n + yy as usize) * n + xx as usize]
-                                    * w[((o * n + ci) * 3 + dy as usize) * 3 + dx as usize];
-                            }
-                        }
-                    }
-                    let got = y[(o * n + i) * n + j];
-                    assert!((got - s).abs() < 1e-4, "({o},{i},{j}): {got} contra {s}");
-                }
-            }
-        }
     }
 }

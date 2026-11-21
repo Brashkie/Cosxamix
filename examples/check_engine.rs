@@ -1,6 +1,6 @@
 //! Prueba el motor real contra el GGUF de `modelos/`, midiendo frío y caliente.
 use cosxamix::engine::{Mensaje, Motor, Peticion};
-use cosxamix::engine_candle::MotorCandle;
+use cosxamix::engine_own::MotorPropio;
 use std::path::Path;
 use std::time::Instant;
 
@@ -8,7 +8,7 @@ fn main() {
     let gguf = Path::new("modelos/qwen2.5-0.5b-instruct-q4_k_m.gguf");
     let tok = Path::new("modelos/tokenizer.json");
 
-    let m = MotorCandle::nuevo("qwen2.5-0.5b", gguf, tok).expect("construir");
+    let m = MotorPropio::nuevo("qwen2.5-0.5b", gguf, tok).expect("construir");
     println!("  caliente al construir: {}", m.esta_caliente());
 
     let pet = |t: &str| Peticion {

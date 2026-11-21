@@ -2451,6 +2451,51 @@ Queda como está. Con 6 hilos, ~10 GB/s cada uno ya son el doble de lo que la RA
 entrega: el kernel no es lo que limita el decode, y lo que falta hasta el techo se
 gana mejor por otro lado, como hizo la precarga.
 
+## 36. Sin candle: imágenes sobre una GEMM propia y el backward escrito a mano
+
+En la 0.11.0 candle salió de todo: el binario, las imágenes, el entrenamiento y
+los tests. Lo que se decidió en cada parte, y lo que se midió:
+
+**Las imágenes: una GEMM, no un grafo.** El UNet, CLIP y TAESD son convoluciones,
+lineales y atención, y todo eso es una multiplicación de matrices. Así que en vez
+de reescribir un grafo de tensores se escribió una GEMM al estilo BLIS
+(`kernels/sgemm.rs`: microkernel AVX2+FMA de 6×16, paneles de 96×256×256) que
+convierte el f16 de los pesos al empaquetar, y la convolución 3×3 entra como una
+fuente que arma las ventanas al empaquetar, sin la matriz im2col en memoria. Llega a
+~300 GFLOPS en las convoluciones grandes del UNet.
+
+| 512×512, i5-10400 | candle | propio |
+|---|---:|---:|
+| UNet | 12,6 s | 5,4 s |
+| total | ~16,5 s | 7,2 s |
+| pico de memoria | ~4,2 GB | 2,6 GB |
+
+Comparado antes de quitarlo, el UNet da lo de candle hasta el ruido de f32. CLIP no:
+4e-3, y es candle el que se aparta: usa la GELU aproximada con tanh y SD 2 pide la
+exacta (cambiando la nuestra a tanh, la diferencia bajó a 1,6e-6, y se dejó la exacta).
+
+**El entrenamiento: backward a mano, no un autograd.** Un autograd general es un
+grafo, una cinta y un gradiente por operación; acá hay **una** arquitectura (la de
+Qwen2 y daiss), así que su vuelta se escribió entera, operación por operación, y cada
+gradiente se comprueba contra diferencias finitas en los tests. A cambio de no ser
+general, sabe qué no calcular: con la base congelada no hace `dL/dW` ni el gradiente
+de las tablas de vocabulario (545 MB por secuencia en el 0,5B), que candle calculaba
+igual: era el quinto de los techos de candle en la tabla del README.
+
+| | candle | propio |
+|---|---:|---:|
+| LoRA, 0,5B, 256 tokens, un paso | ~5,2 s | 2,8 s |
+| daiss-mini, bytes, lote 16 × 128 | ~1.215 ms | ~545 ms |
+
+El forward entrenable da contra el Qwen2 de candle en f32 una diferencia de 4e-5
+sobre un rango de 31: el mismo modelo. El lote se reparte entre los núcleos por
+secuencia, que es lo que con candle había que hacer a mano (`COSXAMIX_PARTES`).
+
+**Los tests: guardar lo que dijo el oráculo.** Lo que se comparaba contra candle
+(RoPE, softmax, atención) compara contra sus resultados guardados una vez, con las
+mismas tolerancias. Lo que se pierde es poder regenerarlos; lo que no se pierde es lo
+que atrapaban, como la convención de RoPE.
+
 ## Cifras que hubo que corregir
 
 Se listan porque una cifra mal medida dirige el trabajo hacia el lado

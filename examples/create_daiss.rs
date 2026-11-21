@@ -4,17 +4,15 @@
 //! decidir qué tamaño tiene sentido en qué máquina, y después escribe el que
 //! se le pida y lo vuelve a leer.
 //!
-//! La comprobación que vale es la última: con `--features candle` el archivo
-//! se lee **también** con candle, que es una implementación independiente que
-//! no comparte una línea con la nuestra. Que las dos lean lo mismo es la
-//! diferencia entre escribir GGUF y escribir un archivo que solo nosotros
-//! entendemos.
+//! La comprobación que vale es la última: que el motor propio construya el
+//! modelo entero desde el archivo. Hasta la 0.10.0 se leía además con candle;
+//! que el formato sea el de GGUF de verdad lo comprueban los tests de
+//! `gguf_write.rs`.
 //!
 //!     cargo run --release --example create_daiss
 //!     COSXAMIX_DAISS=daiss-7b cargo run --release --example create_daiss
 //!     COSXAMIX_DAISS=chavin-30b cargo run --release --example create_daiss
 //!     COSXAMIX_TIPO=q3k COSXAMIX_DAISS=daiss-3b cargo run --release --example create_daiss
-//!     cargo run --release --features candle --example create_daiss
 
 use cosxamix::daiss::{Config, CHAVIN, FAMILIA};
 use cosxamix::gguf::{Gguf, TipoGgml};
@@ -176,90 +174,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bytes.len()
     );
 
-    #[cfg(feature = "candle")]
-    {
-        println!();
-        println!("  candle, que no comparte una linea con nuestro escritor:");
-        let mut f = std::fs::File::open(&ruta)?;
-        let ct = candle_core::quantized::gguf_file::Content::read(&mut f)?;
-        println!(
-            "    {} tensores, {} metadatos",
-            ct.tensor_infos.len(),
-            ct.metadata.len()
-        );
-        assert_eq!(ct.tensor_infos.len(), r.tensores, "candle conto otra cosa");
-
-        // Que lea la cabecera no alcanza: hay que cargar un tensor y
-        // comprobar que los bytes son LOS MISMOS que lee el nuestro.
-        let dev = candle_core::Device::Cpu;
-        let qt = ct.tensor(&mut f, &ultimo.nombre, &dev)?;
-        let suyo = qt.dequantize(&dev)?.flatten_all()?.to_vec1::<f32>()?;
-        let mut nuestro = vec![0f32; ultimo.elementos()];
-        cosxamix::quant::descuantizar(ultimo.tipo, &bytes, &mut nuestro)?;
-        let distintos = nuestro.iter().zip(&suyo).filter(|(a, b)| a != b).count();
-        println!(
-            "    {} descuantizado: {} valores, {} distintos",
-            ultimo.nombre,
-            suyo.len(),
-            distintos
-        );
-        assert_eq!(distintos, 0, "candle lee otros valores que nosotros");
-
-        // Y lo ultimo: que el modelo entero se construya. Es lo que falla si
-        // falta un tensor o si un nombre no es el que el cargador espera.
-        //
-        // Solo hasta 4 GB. Construirlo carga el modelo entero en memoria, y
-        // esta maquina tiene 7,3 libres: con un daiss-7b fallaria por falta
-        // de RAM, que no dice nada sobre si el archivo esta bien escrito.
-        const TOPE_CARGA: u64 = 4 << 30;
-        if r.bytes <= TOPE_CARGA {
-            let mut f = std::fs::File::open(&ruta)?;
-            let ct = candle_core::quantized::gguf_file::Content::read(&mut f)?;
-            match cosxamix::model::qwen2::ModelWeights::from_gguf(ct, &mut f, &dev) {
-                Ok(_) => println!("    el modelo se construye entero: daiss es cargable"),
-                Err(e) => {
-                    println!("    NO se construye: {e}");
-                    return Err(e.into());
-                }
-            }
-        } else {
-            println!(
-                "    {:.1} GB: no se construye aca, no entra en la RAM libre",
-                gb(r.bytes)
-            );
-            // Lo que SI se puede comprobar sin cargarlo: que cada tensor que
-            // el cargador va a pedir existe y tiene la forma que espera.
-            let mut faltan = Vec::new();
-            for d in cfg.declaraciones(TipoGgml::Q8_0) {
-                match ct.tensor_infos.get(&d.nombre) {
-                    Some(i) => {
-                        let suyas: Vec<u64> = i.shape.dims().iter().map(|x| *x as u64).collect();
-                        // candle devuelve la forma al reves que el archivo.
-                        let mut nuestras = d.dims.clone();
-                        nuestras.reverse();
-                        if suyas != nuestras {
-                            faltan.push(format!("{}: {suyas:?} vs {nuestras:?}", d.nombre));
-                        }
-                    }
-                    None => faltan.push(format!("{}: no esta", d.nombre)),
-                }
-            }
-            if faltan.is_empty() {
-                println!(
-                    "    los {} tensores que el cargador pide estan, con su forma",
-                    cfg.declaraciones(TipoGgml::Q8_0).len()
-                );
-            } else {
-                for f in faltan.iter().take(5) {
-                    println!("    PROBLEMA {f}");
-                }
-                return Err(format!("{} tensores mal", faltan.len()).into());
+    // Y lo ultimo: que el modelo entero se construya con el motor propio. Es lo
+    // que falla si falta un tensor o si un nombre no es el que el cargador
+    // espera.
+    //
+    // Solo hasta 4 GB: construirlo mapea el modelo y arma sus capas, y con un
+    // daiss-7b esta maquina se queda sin RAM, que no dice nada sobre si el
+    // archivo esta bien escrito.
+    println!();
+    const TOPE_CARGA: u64 = 4 << 30;
+    if r.bytes <= TOPE_CARGA {
+        match cosxamix::forward::Modelo::abrir(&ruta) {
+            Ok(_) => println!("    el modelo se construye entero con el motor propio"),
+            Err(e) => {
+                println!("    NO se construye: {e}");
+                return Err(e.into());
             }
         }
+    } else {
+        println!(
+            "    {:.1} GB: no se construye aca, no entra en la RAM libre",
+            gb(r.bytes)
+        );
+        // Lo que SI se puede comprobar sin cargarlo: que cada tensor que el
+        // cargador va a pedir existe y tiene la forma que espera.
+        let mut faltan = Vec::new();
+        for d in cfg.declaraciones(TipoGgml::Q8_0) {
+            match g.tensor(&d.nombre) {
+                Some(i) if i.dims != d.dims => {
+                    faltan.push(format!("{}: {:?} vs {:?}", d.nombre, i.dims, d.dims))
+                }
+                Some(_) => {}
+                None => faltan.push(format!("{}: no esta", d.nombre)),
+            }
+        }
+        if faltan.is_empty() {
+            println!(
+                "    los {} tensores que el cargador pide estan, con su forma",
+                cfg.declaraciones(TipoGgml::Q8_0).len()
+            );
+        } else {
+            for f in faltan.iter().take(5) {
+                println!("    PROBLEMA {f}");
+            }
+            return Err(format!("{} tensores mal", faltan.len()).into());
+        }
     }
-
-    #[cfg(not(feature = "candle"))]
-    println!("\n  (con --features candle se comprueba ademas con su lector)");
 
     println!();
     println!("  Lo que esto NO es: un modelo entrenado. Los pesos son ruido con");

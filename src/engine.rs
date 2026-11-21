@@ -28,8 +28,8 @@ pub struct Mensaje {
 /// integración más fácil de cometer y el más difícil de diagnosticar, porque
 /// el modelo contesta igual, solo que mal.
 ///
-/// Acá y no en un motor: los dos —candle y el propio— tienen que armar
-/// exactamente el mismo prompt, o comparar uno contra otro no dice nada.
+/// Acá y no en un motor: mientras convivieron, los dos —candle y el propio—
+/// tenían que armar exactamente el mismo prompt, o compararlos no decía nada.
 pub fn formatear(mensajes: &[Mensaje]) -> String {
     let mut p = String::new();
     for m in mensajes {

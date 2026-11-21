@@ -9,7 +9,65 @@ acá va qué cambió, no por qué.
 
 ---
 
-## [Sin publicar]
+## [0.11.0] - 2026-11-21
+
+- **Licencia: GPL-3.0-or-later** (`LICENSE`, `Cargo.toml`), la misma de
+  WinsiBot. Hasta la 0.10.0 Cosxamix fue MIT, y esas versiones siguen siéndolo
+  para quien las tenga. Todas las dependencias son compatibles con la GPL-3.0
+  (MIT, Apache-2.0, BSD, Zlib, Unicode). `THIRD-PARTY.md` registra además las
+  licencias de los modelos: el Qwen2.5 3B, el de por defecto, es la **Qwen
+  Research License** (no comercial); el 0,5B, el 1,5B y el 7B, Apache-2.0.
+  Los modelos daiss que genera Cosxamix también llevan ahora
+  `general.license = GPL-3.0-or-later` en el GGUF (antes decían `mit`).
+- **Candle salió del todo: Cosxamix no depende de él en ninguna parte.** Ni el
+  texto, ni las imágenes, ni el entrenamiento, ni los tests. La feature `candle`
+  ya no existe, y `training` no suma ninguna dependencia. El binario sirve texto
+  e imágenes sin features: **3,25 MB y 80 crates**, contra 7,3 MB y 139 con
+  candle.
+- **El motor de texto.** `engine_candle.rs`, el `src/model/qwen2.rs` copiado de
+  candle y `COSXAMIX_MOTOR=candle` ya no están: el texto lo sirve solo el motor
+  propio, el de por defecto desde la 0.6.0. Salieron 16 ejemplos que solo
+  medían o comparaban el motor de candle (`compare_forward`, `compare_logits`,
+  `measure_interleaved`, `check_quant`, `check_gguf`, `measure_own_matmul`…);
+  `check_engine` y la batería de `compare_models` quedan, con el motor propio, y
+  `create_daiss` comprueba el modelo construyéndolo con él. `num_cpus` deja de
+  ser opcional.
+- **Las imágenes (`/api/image`), propias**: el codificador de texto de CLIP, el
+  UNet de SD 2.x y TAESD (`src/image_gen/`), sobre una GEMM nueva al estilo BLIS
+  (`kernels/sgemm.rs`: microkernel AVX2+FMA de 6×16, paneles empaquetados, f16
+  convertido al empaquetar, la convolución 3×3 sin armar la matriz de ventanas)
+  y un lector de safetensors que deja los pesos f16 en el mapeo, sin copiarlos.
+  Una imagen de 512×512 en el i5-10400: **7,2 s contra ~16,5**, 2,3 veces más
+  rápido, con un pico de **2,6 GB, 1,6 GB menos**. Comparado contra candle antes
+  de quitarlo: el UNet da lo mismo hasta el ruido de f32. CLIP difiere en 4e-3 a
+  propósito: candle usa la GELU aproximada con tanh y la de SD 2 es la exacta.
+  Ya no existen `COSXAMIX_IMAGEN_TIPO` (los pesos van en f16, y la GEMM los
+  convierte al vuelo) ni `COSXAMIX_IMAGEN_VAE=completo`: decodifica TAESD.
+- **El entrenamiento, con el backward escrito a mano** (`training/transformer.rs`):
+  embeddings, RMSNorm, lineales con LoRA, RoPE, atención causal con cabezas
+  agrupadas, SwiGLU y entropía cruzada, cada gradiente comprobado contra
+  diferencias finitas en los tests; AdamW propio, con los valores del de candle.
+  Con la base congelada no calcula `dL/dW` ni el gradiente de las tablas de
+  vocabulario, que candle calculaba igual. Medido: un paso de LoRA en el 0,5B
+  con 256 tokens, **2,8 s contra ~5,2**; un paso de daiss-mini (bytes, lote
+  16 × 128), **~545 ms contra ~1.215**. El Tensor-Train de las tablas tiene su
+  propio backward por la cadena de núcleos. El modelo entrenable da los mismos
+  logits que el Qwen2 de candle en f32 (diferencia de 4e-5 sobre un rango de 31).
+  Los adaptadores se siguen guardando en el mismo `.safetensors`
+  (`{capa}.lora_a`, `{capa}.lora_b`), así que los viejos se leen.
+  `train_lora` tokeniza con el tokenizador propio. La API cambió: sin `Device`,
+  los lotes son `&[Vec<u32>]`, `logits` en vez de `forward`, y el paso es
+  `aplicar(&mut AdamW, &grads)`. `COSXAMIX_PARTES` de `train_daiss` ya no existe:
+  el lote se reparte solo entre los núcleos, por secuencia.
+- **Los tests que comparaban contra candle** (RoPE, softmax, atención) comparan
+  contra lo que calculó candle 0.9.2, guardado una vez en
+  `tests/fixtures/ops_candle.json`, con las mismas tolerancias.
+- **Arreglado: `una_palabra_enorme_no_cuesta_cuadratico` fallaba en macOS**
+  (8,4-8,6 veces contra un límite de 8). Medía tiempo; ahora cuenta los pasos
+  del codificador, que no dependen de la máquina: 50 K contra 400 K bytes da 8,0
+  justo, y uno cuadrático daría 64. El de tiempo queda, solo en release.
+- El CI y el release ya no usan la feature `candle`: los x86-64 se publican sin
+  features y los ARM con `zig,c`.
 
 ## [0.10.0] - 2026-11-11
 
@@ -1689,6 +1747,7 @@ agrega una sección a uno y se olvida del otro, CI falla.
 - Verificado en esta versión: **22 tests**, 0 avisos, clippy limpio en las tres
   combinaciones (por defecto, `candle`, `zig,candle`).
 
+[0.11.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.11.0
 [0.10.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.10.0
 [0.9.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.9.0
 [0.8.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.8.0

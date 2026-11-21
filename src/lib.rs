@@ -45,22 +45,15 @@ pub mod sampler;
 /// matrices cuantizadas, que es donde se va el 99% del tiempo.
 pub mod ops;
 
-#[cfg(feature = "candle")]
-pub mod model;
-
-#[cfg(feature = "candle")]
-pub mod engine_candle;
-
-#[cfg(feature = "candle")]
+/// Varios modelos a la vez, con un presupuesto de memoria.
 pub mod engine_manager;
 
-/// El motor propio detrás del trait `Motor`, para el servidor. Va con la
-/// feature `candle` solo por el tokenizador de Qwen (`tokenizers`).
-#[cfg(feature = "candle")]
+/// El motor propio detrás del trait `Motor`, para el servidor: `forward.rs`
+/// y los kernels de `src/kernels/`. Desde la 0.11.0 es el único.
 pub mod engine_own;
 
-/// Crear imágenes en la CPU con SD-Turbo y TAESD, para `POST /api/image`.
-#[cfg(feature = "candle")]
+/// Crear imágenes en la CPU con SD-Turbo y TAESD, para `POST /api/image`: CLIP,
+/// el UNet y el decodificador, propios.
 pub mod image_gen;
 
 #[cfg(feature = "training")]
