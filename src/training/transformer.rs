@@ -963,7 +963,14 @@ mod tests {
                 gradientes: true,
             },
         );
-        let h = 1e-3f32;
+        // El paso no es chico a propósito. La pérdida se calcula en f32 y su
+        // redondeo, dividido por 2h, es el ruido del lado numérico: con 1e-3
+        // llegaba a 2,5e-4 en valor absoluto y el peor caso quedaba a 1,3
+        // veces del límite; en Linux y macOS, con el `exp` y el `ln` de su
+        // libm, lo cruzaba (-0,00152 contra -0,00131). Con 5e-3 el ruido baja
+        // a ~7e-5, el error de truncar todavía no se nota y el peor caso queda
+        // a 6 veces del límite.
+        let h = 5e-3f32;
         let mut peor = 0f32;
         let mut probar = |analitico: f32, f: &mut dyn FnMut(f32) -> f32| {
             let (mas, menos) = (f(h), f(-h));

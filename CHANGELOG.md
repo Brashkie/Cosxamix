@@ -68,6 +68,14 @@ acá va qué cambió, no por qué.
   justo, y uno cuadrático daría 64. El de tiempo queda, solo en release.
 - El CI y el release ya no usan la feature `candle`: los x86-64 se publican sin
   features y los ARM con `zig,c`.
+- **Arreglado: `scripts/check_kernel_arch.py` no encontraba la librería de
+  kernels con cargo 1.100**, que movió el `OUT_DIR` de
+  `build/<paquete>-<hash>/out/` a `build/<paquete>/<hash>/out/`. Fallaban el
+  job de ARM del CI y todos los del release. Ahora busca en las dos.
+- El test de gradientes contra diferencias finitas usa un paso de 5e-3 en vez
+  de 1e-3: con 1e-3 el redondeo de la pérdida en f32 lo dejaba al borde, y en
+  Linux y macOS (otro `exp` y otro `ln`) fallaba por 2e-4. El peor caso queda
+  ahora a 6 veces del límite.
 
 ## [0.10.0] - 2026-11-11
 

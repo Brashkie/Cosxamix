@@ -122,9 +122,13 @@ def main():
     # Un target vacio (o "native") es la compilacion para la propia maquina,
     # que cargo deja en `target/<perfil>/` sin el nivel del triple.
     base = "target" if target in ("", "native") else f"target/{target}"
+    # Cargo 1.100 cambio la carpeta de compilacion: el OUT_DIR paso de
+    # `build/<paquete>-<hash>/out/` a `build/<paquete>/<hash>/out/`. Se buscan
+    # las dos, para que el script ande con cualquier cargo.
     patrones = [
-        f"{base}/{perfil}/build/*/out/{lib}"
+        f"{base}/{perfil}/build/{carpeta}/out/{lib}"
         for perfil in ("release", "debug")
+        for carpeta in ("*", "*/*")
         for lib in ("libcosxamix_kernels.a", "cosxamix_kernels.lib")
     ]
     encontrados = []
