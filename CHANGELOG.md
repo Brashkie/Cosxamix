@@ -71,7 +71,9 @@ acá va qué cambió, no por qué.
 - **Arreglado: `scripts/check_kernel_arch.py` no encontraba la librería de
   kernels con cargo 1.100**, que movió el `OUT_DIR` de
   `build/<paquete>-<hash>/out/` a `build/<paquete>/<hash>/out/`. Fallaban el
-  job de ARM del CI y todos los del release. Ahora busca en las dos.
+  job de ARM del CI y los de ARM del release. Ahora recorre toda la carpeta
+  del perfil, se queda con la copia más reciente (antes tomaba la primera, que
+  podía ser de una compilación vieja) y, si no encuentra nada, dice dónde buscó.
 - El test de gradientes contra diferencias finitas usa un paso de 5e-3 en vez
   de 1e-3: con 1e-3 el redondeo de la pérdida en f32 lo dejaba al borde, y en
   Linux y macOS (otro `exp` y otro `ln`) fallaba por 2e-4. El peor caso queda

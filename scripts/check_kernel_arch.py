@@ -19,7 +19,6 @@ hacen falta los tres, uno por plataforma de la matriz de release:
 donde la arquitectura es `aarch64`, `x86_64` o `arm`.
 """
 
-import glob
 import os
 import struct
 import sys
@@ -122,25 +121,31 @@ def main():
     # Un target vacio (o "native") es la compilacion para la propia maquina,
     # que cargo deja en `target/<perfil>/` sin el nivel del triple.
     base = "target" if target in ("", "native") else f"target/{target}"
-    # Cargo 1.100 cambio la carpeta de compilacion: el OUT_DIR paso de
-    # `build/<paquete>-<hash>/out/` a `build/<paquete>/<hash>/out/`. Se buscan
-    # las dos, para que el script ande con cualquier cargo.
-    patrones = [
-        f"{base}/{perfil}/build/{carpeta}/out/{lib}"
-        for perfil in ("release", "debug")
-        for carpeta in ("*", "*/*")
-        for lib in ("libcosxamix_kernels.a", "cosxamix_kernels.lib")
+    # Se recorre todo el perfil en vez de un patron fijo. Cargo 1.100 movio el
+    # OUT_DIR de `build/<paquete>-<hash>/out/` a `build/<paquete>/<hash>/out/`,
+    # y un patron escrito para una forma se rompe en silencio con la proxima.
+    nombres = ("libcosxamix_kernels.a", "cosxamix_kernels.lib")
+    carpetas = [os.path.join(raiz, base, perfil) for perfil in ("release", "debug")]
+    encontrados = [
+        os.path.join(d, f)
+        for carpeta in carpetas
+        for d, _, archivos in os.walk(carpeta)
+        for f in archivos
+        if f in nombres
     ]
-    encontrados = []
-    for p in patrones:
-        encontrados += glob.glob(os.path.join(raiz, p))
 
     if not encontrados:
         print(f"  no encontre la libreria de kernels para {target}")
+        print(f"  busque {' o '.join(nombres)} dentro de:")
+        for carpeta in carpetas:
+            existe = "" if os.path.isdir(carpeta) else "  (no existe)"
+            print(f"    {os.path.relpath(carpeta, raiz)}{existe}")
         print("  compilaste con --features zig?")
         return 1
 
-    ruta = encontrados[0]
+    # Puede haber copias de compilaciones anteriores (otro hash, la forma vieja
+    # de la carpeta): la que cuenta es la ultima.
+    ruta = max(encontrados, key=os.path.getmtime)
     obtenida = arquitectura(ruta)
     rel = os.path.relpath(ruta, raiz)
 
