@@ -293,8 +293,12 @@ jobs:
 
       - name: Demostrar con GNATprove
         working-directory: ada
+        # El indice que trae el runner puede estar atrasado: sin actualizarlo,
+        # Alire no encontraba ningun gnatprove y el build seguia sin el.
         run: |
+          alr -n index --update-all
           alr -n build
+          alr -n exec -- gnatprove --version
           alr -n exec -- gnatprove -P cosxamix_checks.gpr --level=4 -j0 --checks-as-errors=on
 
       - name: Tests con la feature ada

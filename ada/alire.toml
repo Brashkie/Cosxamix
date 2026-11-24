@@ -7,4 +7,7 @@ licenses = "GPL-3.0-or-later"
 tags = []
 
 [[depends-on]]
-gnatprove = "^16.1.0"
+# Cualquier gnatprove desde el 14: la demostracion es aritmetica lineal y
+# contratos comunes. Con "^16.1.0" el indice de Alire del runner de CI no
+# encontraba version para Linux.
+gnatprove = ">=14"
