@@ -21,11 +21,12 @@ DECISIONES §33). Sin GPU en el camino.
 | modelo | Qwen2.5-3B-Instruct Q3_K_M, 1644 MB |
 | residente | 1687 MB (x1,03 del archivo) |
 | generación | ~14,7 tok/s (con la precarga de la 0.9.0) |
-| lectura del prompt | ~50 tok/s (333 tokens en 6,6 s, matmul por bloques) |
+| lectura del prompt | ~57 tok/s (333 tokens en ~5,8 s, tesela por grupos de 128; DECISIONES §38) |
 | **del techo de memoria** | **~81%** (`30 ÷ 1,644 = 18,2 tok/s`) |
-| calidad | 10/15 preguntas verificables |
+| calidad | 11/15 preguntas verificables con el motor propio; **Qwen3-4B-Instruct-2507: 14/15** a 10,7 tok/s (DECISIONES §37) |
+| memoria privada | ~150 MB de pico en el primer mensaje (333 tokens), caché de atención en f16 (DECISIONES §39) |
 | sesiones concurrentes | 16, caché LRU, intercalar no cuesta nada |
-| plataformas con kernel vectorizado | x86-64 (AVX2) y ARM/Android (Zig) |
+| plataformas con kernel vectorizado | x86-64 (AVX2) y ARM/Android (Zig, C con `sdot`, Fortran en la GEMM en f32) |
 
 El techo es `tokens/s ≈ ancho de banda / tamaño del modelo`. El 51% que decía
 esta tabla se calculaba contra 37,5 GB/s, que esta RAM no puede dar; con el techo
@@ -681,6 +682,41 @@ la tabla salvo en el tamaño de los pesos, donde empata.
   lo de §32, solo vale entrenando así.
 - **Un núcleo compartido entre capas**, con un adaptador por capa: es el punto 7
   de §8.
+
+### 12. Pesos como fórmulas: comprimir sin perder inteligencia
+
+La pregunta: ¿cuánto de un modelo se puede describir con una fórmula en vez de
+guardarlo número por número, sin que acierte menos? GGUF guarda cada peso con
+2 a 8 bits y una escala; una fórmula puede guardar **la regla que los genera**.
+Ideas, de la más medible a la más arriesgada, todas contra la misma batería de
+15 preguntas y la KL contra el modelo original (`measure_precision`):
+
+1. **Cuantización vectorial con red de puntos**: en vez de un número por peso,
+   grupos de 8 pesos como un punto de la red E8 (la de empaquetado de esferas
+   más densa en 8 dimensiones). A 2 bits por peso pierde bastante menos que
+   Q2_K, que hoy rompe el 3B (6/15). Es la primera porque se mide con el mismo
+   kernel de siempre: desempaquetar y multiplicar.
+2. **Tensor-Train y Kronecker sobre las matrices grandes**: ya existe para las
+   tablas de vocabulario (`training::full`, DECISIONES §32); falta medirlo en
+   `ffn_gate`, `ffn_up` y `ffn_down`, que son dos tercios del modelo, con un
+   residuo cuantizado para lo que la fórmula no capture.
+3. **Pesos sembrados**: cada bloque como combinación de unas pocas bases
+   pseudoaleatorias que se regeneran de una semilla (`W ≈ Σ cᵢ·Bᵢ(semilla)`):
+   se guardan los coeficientes, no las bases. Cuesta cómputo al leer y ahorra
+   ancho de banda, que es justo lo que le sobra y lo que le falta a esta
+   máquina (el decode está al ~81% del techo de memoria).
+4. **Destilar a un daiss con la forma de la fórmula**: entrenar desde el
+   principio un modelo cuyas matrices *son* la fórmula (TT, Kronecker, E8),
+   con el Qwen como maestro, en vez de comprimir uno ya hecho.
+
+Cada idea se cierra con una tabla: bytes por peso, tok/s, KL y aciertos. Si no
+le gana a Q3_K_M en bytes con el mismo acierto, no entra.
+
+**Estado:** la idea 1 pasó el primer filtro. En 12 matrices del 0,5B en F16,
+E8 girado (2,06 bits por peso) da el mismo error que Q2_K (2,63): 0,0965
+contra 0,0957 (DECISIONES §40, `measure_lattice`). Con el 0,5B entero
+simulado acierta 5/15, como Q3_K (3,44 bits) y uno más que Q2_K (2,63), con KL
+0,43 contra 0,38. Lo siguiente: el 3B en F16 y el kernel con la tabla de E8.
 
 ## Decidido y cerrado
 

@@ -1,0 +1,10 @@
+name = "cosxamix_checks"
+description = "Limites de los tensores de un GGUF, demostrados con SPARK"
+version = "0.1.0"
+
+authors = ["Brashkie"]
+licenses = "GPL-3.0-or-later"
+tags = []
+
+[[depends-on]]
+gnatprove = "^16.1.0"

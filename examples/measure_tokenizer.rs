@@ -68,6 +68,7 @@ fn solo(cual: &str) {
 }
 
 fn main() {
+    cosxamix::machine_load::antes_de_medir();
     if let Ok(cual) = std::env::var("COSXAMIX_SOLO") {
         solo(&cual);
         return;

@@ -282,6 +282,7 @@ fn error_relativo(a: &[f32], b: &[f32]) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cosxamix::machine_load::antes_de_medir();
     let mut args = std::env::args().skip(1);
     let ruta_modelo = args.next().expect("falta el modelo");
     let ruta_corpus = args.next().expect("falta el corpus");

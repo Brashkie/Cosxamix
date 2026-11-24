@@ -171,6 +171,41 @@ unsafe fn f16_a_f32_f16c(src: &[u16], dst: &mut [f32]) {
     }
 }
 
+/// f32 → f16, de a 8 con F16C si la CPU lo tiene; redondeo al par más
+/// cercano en los dos caminos, así que dan lo mismo. Agrega a `dst`.
+pub fn f32_a_f16_agregar(src: &[f32], dst: &mut Vec<u16>) {
+    let desde = dst.len();
+    dst.resize(desde + src.len(), 0);
+    let destino = &mut dst[desde..];
+    #[cfg(target_arch = "x86_64")]
+    if super::cpu_avx2() && std::arch::is_x86_feature_detected!("f16c") {
+        // SAFETY: la CPU tiene F16C (comprobado arriba).
+        unsafe { f32_a_f16_f16c(src, destino) };
+        return;
+    }
+    for (d, s) in destino.iter_mut().zip(src) {
+        *d = crate::quant::f32_a_f16(*s);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,f16c")]
+unsafe fn f32_a_f16_f16c(src: &[f32], dst: &mut [u16]) {
+    use std::arch::x86_64::*;
+    let n = src.len().min(dst.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = _mm256_loadu_ps(src.as_ptr().add(i));
+        // 0: al par más cercano, como `quant::f32_a_f16`.
+        let h = _mm256_cvtps_ph::<0>(x);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, h);
+        i += 8;
+    }
+    for j in i..n {
+        dst[j] = crate::quant::f32_a_f16(src[j]);
+    }
+}
+
 /// Un f16 a f32, a mano: signo, exponente y mantisa, con subnormales.
 pub fn f16_escalar(h: u16) -> f32 {
     let signo = u32::from(h >> 15) << 31;
@@ -274,11 +309,71 @@ unsafe fn micro(
     filas: usize,
     cols: usize,
 ) {
+    #[cfg(all(feature = "fortran", target_arch = "x86_64"))]
+    if super::cpu_avx2() && micro_de_fortran() {
+        return micro_fortran(kc, a, b, dst, ldc, filas, cols);
+    }
     #[cfg(target_arch = "x86_64")]
     if super::cpu_avx2() {
         return micro_avx2(kc, a, b, dst, ldc, filas, cols);
     }
+    // En ARM64 Rust no tiene versión vectorizada; la de Fortran la vectoriza
+    // gfortran con NEON.
+    #[cfg(all(feature = "fortran", target_arch = "aarch64"))]
+    return micro_fortran(kc, a, b, dst, ldc, filas, cols);
+    #[allow(unreachable_code)]
     micro_escalar(kc, a, b, dst, ldc, filas, cols)
+}
+
+/// En x86-64, si el microkernel es el de Fortran o el de intrínsecos de Rust:
+/// `COSXAMIX_SGEMM_MICRO=fortran` o `rust`, para medirlos uno contra otro.
+#[cfg(all(feature = "fortran", target_arch = "x86_64"))]
+fn micro_de_fortran() -> bool {
+    static FORTRAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORTRAN.get_or_init(|| std::env::var("COSXAMIX_SGEMM_MICRO").is_ok_and(|v| v == "fortran"))
+}
+
+#[cfg(feature = "fortran")]
+extern "C" {
+    /// `kernels/sgemm_micro.f90`: el bloque de 6 × 16 en `t`, fila por fila.
+    fn cosxamix_sgemm_micro_f90(kc: usize, a: *const f32, b: *const f32, t: *mut f32);
+    /// Lo mismo, sumado directo en un bloque entero de C de paso `ldc`.
+    fn cosxamix_sgemm_micro_suma_f90(
+        kc: usize,
+        a: *const f32,
+        b: *const f32,
+        c: *mut f32,
+        ldc: usize,
+    );
+}
+
+/// El bloque con el microkernel de Fortran, sumado en C.
+///
+/// # Safety
+/// Como [`micro`]; en x86-64 además la CPU tiene que tener AVX2 y FMA, porque
+/// el objeto se compila para x86-64-v3.
+#[cfg(feature = "fortran")]
+pub unsafe fn micro_fortran(
+    kc: usize,
+    a: &[f32],
+    b: &[f32],
+    dst: *mut f32,
+    ldc: usize,
+    filas: usize,
+    cols: usize,
+) {
+    debug_assert!(a.len() >= MR * kc && b.len() >= NR * kc);
+    if filas == MR && cols == NR {
+        cosxamix_sgemm_micro_suma_f90(kc, a.as_ptr(), b.as_ptr(), dst, ldc);
+        return;
+    }
+    let mut t = [0f32; MR * NR];
+    cosxamix_sgemm_micro_f90(kc, a.as_ptr(), b.as_ptr(), t.as_mut_ptr());
+    for i in 0..filas {
+        for j in 0..cols {
+            *dst.add(i * ldc + j) += t[i * NR + j];
+        }
+    }
 }
 
 /// La referencia: la misma cuenta, valor por valor.
@@ -406,6 +501,36 @@ mod tests {
         }
     }
 
+    /// El microkernel de Fortran hace las mismas FMA en el mismo orden que el
+    /// de intrínsecos, así que tiene que dar **lo mismo bit a bit**; contra la
+    /// referencia escalar, que también fusiona, igual. Con un bloque entero y
+    /// con uno de borde.
+    #[cfg(feature = "fortran")]
+    #[test]
+    fn el_de_fortran_da_lo_mismo_bit_a_bit() {
+        // En x86-64 el objeto es de x86-64-v3: sin AVX2 no se puede llamar.
+        #[cfg(target_arch = "x86_64")]
+        if !super::super::cpu_avx2() {
+            return;
+        }
+        let kc = 77;
+        let a = azar(MR * kc, 3);
+        let b = azar(NR * kc, 4);
+        for (filas, cols) in [(MR, NR), (5, 11)] {
+            let base = azar(MR * NR, 5);
+            let (mut f, mut r) = (base.clone(), base.clone());
+            // SAFETY: `f` y `r` son de MR × NR con paso NR.
+            unsafe {
+                micro_fortran(kc, &a, &b, f.as_mut_ptr(), NR, filas, cols);
+                #[cfg(target_arch = "x86_64")]
+                micro_avx2(kc, &a, &b, r.as_mut_ptr(), NR, filas, cols);
+                #[cfg(not(target_arch = "x86_64"))]
+                micro_escalar(kc, &a, &b, r.as_mut_ptr(), NR, filas, cols);
+            }
+            assert_eq!(f, r, "bloque de {filas} × {cols}");
+        }
+    }
+
     /// Contra la definición, en tamaños con bordes por todos lados: menos de
     /// un bloque, justo un bloque, y más de uno en las tres dimensiones.
     #[test]
@@ -529,6 +654,32 @@ mod tests {
             &ingenua(t, sal, ent, |i, p| x[i * ent + p], |p, j| wf[j * ent + p]),
             ent,
         );
+    }
+
+    /// El camino de F16C y el escalar redondean igual, también en los bordes:
+    /// subnormales, el máximo, lo que satura a infinito y los empates.
+    #[test]
+    fn f32_a_f16_vectorizado_y_escalar_dan_lo_mismo() {
+        let mut x: Vec<f32> = azar(1000, 7).iter().map(|v| v * 300.0).collect();
+        x.extend([
+            0.0,
+            -0.0,
+            6.0e-8,
+            -6.0e-8,
+            1.0e-5,
+            65504.0,
+            65520.0,
+            70000.0,
+            -1.0e9,
+            1.0 + 1.0 / 2048.0,
+            1.0 + 3.0 / 2048.0,
+            2.5e-5,
+            f32::INFINITY,
+        ]);
+        let mut v = Vec::new();
+        f32_a_f16_agregar(&x, &mut v);
+        let e: Vec<u16> = x.iter().map(|a| crate::quant::f32_a_f16(*a)).collect();
+        assert_eq!(v, e);
     }
 
     #[test]

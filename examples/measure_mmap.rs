@@ -39,6 +39,7 @@ fn sumar(b: &[u8]) -> u64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cosxamix::machine_load::antes_de_medir();
     let dir = std::env::var("COSXAMIX_MODELOS").unwrap_or_else(|_| "modelos".into());
     let archivo =
         std::env::var("COSXAMIX_GGUF").unwrap_or_else(|_| "qwen2.5-3b-instruct-q4_k_m.gguf".into());

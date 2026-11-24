@@ -899,6 +899,83 @@ pub unsafe fn tesela_i8_avx2<const R: usize, const C: usize>(
     salida
 }
 
+/// La tesela sin signo, **de a grupos de 128 valores**: menos trabajo en coma
+/// flotante por producto.
+///
+/// [`tesela_u8_avx2`] convierte a `f32` y escala cada trozo de 32 valores: por
+/// cada par fila × columna y cada trozo son `maddubs`, `madd`, la conversión,
+/// un `mul` y una FMA, cinco instrucciones que en Skylake van todas a los
+/// puertos 0 y 1. Ese es el techo medido del prefill: ~6,4 productos por ciclo
+/// y núcleo, ~300 GOPS en los 6 núcleos del i5-10400.
+///
+/// Acá los cuatro trozos de un grupo se suman **en enteros** con `hadd`, que
+/// va casi todo al puerto 5, y la conversión, el producto de escalas y la FMA
+/// se hacen una vez por grupo. Después de dos niveles de `hadd`, el carril `j`
+/// tiene la suma de los primeros 16 valores del trozo `j` (j < 4) o de los
+/// segundos 16 del trozo `j - 4`: justo un sub-bloque de 16, así que sirve
+/// igual para Q3_K y Q6_K (sub-bloques de 16) que para Q4_K y Q5_K (de 32, con
+/// la escala repetida en los dos carriles). Las escalas llegan ya en ese orden:
+/// 8 por grupo ([`crate::ops`] las arma con `agrupar_escalas`).
+///
+/// Las sumas parciales son enteras, o sea exactas: hay un redondeo por grupo
+/// en vez de uno por trozo.
+///
+/// # Safety
+///
+/// AVX2 y FMA; cada puntero de fila y de columna cubre `128 · grupos` valores
+/// y cada puntero de escalas `8 · grupos`; filas en `-127..=127` y columnas en
+/// `0..=129`.
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn tesela_u8_grupos_avx2<const R: usize, const C: usize>(
+    filas: &[*const i8; R],
+    esc_filas: &[*const f32; R],
+    cols: &[*const i8; C],
+    esc_cols: &[*const f32; C],
+    grupos: usize,
+) -> [[f32; C]; R] {
+    let unos = _mm256_set1_epi16(1);
+    let mut acc = [[_mm256_setzero_ps(); C]; R];
+    for g in 0..grupos {
+        let base = 128 * g;
+        // Dos mitades del grupo: trozos (0, 1) y (2, 3), cada una a un `hadd`.
+        let mut mitad = [[[_mm256_setzero_si256(); C]; R]; 2];
+        for (m, mitad_m) in mitad.iter_mut().enumerate() {
+            let q = base + 64 * m;
+            let mut c0 = [_mm256_setzero_si256(); C];
+            let mut c1 = [_mm256_setzero_si256(); C];
+            for c in 0..C {
+                c0[c] = _mm256_loadu_si256(cols[c].add(q) as *const __m256i);
+                c1[c] = _mm256_loadu_si256(cols[c].add(q + 32) as *const __m256i);
+            }
+            for r in 0..R {
+                let x0 = _mm256_loadu_si256(filas[r].add(q) as *const __m256i);
+                let x1 = _mm256_loadu_si256(filas[r].add(q + 32) as *const __m256i);
+                for c in 0..C {
+                    let a = _mm256_madd_epi16(_mm256_maddubs_epi16(c0[c], x0), unos);
+                    let b = _mm256_madd_epi16(_mm256_maddubs_epi16(c1[c], x1), unos);
+                    mitad_m[r][c] = _mm256_hadd_epi32(a, b);
+                }
+            }
+        }
+        for c in 0..C {
+            let ec = _mm256_loadu_ps(esc_cols[c].add(8 * g));
+            for r in 0..R {
+                let ef = _mm256_loadu_ps(esc_filas[r].add(8 * g));
+                let h = _mm256_hadd_epi32(mitad[0][r][c], mitad[1][r][c]);
+                acc[r][c] =
+                    _mm256_fmadd_ps(_mm256_cvtepi32_ps(h), _mm256_mul_ps(ef, ec), acc[r][c]);
+            }
+        }
+    }
+    let mut salida = [[0f32; C]; R];
+    for r in 0..R {
+        for c in 0..C {
+            salida[r][c] = reducir_f32(acc[r][c]);
+        }
+    }
+    salida
+}
+
 /// La misma tesela con los pesos **sin signo** (`0..=129`): ya no hace falta
 /// el rodeo del signo, y por cada producto se ahorran dos instrucciones —el
 /// valor absoluto de la columna y el signo pasado a la fila—.

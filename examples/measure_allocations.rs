@@ -55,6 +55,7 @@ fn medir(repeticiones: usize, mut f: impl FnMut()) -> f64 {
 }
 
 fn main() {
+    cosxamix::machine_load::antes_de_medir();
     let tipo = TipoGgml::Q4K;
     let m = 1usize;
 

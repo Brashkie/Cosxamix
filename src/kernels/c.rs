@@ -123,6 +123,95 @@ pub unsafe fn dot_q3k_i8_neon(bloques: &[u8], xq: &[i8], xe: &[f32], xs: &[f32])
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn cosxamix_tesela_grupos_3x2_c(
+        filas: *const *const i8,
+        esc_filas: *const *const f32,
+        cols: *const *const i8,
+        esc_cols: *const *const f32,
+        grupos: usize,
+        salida: *mut f32,
+    );
+}
+
+/// La tesela del prefill por grupos de 128, en C
+/// (`kernels/tile_groups_avx2.c`): el mismo algoritmo que
+/// [`super::x86::tesela_u8_grupos_avx2`] con la forma fija de 3 × 2.
+///
+/// # Safety
+///
+/// Lo mismo que [`super::x86::tesela_u8_grupos_avx2`].
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn tesela_grupos_3x2(
+    filas: &[*const i8; 3],
+    esc_filas: &[*const f32; 3],
+    cols: &[*const i8; 2],
+    esc_cols: &[*const f32; 2],
+    grupos: usize,
+) -> [[f32; 2]; 3] {
+    let mut s = [0f32; 6];
+    unsafe {
+        cosxamix_tesela_grupos_3x2_c(
+            filas.as_ptr(),
+            esc_filas.as_ptr(),
+            cols.as_ptr(),
+            esc_cols.as_ptr(),
+            grupos,
+            s.as_mut_ptr(),
+        );
+    }
+    [[s[0], s[1]], [s[2], s[3]], [s[4], s[5]]]
+}
+
+/// La tesela de C hace las mismas operaciones en el mismo orden que la de
+/// Rust: tiene que dar lo mismo bit a bit.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests_x86 {
+    #[test]
+    fn la_tesela_por_grupos_de_c_da_lo_mismo_que_la_de_rust() {
+        if !super::super::cpu_avx2() {
+            return;
+        }
+        let grupos = 5;
+        let n = 128 * grupos;
+        let filas: Vec<Vec<i8>> = (0..3)
+            .map(|r| {
+                (0..n)
+                    .map(|i| ((i * 37 + r * 11) % 255) as i8 / 2)
+                    .collect()
+            })
+            .collect();
+        let cols: Vec<Vec<i8>> = (0..2)
+            .map(|c| {
+                (0..n)
+                    .map(|i| ((i * 13 + c * 7) % 130) as u8 as i8)
+                    .collect()
+            })
+            .collect();
+        let esc = |s: usize| -> Vec<f32> {
+            (0..8 * grupos)
+                .map(|i| 0.01 + ((i * s) % 17) as f32 * 0.003)
+                .collect()
+        };
+        let ef: Vec<Vec<f32>> = (1..4).map(esc).collect();
+        let ec: Vec<Vec<f32>> = (5..7).map(esc).collect();
+        let fp = [filas[0].as_ptr(), filas[1].as_ptr(), filas[2].as_ptr()];
+        let efp = [ef[0].as_ptr(), ef[1].as_ptr(), ef[2].as_ptr()];
+        let cp = [cols[0].as_ptr(), cols[1].as_ptr()];
+        let ecp = [ec[0].as_ptr(), ec[1].as_ptr()];
+        // SAFETY: AVX2 comprobado; cada puntero cubre `n` valores y `8 · grupos`
+        // escalas; filas en -127..=127, columnas en 0..=129.
+        let (de_c, de_rust) = unsafe {
+            (
+                super::tesela_grupos_3x2(&fp, &efp, &cp, &ecp, grupos),
+                super::super::x86::tesela_u8_grupos_avx2::<3, 2>(&fp, &efp, &cp, &ecp, grupos),
+            )
+        };
+        assert_eq!(de_c, de_rust);
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;

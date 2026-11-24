@@ -1,0 +1,25 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
+--
+--  Para demostrar (desde ada/):
+--
+--     alr -n build
+--     alr -n exec -- gnatprove -P cosxamix_checks.gpr --level=4 -j0 --checks-as-errors=on
+--
+--  El objeto que enlaza Cosxamix lo compila build.rs con la feature `ada`,
+--  directo con el gcc de GNAT: no hace falta este proyecto para compilar.
+
+project Cosxamix_Checks is
+
+   for Source_Dirs use ("src/");
+   for Object_Dir use "obj/";
+   for Create_Missing_Dirs use "True";
+
+   package Compiler is
+      for Default_Switches ("Ada") use ("-gnat2022", "-gnatwa", "-gnatyM100");
+   end Compiler;
+
+   package Prove is
+      for Proof_Switches ("Ada") use ("--level=4");
+   end Prove;
+
+end Cosxamix_Checks;

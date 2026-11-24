@@ -174,7 +174,7 @@ equivocado no da error: da texto sin sentido.
 ## Compilar, probar y publicar
 
 ```bash
-cargo run --release --features zig,c                # texto e imágenes, con los kernels de Zig y C: 80 crates
+cargo run --release --features zig,c                # texto e imágenes, con los kernels de Zig y C: 72 crates
 ```
 
 Lo que comprueba cada cosa, y se corre igual en local que en CI:
@@ -323,7 +323,8 @@ pasó a ser el de por defecto: 11 de 15 en la batería de preguntas contra 10, y
 0.11.0 candle salió del todo**: el texto, las imágenes (CLIP, el UNet de SD y
 TAESD sobre una GEMM propia, 2,3 veces más rápido y con 1,6 GB menos) y el
 entrenamiento (el backward escrito a mano, 1,9 veces más rápido en LoRA) son
-propios. El binario pesa 3,25 MB en vez de 7,3, con las imágenes adentro, con 80 crates en vez de 139.
+propios. El binario pesa 2,56 MB en vez de 7,3, con las imágenes adentro, con 72 crates en vez de 139
+(3,25 MB y 80 en la 0.11.0; tokio y el registro con solo lo que se usa, DECISIONES §38).
 
 Las mediciones de esa época —el caché de atención, la tabla de embeddings, la
 especulativa que se borró— están en [DECISIONES.md](DECISIONES.md) y en el
@@ -366,11 +367,19 @@ El 3B en Q3_K_M, medido con las mismas 15 preguntas de respuesta verificable
 | 3B Q2_K | 1313 MB | 6/15, se rompe |
 | **3B Q3_K_M** | **1644 MB** | **10/15** |
 | 3B Q4_K_M | 2007 MB | 10/15 |
+| **Qwen3-4B-Instruct-2507 Q3_K_M** | **1979 MB** | **14/15** |
 
 Q3_K_M acierta lo mismo que Q4_K_M con 363 MB menos, y menos bytes por peso son
 menos bytes que leer de la RAM en cada token. El 3B es la **Qwen Research
 License** (no comercial); el 0,5B y el 1,5B, Apache-2.0
 ([THIRD-PARTY.md](THIRD-PARTY.md)).
+
+**Qwen3** se lee desde la 0.12.0 (sin sesgos en q, k y v, RMSNorm por cabeza
+sobre q y k, ancho de cabeza del archivo). El 4B-Instruct-2507 en Q3_K_M
+acierta **14/15**, contra 11/15 del 3B con el motor propio, en la misma
+batería y la misma máquina: decode **11,0 tok/s contra 14,1**, una respuesta de
+40 tokens en ~4,8 s contra ~3,8, y 335 MB más. Es Apache-2.0, así que además
+se puede usar con fines comerciales. `compare_models -- --qwen3` lo repite.
 
 ### Hilos, caché y memoria
 
@@ -394,8 +403,8 @@ abierta al que gane la medición:
 |---|---|---|
 | **Zig** | una sola fuente que cubre x86-64, ARM64 y Android | nada: ya está dentro |
 | **Ensamblador** | el kernel fusionado de Q4_K en x86-64, primero en el despachador con `asm_q4k` (1,04x-1,08x sobre los intrínsecos). El de Q3_K (`asm_q3k`) empata con los intrínsecos, igual bit a bit | el cuerpo NEON, `kernels/q4k_neon.s`, y medirlo en ARM |
-| **Fortran** | arreglos sin aliasing, que es por lo que BLAS y LAPACK siguen siendo Fortran | un compilador en cada plataforma, y Android es justo el problema |
-| **Ada / SPARK** | demostrar que un kernel no desborda, en vez de comprobarlo con tests | un kernel lo bastante crítico como para que valga el toolchain |
+| **Fortran** | dentro con la feature `fortran` (`kernels/*.f90`, gfortran, `bind(C)` y sin el runtime de Fortran): el microkernel de la GEMM en f32 de las imágenes y el entrenamiento. Cuatro líneas de bucle de las que gfortran saca las mismas 12 FMA que 40 de intrínsecos: en x86-64 **empata** con Rust, igual bit a bit ([DECISIONES §37](DECISIONES.md)). En ARM64, donde Rust solo tiene el escalar, va por defecto con el NEON que genera gfortran | la cifra de ARM: el job ARM64 de CI la mide sin y con la feature; y un gfortran para Android |
+| **Ada / SPARK** | dentro con la feature `ada` (`ada/src/`, el gcc de GNAT): los límites de cada tensor de un GGUF, con GNATprove demostrando que ninguna cuenta se desborda y que dice «válido» exactamente cuando la regla se cumple (54 obligaciones). Sin la feature rige la misma regla en Rust, y un test compara las dos ([DECISIONES §41](DECISIONES.md)) | un kernel de cómputo demostrado; GNAT no compila para Android, así que ahí siempre va la regla en Rust |
 | **C** | dentro con la feature `c`, compilado con `zig cc` y sin libc. Extensiones de CPU por función (`__attribute__((target))`), y en ARM `vdotq_s32` —`sdot`— estable, que Rust no expone y Zig no genera. En x86 su Q3_K pierde un 4% con Rust ([DECISIONES §21](DECISIONES.md)) | la cifra de un teléfono: en el runner ARM de CI los fusionados con `sdot` ganan 2,4x (Q4_K) y 5,4x (Q3_K), y desde la 0.5.1 están en el despachador |
 
 El riesgo de eso no son los lenguajes: es tener **N sitios distintos** por donde

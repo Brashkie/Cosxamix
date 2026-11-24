@@ -1,6 +1,6 @@
 [package]
 name = "cosxamix"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 description = "Runtime de IA que sirve modelos de lenguaje por HTTP, compatible con el dialecto de Ollama"
 license     = "GPL-3.0-or-later"
@@ -14,7 +14,10 @@ build       = "build.rs"
 # Mismas versiones que la Session API de WinsiBot: los dos proyectos se van a
 # tocar, y tener axum 0.7 de un lado y 0.8 del otro solo traería trabajo.
 axum               = "0.7"
-tokio              = { version = "1", features = ["full"] }
+# Solo lo que usa el servidor: el runtime multihilo, `#[tokio::main]`, el
+# socket, los canales del streaming y el intervalo del vaciado. Con "full" se
+# compilaba todo tokio.
+tokio              = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 # Solo por `ReceiverStream`, que convierte el canal del generador en el flujo
 # que pide la respuesta SSE. Se declara aunque sea una linea: viene del equipo
 # de tokio, pero es una dependencia que usa el codigo propio.
@@ -22,7 +25,10 @@ tokio-stream       = "0.1"
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Sin `env-filter`: traia el motor de expresiones regulares entero (regex,
+# regex-automata, regex-syntax, matchers) para leer RUST_LOG. El nivel se lee
+# a mano en main.rs.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
 
 # Mapear el archivo de pesos en memoria virtual en vez de copiarlo al monticulo.
 # Un crate de 0 dependencias que envuelve `mmap` de POSIX y
@@ -80,6 +86,24 @@ asm_q3k = []
 #
 #   cargo run --release --features training --example train_lora
 training = []
+
+# Kernels en Fortran (kernels/*.f90), compilados con gfortran y enlazados por
+# `bind(C)`, sin el runtime de Fortran. Hoy, el microkernel de la GEMM en f32
+# de las imagenes y el entrenamiento (kernels/sgemm_micro.f90). En Windows se
+# busca el gfortran de MSYS2 (C:\msys64\ucrt64\bin); COSXAMIX_GFORTRAN lo
+# reemplaza.
+#
+#   cargo run --release --features fortran --example measure_sgemm
+fortran = []
+
+# Las comprobaciones demostradas con SPARK (ada/src/*.adb): los limites de
+# cada tensor de un GGUF, con la ausencia de desbordes y la regla exacta
+# demostradas por GNATprove. Compiladas con el gcc de GNAT, que se busca en
+# COSXAMIX_GNAT_GCC, en la cache de Alire o en el PATH (`alr exec`). Sin la
+# feature rige la misma regla escrita en Rust, y un test compara las dos.
+#
+#   cargo test --features ada
+ada = []
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

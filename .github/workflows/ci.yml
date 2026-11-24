@@ -118,16 +118,24 @@ jobs:
 
       - uses: ./.github/actions/instalar-zig
 
+      # Para la feature `fortran` (kernels/*.f90): el gfortran de Ubuntu.
+      - name: gfortran
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran
+
       - name: Clippy
-        run: cargo clippy --features zig,c,training --all-targets -- -D warnings
+        run: cargo clippy --features zig,c,training,fortran --all-targets -- -D warnings
 
       # Entre los 22 hay seis que comparan cada backend contra la referencia
       # escalar con la misma entrada. Son los que demuestran que el kernel de
       # Zig calcula lo mismo que el de Rust, que es lo unico que justifica
       # tenerlo.
       # Con `c`, tambien el kernel de C (`zig cc`, el mismo Zig de arriba).
+      # Con `fortran`, tambien que el microkernel de la GEMM en Fortran de lo
+      # mismo bit a bit que el de intrinsecos.
       - name: Tests
-        run: cargo test --features zig,c,training
+        run: cargo test --features zig,c,training,fortran
 
       # La compilación para las CPU sin AVX2: Rust en el x86-64 básico, y Zig
       # con sus dos copias. Aquí SÍ va RUSTFLAGS, a propósito: es la forma de
@@ -231,6 +239,11 @@ jobs:
 
       - uses: ./.github/actions/instalar-zig
 
+      - name: gfortran
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran
+
       - name: Que esta CPU tenga sdot
         # En bloque `|` y no en una linea: un `: ` dentro de un `run:` en linea
         # YAML lo lee como otra clave, y el archivo entero deja de ser valido.
@@ -242,16 +255,51 @@ jobs:
       # Con `c`: los kernels de `kernels/neon_dotprod.c`, con `sdot`. Este es
       # el UNICO lugar donde corren: la maquina de desarrollo es x86-64.
       - name: Clippy
-        run: cargo clippy --features zig,asm_q4k,c --all-targets -- -D warnings
+        run: cargo clippy --features zig,asm_q4k,c,fortran --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --features zig,asm_q4k,c
+        run: cargo test --features zig,asm_q4k,c,fortran
+
+      # En ARM64 la GEMM en f32 (imagenes, entrenamiento) no tiene version
+      # vectorizada en Rust: cae al microkernel escalar. El de Fortran lo
+      # vectoriza gfortran con NEON. Sin y con la feature, en la misma maquina.
+      - name: GEMM en f32, escalar contra Fortran
+        run: |
+          echo "== sin fortran (Rust escalar)"
+          cargo run -q --release --example measure_sgemm
+          echo "== con fortran (NEON de gfortran)"
+          cargo run -q --release --features fortran --example measure_sgemm
 
       # No decide nada —un runner compartido mide con ruido y no es el telefono—,
       # pero deja en el log el orden de magnitud de escalar, Zig y NEON en la
       # misma maquina, que es la comparacion que importa.
       - name: Bench del fusionado
         run: cargo bench --features zig,asm_q4k,c --bench kernels -- dot_q4k_i8 --warm-up-time 1 --measurement-time 3
+
+  # -- Ada/SPARK: demostrar y enlazar --------------------------------------
+  #
+  # GNATprove demuestra `ada/src/gguf_bounds` (los limites de cada tensor de
+  # un GGUF: sin desbordes, y la regla exacta) y despues los tests corren con
+  # la feature `ada`, que enlaza el objeto de SPARK y lo compara con la misma
+  # regla escrita en Rust. `alr exec` deja el gcc de GNAT en el PATH, que es
+  # el que usa build.rs.
+  ada:
+    name: Ada/SPARK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: alire-project/setup-alire@v4
+
+      - name: Demostrar con GNATprove
+        working-directory: ada
+        run: |
+          alr -n build
+          alr -n exec -- gnatprove -P cosxamix_checks.gpr --level=4 -j0 --checks-as-errors=on
+
+      - name: Tests con la feature ada
+        working-directory: ada
+        run: alr -n exec -- bash -c 'cd .. && cargo test --features ada'
 
   # -- Que el ensamblador ensamble en los tres formatos de objeto ----------
   #

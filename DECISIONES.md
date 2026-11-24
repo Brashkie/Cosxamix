@@ -2496,6 +2496,278 @@ secuencia, que es lo que con candle había que hacer a mano (`COSXAMIX_PARTES`).
 mismas tolerancias. Lo que se pierde es poder regenerarlos; lo que no se pierde es lo
 que atrapaban, como la convención de RoPE.
 
+## 37. Qwen3 y el primer kernel en Fortran
+
+**Qwen3.** El forward leía `qwen2.*` a fuego. Qwen3 cambia tres cosas, y las
+tres se leen del archivo: q, k y v sin sesgo; una RMSNorm por cabeza sobre q y
+k antes de RoPE (`attn_q_norm`, `attn_k_norm`); y el ancho de cabeza de
+`qwen3.attention.key_length` —128 en el 4B, cuando 2560/32 daría 80—, que
+cambia el ancho de q y de la entrada de `attn_output`. Lo demás, igual: el
+tokenizador del GGUF declara `gpt2`/`qwen2`, la plantilla es ChatML.
+
+Medido con `compare_models -- --qwen3`, temperatura 0, la máquina libre (la
+primera corrida dio 0,9 tok/s con `gnatprove -j0` de Fabianus usando los 12
+hilos; de ahí `machine_load`):
+
+| | disco | decode | 40 tokens | aciertos |
+|---|---:|---:|---:|---:|
+| Qwen2.5-3B Q3_K_M | 1644 MB | 14,1 tok/s | ~3,8 s | 11/15 |
+| **Qwen3-4B-Instruct-2507 Q3_K_M** | 1979 MB | 11,0 tok/s | ~4,8 s | **14/15** |
+
+El decode baja lo que pide el tamaño (1979/1644 = 1,20; 14,1/11,0 = 1,28) y
+acierta tres más: los lápices, Canberra y la carrera. Los dos fallan la del
+tren. Y es Apache-2.0, cuando el 3B es de uso no comercial.
+
+**Fortran.** `kernels/sgemm_micro.f90` es el microkernel de 6 × 16 de la GEMM
+en f32, en `bind(C)` y sin runtime. Cuatro líneas de bucle; gfortran 16.1 con
+`-O3 -march=x86-64-v3` saca de ahí lo mismo que `micro_avx2` escribe a mano en
+40: 2 cargas, 6 difusiones y 12 `vfmadd231ps` por paso, los 12 acumuladores en
+registros. Da lo mismo **bit a bit** (test `el_de_fortran_da_lo_mismo_bit_a_bit`)
+porque hace las mismas FMA en el mismo orden.
+
+En velocidad, `measure_sgemm` alternando dos rondas de cada uno: empate. La
+primera versión devolvía el bloque en un búfer y Rust lo sumaba en C, y perdía
+un 4% en el feed-forward (`k` = 320, donde esa vuelta pesa); sumando directo
+en C cuando el bloque está entero, el empate es en todo:
+
+| | Rust (intrínsecos) | Fortran |
+|---|---:|---:|
+| conv 3×3, 320 canales | 24,3-27,2 ms | 24,9-26,5 ms |
+| conv 3×3, 1280 canales | 7,2-7,5 ms | 7,3-7,4 ms |
+| lineal de atención | 6,1-6,5 ms | 6,2 ms |
+| feed-forward GEGLU | 28,7-29,7 ms | 29,2-29,8 ms |
+
+Por eso en x86-64 sigue por defecto el de Rust (`COSXAMIX_SGEMM_MICRO=fortran`
+elige el otro) y en ARM64 va el de Fortran: ahí Rust no tiene versión
+vectorizada y cae al escalar. El job ARM64 de CI corre `measure_sgemm` sin y
+con la feature, en la misma máquina.
+
+Dos cosas que costaron una compilación: el `gfortran` del PATH de esta máquina
+es un MinGW 6.3 de 32 bits —por eso `build.rs` busca primero el de MSYS2 y
+comprueba `-dumpmachine` contra el target—, y el de MSYS2 llamado desde fuera
+de su consola termina con código 1 sin decir nada, porque no encuentra sus DLL
+ni su `as`: `build.rs` pone su carpeta primera en el PATH.
+
+## 38. El prefill, de 47 a 57 tok/s, y un binario un 22% más chico
+
+**Dónde estaba el techo.** La tesela del prefill (`tesela_u8_avx2`, 4 × 2)
+hacía, por cada trozo de 32 valores y cada par fila × columna, `maddubs`,
+`madd`, la conversión a `f32`, un `mul` y una FMA: cinco instrucciones que en
+Skylake van todas a los puertos 0 y 1. Eso son ~6,4 productos por ciclo y
+núcleo, ~300 GOPS en los 6 núcleos: lo mismo que medía `measure_response`
+(286-299 GFLOP/s). El techo no era la cuenta entera sino lo que la rodea.
+
+**La tesela por grupos** (`tesela_u8_grupos_avx2`) suma los cuatro trozos de
+un grupo de 128 valores en enteros con dos niveles de `hadd` —que va casi todo
+al puerto 5— y convierte, escala y acumula una vez por grupo. Después del
+segundo `hadd`, cada carril tiene la suma de un sub-bloque de 16, así que las
+escalas de Q3_K y Q6_K (de 16) y las de Q4_K y Q5_K (de 32, repetidas) entran
+igual, preparadas en ese orden (`agrupar_escalas`). Las sumas parciales son
+enteras: un redondeo por grupo en vez de cuatro, y el error contra el camino
+con buffer sigue en 2e-6 a 2e-5.
+
+La forma de la tesela se midió aparte, porque su cuenta de registros es otra
+(cada par lleva el acumulador y las dos mitades del grupo): con 4 × 2 el
+compilador usaba la pila 27 veces por cada 32 `maddubs`. Dos capas del 3B con
+333 filas, dos rondas alternadas:
+
+| tesela por grupos | 4 × 2 | 2 × 2 | **3 × 2** | 2 × 3 |
+|---|---:|---:|---:|---:|
+| ms | 296-301 | 284-290 | **277-278** | 287-290 |
+
+**El término del desplazamiento** (los formatos con mínimo, y Q3_K y Q6_K
+después de correr los pesos a sin signo) se hacía con un producto punto por
+fila y columna, `k / sub` valores sin reusar nada: en `ffn_gate` de Q3_K, ~470
+millones de FMA. Es una multiplicación de `m × n_bloques` por `n_bloques × n`,
+y ahora la hace la GEMM en f32 de una vez: −5% con 333 filas. Con 18 perdía un
+25% —empaquetar cuesta más de lo que ahorra con tan pocas filas— y el búfer de
+5,6 MB que se pedía y llenaba de ceros en cada multiplicación también se
+notaba; desde 64 filas va por la GEMM, por debajo como antes y sin el búfer.
+
+Las dos capas, de punta a punta: **~331-343 ms → ~264-268 ms (−20%)**. Y la
+respuesta del bot (`measure_response`, alternando):
+
+| lectura del prompt, 3B Q3_K_M | antes | ahora |
+|---|---:|---:|
+| 333 tokens, sin caché | 6,75-7,29 s (~47 tok/s) | **5,52-6,13 s (~57 tok/s)** |
+| 286 tokens | 5,62-6,18 s | **4,90-5,02 s** |
+| 18 tokens, *system* en caché | ~0,58 s | ~0,58 s |
+
+**En C, lo mismo.** `kernels/tile_groups_avx2.c` es la tesela por grupos de
+3 × 2 línea por línea, compilada con `zig cc`; da lo mismo bit a bit que la de
+Rust y empata en velocidad (260-272 ms las dos, ganando cada una la mitad de
+las rondas): las dos pasan por LLVM. Sigue la de Rust; `COSXAMIX_TESELA=c`
+elige la otra y `COSXAMIX_TESELA=vieja` la de antes. Fortran no entra en este
+kernel: no tiene cómo pedir `vpmaddubsw`, el producto de u8 por i8 sumado en
+16 bits, que es todo el kernel.
+
+**Un bug que destapó la medición.** La primera versión pedía el búfer de
+escalas agrupadas con `max(1)` sobre el total y no por fila; con la tesela
+vieja, el `zip` en paralelo cortaba la cuantización de la entrada en la primera
+fila, y `measure_blocked_matmul` mostró una diferencia relativa de 1,0. El
+test de bloques no lo veía porque la elección salía de una variable de entorno
+que los tests nunca cambiaban; ahora la elección es un parámetro y el test
+recorre las dos teselas, con 4, 37 y 70 filas (la última, por la GEMM del
+desplazamiento). Reintroducido el bug a propósito, el test falla.
+
+**Más liviano.** Dos features de más:
+
+- `tokio` con `full` compilaba todo tokio; el servidor usa el runtime
+  multihilo, la macro, el socket, los canales y el intervalo;
+- `tracing-subscriber` con `env-filter` traía el motor de expresiones
+  regulares entero (`regex`, `regex-automata`, `regex-syntax`, `matchers`) para
+  leer `RUST_LOG`. Ahora el nivel se lee a mano: `error`, `warn`, `info`,
+  `debug` o `trace`, y con la forma de `env-filter` el más detallado que
+  aparezca.
+
+El binario sin features pasa de **3.416.064 a 2.670.080 bytes (−22%)** y un
+build limpio compila **72 crates en vez de 80**. `num_cpus` se queda: contar
+núcleos físicos a mano en cada sistema es más código del que ahorra.
+
+## 39. La memoria del motor: RoPE por tanda y SwiGLU en su sitio
+
+`measure_response` ahora dice la memoria **privada** del proceso —lo que el
+motor pidió: activaciones, búferes, caché de atención— aparte de la
+residente, que suma las páginas del modelo mapeado (esas son del archivo y el
+sistema las suelta si le hace falta). Lo lee `machine_load::memoria()`:
+`GetProcessMemoryInfo` en Windows, `/proc/self/status` en Linux.
+
+Dos cosas que ocupaban sin hacer falta:
+
+- **La tabla de RoPE de todo el contexto**: `contexto × dim_cabeza/2 × 2`
+  valores, 16,8 MB en el 3B (32.768 posiciones) y **134 MB en Qwen3-4B**, que
+  declara 262.144. Ahora cada forward calcula las de sus posiciones
+  (`ops::frecuencias_rope_desde`), con el mismo ángulo en f64: los mismos
+  valores, comprobado contra la tabla entera, y menos de un milisegundo con 333
+  tokens, compartido por las 36 capas.
+- **SwiGLU a un búfer nuevo por capa**: `t × ffn`, 14,7 MB con 333 tokens en el
+  3B, pedidos 36 veces por forward. Ahora va en su sitio sobre `gate`, de a
+  tramos de 1024.
+
+| memoria privada | antes | ahora |
+|---|---:|---:|
+| 3B, con el modelo abierto | 76 MB | 59 MB |
+| 3B, pico del primer mensaje (333 tokens) | 189 MB | 159 MB |
+| Qwen3-4B, con el modelo abierto | 194 MB | 60 MB |
+| Qwen3-4B, pico del primer mensaje | 381 MB | **237 MB** |
+
+Lo que quedaba grande en Qwen3-4B era la caché de atención: 8 cabezas de
+clave y valor de 128 son ~294 KB por token en f32, cuatro veces las del 3B; 98
+MB con 333 tokens y ~1,2 GB con 4.000. **Ahora va en f16**, la mitad, como en
+llama.cpp.
+
+La primera versión pasaba a f32 la caché entera de cada capa en cada token y
+el decode del 3B bajó de 12,7-12,9 a 11,9-12,1 tok/s. Mirándolo apareció algo
+más grande: la atención se repartía por token, y en el decode hay uno, así que
+corría **en un solo hilo** —con 380 tokens de contexto, ~56 millones de FMA
+por token del 3B en un núcleo—. Ahora se reparte por token y cabeza, y en el
+decode lee la caché en f16 directo, convirtiendo en registros con F16C
+(`ops::atencion_f16`); desde 16 tokens por tanda, donde cada clave se lee
+muchas veces, la capa pasa a f32 una vez. Los mismos aciertos (11/15 y 14/15),
+y:
+
+| | antes | caché f16, atención por cabeza |
+|---|---:|---:|
+| decode 3B | 12,7-12,9 tok/s | **13,7-14,1 tok/s** |
+| decode Qwen3-4B | 8,4 tok/s | **10,7 tok/s** |
+| pico privado Qwen3-4B, primer mensaje | 237 MB | **192 MB** |
+
+## 40. Pesos como fórmulas, primer filtro: E8 a 2 bits empata con Q2_K a 2,63
+
+El primer experimento de la etapa 12 del ROADMAP (`examples/measure_lattice.rs`).
+Cada grupo de 8 pesos va al punto más cercano de la red E8 dentro de la bola
+de norma² ≤ 10 —56.881 puntos, un índice de 16 bits—, con una escala f16 por
+bloque de 256: 2,0625 bits por peso. «Girado» es después de una transformada
+de Hadamard de 256 con signos al azar fijos (la idea de QuIP#), que al usar el
+modelo se aplica también a la entrada.
+
+Se mide sobre **pesos sin cuantizar** (Qwen2.5-0.5B-Instruct en F16): sobre un
+modelo que ya viene en Q3_K, cualquier esquema parecido a Q3_K sale
+favorecido. Error relativo `‖W − Ŵ‖² / ‖W‖²` en 12 matrices (q, salida de la
+atención, gate y down de las capas 0, 12 y 23):
+
+| | Q4_K | Q3_K | Q2_K | E8 | **E8 girado** |
+|---|---:|---:|---:|---:|---:|
+| bits por peso | 4,5 | 3,44 | 2,63 | 2,06 | **2,06** |
+| error medio | 0,0058 | 0,0260 | 0,0957 | 0,1197 | **0,0965** |
+| `blk.0.attn_q` (la de valores extremos) | 0,0094 | 0,0383 | 0,1355 | 0,1853 | **0,0955** |
+
+E8 solo pierde; **girado, iguala el error de Q2_K con un 22% menos de bits**,
+y deja todas las matrices en el mismo error (0,095-0,098): girados, los pesos
+se parecen a una gaussiana y el error deja de depender de los valores
+extremos de cada matriz, que es justo donde Q2_K sufre.
+
+Es el primer filtro, no el veredicto: lo que decide es el modelo entero.
+
+**El modelo entero.** `measure_lattice simular` escribe copias del 0,5B en F16
+con las 24 matrices de las capas pasadas por cada esquema y de vuelta (los
+embeddings, en F16 en todas): el motor las corre tal cual, sin kernel nuevo.
+`measure_lattice kl` compara token por token contra el original sobre un
+texto en español de 150 tokens, y `compare_models -- --e8` pasa la batería:
+
+| 0,5B | bits por peso | KL media | mismo token más probable | aciertos |
+|---|---:|---:|---:|---:|
+| F16 | 16 | — | — | 8/15 |
+| Q3_K | 3,44 | 0,084 | 84% | 5/15 |
+| Q2_K | 2,63 | 0,384 | 67% | 4/15, y se le escapa el portugués |
+| **E8 girado** | **2,06** | 0,433 | 71% | **5/15** |
+
+Con un 22% menos de bits que Q2_K, E8 girado acierta como Q3_K y no se le
+mezcla otro idioma, aunque tiene algo más de KL y una respuesta degenerada (un
+número de 40 cifras). Con 15 preguntas y un modelo tan chico la diferencia es
+ruido: lo que se puede decir es que **E8 no es peor que Q2_K con menos
+bits**, y que vale el paso siguiente.
+
+El paso siguiente es caro y por eso queda escrito y no hecho: confirmarlo en
+el 3B pide el 3B en F16 (6 GB) y un kernel —girar la entrada de a 256 con
+Hadamard, y por cada índice de 16 bits los 8 valores del punto: una tabla de
+56.881 puntos (455 KB en `i8`, que no entra en L1) o el truco de QuIP#, una
+tabla chica de 256 y los signos aparte—. Si se sostiene, el 3B pasaría de 1,64
+GB a ~0,8 y el decode, que va al ritmo de la RAM, iría cerca del doble.
+
+## 41. Ada/SPARK: los límites de cada tensor, demostrados
+
+**El hueco.** El lector de GGUF comprobaba con sumas verificadas que cada
+tensor cayera dentro del archivo (`Pesos::de`), pero el tamaño salía de
+`InfoTensor::elementos()`, que multiplicaba las dimensiones **sin comprobar**.
+Con dimensiones absurdas el producto daba la vuelta en release y quedaba
+chico: pasaba el chequeo de límites, y después la cantidad de valores no
+coincidía con los bytes. Los valores vienen del archivo, o sea de quien lo
+escribió.
+
+**La regla** (`gguf::tramo_de_tensor`): elementos = producto de las
+dimensiones, bytes = elementos / valores por bloque × bytes por bloque, todo
+dentro del archivo y con el offset alineado; con topes que ningún GGUF real
+roza —cada dimensión hasta 2^62, cada bloque hasta 2^16 bytes— y que hacen que
+ningún producto pase de 126 bits. `Gguf::abrir` la aplica a cada tensor apenas
+lo lee, así que un `Gguf` en memoria ya no puede tener tamaños desbordados.
+
+**SPARK** (`ada/src/gguf_bounds.ads`): la misma regla como procedimiento
+exportado a C. GNATprove demuestra las **54 obligaciones**: ausencia de
+errores de ejecución, y el contrato `(Ok = 1) = Valido (...)` con los
+elementos y bytes exactos, donde `Valido` hace las cuentas en aritmética de
+127 bits, sin vuelta. Lo que costó:
+
+- el primer contrato podía desbordarse él mismo (`A(D0) · A(D1)` llega a 2^128
+  y el tipo ancho llega a 2^127 − 1);
+- la segunda versión, con guardas en forma de división, dejaba obligaciones
+  no lineales (`X ≤ Tope / Y ⇒ X · Y ≤ Tope`) que los probadores no cerraban;
+- con los topes, cada producto entra en 127 bits sin condiciones y el
+  contrato es lineal; la última obligación —que el cociente de 64 bits es el
+  de 127— la cerraron dos afirmaciones intermedias.
+
+La implementación multiplica en 128 bits, que se compila en línea; no hay
+divisiones de 128 bits, que pedirían la libgcc. Paquete `Pure`, sin
+elaboración, compilado con `-gnatp`: el objeto enlaza con el linker de MSVC.
+
+Con la feature `ada` la regla la decide SPARK; sin ella, Rust, y
+`la_regla_de_spark_y_la_de_rust_coinciden` las compara en casos borde
+(productos que dan la vuelta en 64 bits, el último byte justo y uno de más,
+alineación, más de 4 dimensiones). `examples/check_models.rs` abre los 24 GGUF
+de `modelos/` —oficiales, daiss, Chavín, simulados— con las dos reglas: los 24
+pasan. El CI tiene un job que demuestra con GNATprove y corre los tests con la
+feature. GNAT no compila para Android: ahí rige siempre la regla en Rust.
+
 ## Cifras que hubo que corregir
 
 Se listan porque una cifra mal medida dirige el trabajo hacia el lado

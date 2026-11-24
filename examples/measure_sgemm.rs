@@ -65,6 +65,7 @@ fn medir(nombre: &str, (m, n, k): (usize, usize, usize), f16_en_a: bool) {
 }
 
 fn main() {
+    cosxamix::machine_load::antes_de_medir();
     println!("  hilos: {}", rayon::current_num_threads());
     medir("conv 3x3, 320 canales a 64x64", (320, 4096, 2880), true);
     medir("conv 3x3, 1280 canales a 8x8", (1280, 64, 11520), true);

@@ -91,6 +91,7 @@ fn ancho_de_banda(bytes: &[u8]) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cosxamix::machine_load::antes_de_medir();
     let dir = std::env::var("COSXAMIX_MODELOS").unwrap_or_else(|_| "modelos".into());
     let archivo =
         std::env::var("COSXAMIX_GGUF").unwrap_or_else(|_| "qwen2.5-3b-instruct-q3_k_m.gguf".into());
@@ -113,6 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let modelo = Modelo::abrir(&ruta)?;
+    let memoria_inicial = cosxamix::machine_load::memoria();
     let pesos = modelo.bytes() as f64;
     // Los parámetros, para las cuentas: cada uno es una multiplicación y una
     // suma por token. Se cuentan desde los bytes y los bits por peso del
@@ -145,6 +147,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let mut logits = modelo.forward(&primero, &mut cache)?;
     let t_prefill = t0.elapsed().as_secs_f64();
+    // Antes de mapear el archivo entero para medir la RAM, que sumaría páginas.
+    let memoria_prefill = cosxamix::machine_load::memoria();
 
     let mut m = Muestreador::voraz();
     let mut por_token = Vec::with_capacity(nuevos);
@@ -219,6 +223,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cambiado.len() - comun_c,
         t_cambiado * 1e3
     );
+    if let Some(m) = memoria_inicial {
+        println!(
+            "  memoria con el modelo abierto y el tokenizador: privada {:.0} MB",
+            m.privada as f64 / 1e6
+        );
+    }
+    if let Some(m) = memoria_prefill {
+        println!(
+            "  memoria tras el primer mensaje: privada {:.0} MB (pico {:.0}), residente pico {:.0} MB",
+            m.privada as f64 / 1e6,
+            m.privada_pico as f64 / 1e6,
+            m.residente_pico as f64 / 1e6
+        );
+    }
     println!();
     println!("  la RAM da {gbs:.1} GB/s leyendo con todos los núcleos");
     println!(

@@ -57,6 +57,7 @@ fn peticion(sesion: &str, sistema: String, usuario: &str) -> Peticion {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cosxamix::machine_load::antes_de_medir();
     let dir = std::env::var("COSXAMIX_MODELOS").unwrap_or_else(|_| "modelos".into());
     let gguf = std::path::Path::new(&dir).join("qwen2.5-3b-instruct-q3_k_m.gguf");
     let tok = std::path::Path::new(&dir).join("tokenizer-3b.json");

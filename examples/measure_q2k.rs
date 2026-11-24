@@ -29,6 +29,7 @@ fn medir(mut f: impl FnMut() -> f32) -> f64 {
 }
 
 fn main() {
+    cosxamix::machine_load::antes_de_medir();
     const ANCHO: usize = 6144;
     let mut azar = cosxamix::daiss::Azar::con_semilla(5);
     let w: Vec<f32> = (0..ANCHO).map(|_| azar.normales(0.02).0).collect();

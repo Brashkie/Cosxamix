@@ -8,6 +8,8 @@
 
 pub mod engine;
 pub mod kernels;
+/// Si la máquina está libre antes de medir velocidades.
+pub mod machine_load;
 
 /// Lector de GGUF propio. No depende de candle: es el primer ladrillo del
 /// motor de inferencia de la casa.

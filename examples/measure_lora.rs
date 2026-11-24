@@ -116,6 +116,7 @@ fn medir(mut f: impl FnMut()) -> f64 {
 }
 
 fn main() {
+    cosxamix::machine_load::antes_de_medir();
     let lote = vec![(0..=TOKENS as u32)
         .map(|i| i * 7 % 512)
         .collect::<Vec<u32>>()];

@@ -193,6 +193,128 @@ impl InfoTensor {
     }
 }
 
+/// Los límites de un tensor, la regla entera: cuántos valores tiene y cuántos
+/// bytes ocupa, y si caen dentro de un archivo de `largo` bytes cuya zona de
+/// datos empieza en `inicio`, con `desde` alineado. `None` si no.
+///
+/// La regla tiene topes —cada dimensión hasta 2^62, cada bloque de formato
+/// hasta 2^16 bytes— que ningún GGUF real roza y que hacen que ningún producto
+/// pase de 126 bits. Con la feature `ada` la decide `ada/src/gguf_bounds.adb`,
+/// donde GNATprove demuestra que no se desborda y que dice que sí exactamente
+/// cuando la regla se cumple; sin ella, [`tramo_de_tensor_rust`], que hace lo
+/// mismo y que un test compara con la de SPARK.
+pub fn tramo_de_tensor(
+    dims: &[u64],
+    tipo: TipoGgml,
+    (inicio, desde, largo, alineacion): (u64, u64, u64, u64),
+) -> Option<(u64, u64)> {
+    #[cfg(feature = "ada")]
+    {
+        spark::tramo_de_tensor(dims, tipo, (inicio, desde, largo, alineacion))
+    }
+    #[cfg(not(feature = "ada"))]
+    {
+        tramo_de_tensor_rust(dims, tipo, (inicio, desde, largo, alineacion))
+    }
+}
+
+/// La regla de [`tramo_de_tensor`] en Rust, en `u128`.
+pub fn tramo_de_tensor_rust(
+    dims: &[u64],
+    tipo: TipoGgml,
+    (inicio, desde, largo, alineacion): (u64, u64, u64, u64),
+) -> Option<(u64, u64)> {
+    const TOPE_DIMENSION: u64 = 1 << 62;
+    const TOPE_BLOQUE: u64 = 1 << 16;
+    if dims.len() > 4 {
+        return None;
+    }
+    let mut elementos: u128 = 1;
+    for d in dims {
+        if !(1..=TOPE_DIMENSION).contains(d) {
+            return None;
+        }
+        elementos *= u128::from(*d);
+        if elementos > u128::from(u64::MAX) {
+            return None;
+        }
+    }
+    let (valores, bytes_bloque) = (
+        tipo.valores_por_bloque() as u64,
+        tipo.bytes_por_bloque() as u64,
+    );
+    if valores == 0 || bytes_bloque > TOPE_BLOQUE || !elementos.is_multiple_of(u128::from(valores))
+    {
+        return None;
+    }
+    let bytes = elementos / u128::from(valores) * u128::from(bytes_bloque);
+    if alineacion == 0 || !desde.is_multiple_of(alineacion) {
+        return None;
+    }
+    if u128::from(inicio) + u128::from(desde) + bytes > u128::from(largo) {
+        return None;
+    }
+    Some((elementos as u64, bytes as u64))
+}
+
+/// La misma regla, demostrada con SPARK (`ada/src/gguf_bounds.ads`).
+#[cfg(feature = "ada")]
+pub mod spark {
+    use super::TipoGgml;
+
+    unsafe extern "C" {
+        #[allow(clippy::too_many_arguments)]
+        fn cosxamix_ada_tensor_span(
+            d0: u64,
+            d1: u64,
+            d2: u64,
+            d3: u64,
+            valores_bloque: u64,
+            bytes_bloque: u64,
+            inicio: u64,
+            desde: u64,
+            largo: u64,
+            alineacion: u64,
+            elementos: *mut u64,
+            bytes: *mut u64,
+            ok: *mut u8,
+        );
+    }
+
+    pub fn tramo_de_tensor(
+        dims: &[u64],
+        tipo: TipoGgml,
+        (inicio, desde, largo, alineacion): (u64, u64, u64, u64),
+    ) -> Option<(u64, u64)> {
+        if dims.len() > 4 {
+            return None;
+        }
+        // Las dimensiones que falten van en 1.
+        let d: [u64; 4] = std::array::from_fn(|i| dims.get(i).copied().unwrap_or(1));
+        let (mut elementos, mut bytes, mut ok) = (0u64, 0u64, 0u8);
+        // SAFETY: la función solo escribe en las tres salidas, que son
+        // variables locales de los tipos que declara.
+        unsafe {
+            cosxamix_ada_tensor_span(
+                d[0],
+                d[1],
+                d[2],
+                d[3],
+                tipo.valores_por_bloque() as u64,
+                tipo.bytes_por_bloque() as u64,
+                inicio,
+                desde,
+                largo,
+                alineacion,
+                &mut elementos,
+                &mut bytes,
+                &mut ok,
+            );
+        }
+        (ok == 1).then_some((elementos, bytes))
+    }
+}
+
 pub struct Gguf {
     pub version: u32,
     pub metadatos: HashMap<String, Valor>,
@@ -333,6 +455,26 @@ impl Gguf {
                 .map_err(|e| format!("no pude saber la posicion: {e}"))?;
         let inicio_datos = pos.div_ceil(alineacion) * alineacion;
 
+        // Cada tensor, contra el largo del archivo, una vez al abrir: con
+        // dimensiones absurdas el producto se desbordaba en `elementos()` y
+        // daba un tamaño chico que pasaba el chequeo de límites.
+        let largo =
+            l.r.get_ref()
+                .metadata()
+                .map_err(|e| format!("no pude saber el largo: {e}"))?
+                .len();
+        for t in &tensores {
+            if tramo_de_tensor(&t.dims, t.tipo, (inicio_datos, t.offset, largo, alineacion))
+                .is_none()
+            {
+                return Err(format!(
+                    "{}: dimensiones {:?} en {:?} desde {} no caben en un archivo de {largo} bytes \
+                     (o desbordan, o no respetan la alineación de {alineacion})",
+                    t.nombre, t.dims, t.tipo, t.offset
+                ));
+            }
+        }
+
         Ok(Self {
             version,
             metadatos,
@@ -444,6 +586,98 @@ impl Pesos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dimensiones, formato e `(inicio, desde, largo, alineación)`.
+    type Caso = (Vec<u64>, TipoGgml, (u64, u64, u64, u64));
+
+    /// Casos borde de la regla de límites: los que pasan y los que no.
+    fn casos_de_limites() -> Vec<Caso> {
+        let m = u64::MAX;
+        let mut c = vec![
+            (vec![896, 4864], TipoGgml::Q4K, (1024, 0, 1 << 40, 32)),
+            (vec![896], TipoGgml::F32, (1024, 64, 1 << 20, 32)),
+            (
+                vec![2048, 11008],
+                TipoGgml::Q3K,
+                (4096, 32, 9_691_136 + 4128, 32),
+            ),
+            // Justo hasta el último byte, y uno de más.
+            (vec![256], TipoGgml::Q4K, (32, 0, 32 + 144, 32)),
+            (vec![256], TipoGgml::Q4K, (32, 0, 32 + 143, 32)),
+            // Sin alineación, o alineación cero.
+            (vec![256], TipoGgml::Q4K, (32, 7, 1 << 20, 32)),
+            (vec![256], TipoGgml::Q4K, (32, 0, 1 << 20, 0)),
+            // Una fila que no es múltiplo del bloque.
+            (vec![100], TipoGgml::Q4K, (32, 0, 1 << 20, 32)),
+            // Dimensiones en cero, al tope y sobre el tope.
+            (vec![0, 10], TipoGgml::F32, (32, 0, 1 << 20, 32)),
+            (vec![1 << 62], TipoGgml::F32, (0, 0, m, 1)),
+            (vec![(1 << 62) + 1], TipoGgml::F32, (0, 0, m, 1)),
+            // Productos que en 64 bits dan la vuelta y quedan chicos.
+            (vec![1 << 32, 1 << 32], TipoGgml::F32, (0, 0, m, 1)),
+            (vec![1 << 33, 1 << 33, 4], TipoGgml::F32, (0, 0, m, 1)),
+            (vec![3, 1 << 62, 1, 1], TipoGgml::F32, (0, 0, m, 1)),
+            // Bytes que entran justo en 64 bits (2^63).
+            (vec![1 << 61], TipoGgml::F32, (0, 0, m, 1)),
+            // Inicio, offset y bytes que juntos pasan el largo de 64 bits.
+            (vec![256], TipoGgml::Q4K, (m - 10, m - 10, m, 1)),
+            (vec![256], TipoGgml::Q4K, (m - 200, 0, m, 1)),
+            // Más de 4 dimensiones.
+            (vec![1, 1, 1, 1, 1], TipoGgml::F32, (0, 0, 1 << 20, 1)),
+        ];
+        // Y un barrido chico de valores comunes.
+        for d in [1u64, 31, 32, 256, 4096] {
+            for tipo in [TipoGgml::F32, TipoGgml::F16, TipoGgml::Q8_0, TipoGgml::Q6K] {
+                for largo in [0u64, 4096, 1 << 30] {
+                    c.push((vec![d, 7], tipo, (64, 32, largo, 32)));
+                }
+            }
+        }
+        c
+    }
+
+    /// Lo que la regla en Rust tiene que decir en los casos que se entienden
+    /// a mano.
+    #[test]
+    fn la_regla_de_limites_rechaza_los_desbordes() {
+        let r = |d: &[u64], t, l| tramo_de_tensor_rust(d, t, l);
+        assert_eq!(r(&[256], TipoGgml::Q4K, (32, 0, 176, 32)), Some((256, 144)));
+        assert_eq!(r(&[256], TipoGgml::Q4K, (32, 0, 175, 32)), None);
+        assert_eq!(
+            r(&[1 << 32, 1 << 32], TipoGgml::F32, (0, 0, u64::MAX, 1)),
+            None
+        );
+        // 2^62 valores de 4 bytes son 2^64 bytes: no entran en 64 bits.
+        assert_eq!(r(&[1 << 62], TipoGgml::F32, (0, 0, u64::MAX, 1)), None);
+        assert_eq!(
+            r(&[1 << 61], TipoGgml::F32, (0, 0, u64::MAX, 1)),
+            Some((1 << 61, 1 << 63))
+        );
+        assert_eq!(r(&[0, 10], TipoGgml::F32, (0, 0, 1 << 20, 1)), None);
+    }
+
+    /// La versión demostrada con SPARK y la de Rust dicen lo mismo en cada
+    /// caso borde.
+    #[cfg(feature = "ada")]
+    #[test]
+    fn la_regla_de_spark_y_la_de_rust_coinciden() {
+        for (dims, tipo, l) in casos_de_limites() {
+            assert_eq!(
+                spark::tramo_de_tensor(&dims, tipo, l),
+                tramo_de_tensor_rust(&dims, tipo, l),
+                "{dims:?} {tipo:?} {l:?}"
+            );
+        }
+    }
+
+    /// Sin la feature, los casos se usan igual: que la regla no entre en
+    /// pánico con ninguno.
+    #[test]
+    fn la_regla_no_entra_en_panico_en_los_bordes() {
+        for (dims, tipo, l) in casos_de_limites() {
+            let _ = tramo_de_tensor(&dims, tipo, l);
+        }
+    }
 
     /// Construye un GGUF minimo pero valido en memoria.
     ///

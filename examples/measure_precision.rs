@@ -52,6 +52,7 @@ fn argmax(v: &[f32]) -> usize {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cosxamix::machine_load::antes_de_medir();
     let args: Vec<String> = std::env::args().collect();
     let (modo, archivo) = match (args.get(1), args.get(2)) {
         (Some(m), Some(a)) if m == "guardar" || m == "comparar" => (m.clone(), a.clone()),

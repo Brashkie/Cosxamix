@@ -9,6 +9,75 @@ acá va qué cambió, no por qué.
 
 ---
 
+## [0.12.0] - 2026-11-24
+
+- **Ada/SPARK**: los límites de cada tensor de un GGUF (`gguf::tramo_de_tensor`)
+  se validan al abrir el archivo. Antes `InfoTensor::elementos()` multiplicaba
+  las dimensiones sin comprobar y, con dimensiones absurdas, el producto daba
+  la vuelta y pasaba el chequeo de límites. Con la feature `ada` decide
+  `ada/src/gguf_bounds.adb`, donde GNATprove demuestra las 54 obligaciones (sin
+  desbordes, y la regla exacta); sin ella, la misma regla en Rust, y un test
+  compara las dos. `examples/check_models.rs` abre todos los GGUF de una
+  carpeta con la regla; los 24 locales pasan. Job de CI con Alire y GNATprove
+  (DECISIONES §41).
+- **Qwen3**: el motor lee `general.architecture` y sirve `qwen2` y `qwen3`.
+  Qwen3 trae q, k y v sin sesgo, una RMSNorm por cabeza sobre q y k
+  (`attn_q_norm`, `attn_k_norm`) y un ancho de cabeza que no sale de dividir
+  (`qwen3.attention.key_length`: 128 en el 4B, no 2560/32 = 80). El
+  tokenizador sale del GGUF, que declara `gpt2`/`qwen2` como el de Qwen2.5.
+  En la batería de `compare_models` (15 preguntas verificables, temperatura
+  0), **Qwen3-4B-Instruct-2507 Q3_K_M acierta 14/15 contra 11/15** del
+  Qwen2.5-3B Q3_K_M de por defecto, con 1.979 MB contra 1.644 en disco, y es
+  Apache-2.0. `compare_models -- --qwen3` repite la comparación. Con la
+  máquina libre: decode **11,0 tok/s contra 14,1**, una respuesta de 40 tokens
+  en ~4,8 s contra ~3,8 (DECISIONES §37).
+- **Fortran**: la feature `fortran` compila `kernels/*.f90` con gfortran y los
+  enlaza por `bind(C)`, sin el runtime de Fortran. El primero es el
+  microkernel de la GEMM en f32 (`kernels/sgemm_micro.f90`), que da lo mismo
+  bit a bit que el de intrínsecos y empata en velocidad en x86-64; en ARM64,
+  donde Rust solo tiene el escalar, va por defecto. `COSXAMIX_SGEMM_MICRO`
+  elige en x86-64, y `COSXAMIX_GFORTRAN` el compilador (en Windows se busca el
+  de MSYS2). El CI lo prueba en x86 y en ARM64, donde además mide la GEMM sin
+  y con la feature.
+- **La lectura del prompt, ~47 → ~57 tok/s** en el 3B Q3_K_M (333 tokens:
+  6,75-7,29 s → 5,52-6,13 s; 286 tokens: 5,62-6,18 s → 4,90-5,02 s). La tesela
+  del prefill suma de a cuatro trozos en enteros con `hadd` y convierte y
+  escala una vez por grupo de 128 (`tesela_u8_grupos_avx2`, 3 × 2), y el
+  término del desplazamiento va por la GEMM en f32 desde 64 filas. Con 18
+  filas, igual que antes. La misma tesela en C (`kernels/tile_groups_avx2.c`,
+  feature `c`) da lo mismo bit a bit y empata; `COSXAMIX_TESELA` elige `c` o
+  `vieja` para comparar (DECISIONES §38).
+- **Binario un 22% más chico**: 3.416.064 → 2.670.080 bytes sin features, y 72
+  crates en vez de 80 en un build limpio. `tokio` con solo lo que usa el
+  servidor y `tracing-subscriber` sin `env-filter`, que traía `regex` entero.
+  `RUST_LOG` acepta un nivel (`error`, `warn`, `info`, `debug`, `trace`); con
+  la forma de `env-filter` se toma el más detallado que aparezca.
+- **Menos memoria**: las tablas de RoPE se calculan por tanda en vez de para
+  todo el contexto (134 MB menos en Qwen3-4B, 16,8 en el 3B) y SwiGLU va en su
+  sitio en vez de a un búfer nuevo por capa. Memoria privada en el pico del
+  primer mensaje: 189 → 159 MB en el 3B y 381 → 237 MB en Qwen3-4B.
+  `machine_load::memoria()` lee la privada y la residente, y `measure_response`
+  las muestra (DECISIONES §39).
+- **`measure_lattice`**, el primer experimento de «pesos como fórmulas»
+  (ROADMAP 12): cuantizar de a 8 pesos con la red E8, después de girarlos con
+  Hadamard, da en el 0,5B en F16 el mismo error que Q2_K con 2,06 bits por peso
+  en vez de 2,63 (DECISIONES §40). Con el modelo entero simulado
+  (`measure_lattice simular` y `kl`, `compare_models -- --e8`) acierta 5/15
+  como Q3_K y uno más que Q2_K. Todavía no hay kernel.
+- **La caché de atención en f16, y la atención repartida por cabeza**: la
+  caché ocupa la mitad (147 KB por token en Qwen3-4B en vez de 294) y en el
+  decode se lee en f16 directo, convirtiendo en registros. La atención se
+  reparte por token **y cabeza**: en el decode corría en un solo hilo. Decode
+  del 3B 12,7-12,9 → **13,7-14,1 tok/s**, de Qwen3-4B 8,4 → **10,7 tok/s**,
+  con los mismos aciertos (11/15 y 14/15). Pico de memoria privada de Qwen3-4B
+  en el primer mensaje: 237 → 192 MB.
+- **`machine_load`: antes de medir, mirar si la máquina está libre.** Los 22
+  ejemplos que miden velocidad miran un segundo la ocupación de la CPU de todo
+  el sistema (`GetSystemTimes` en Windows, `/proc/stat` en Linux y Android) y
+  avisan si pasa del 15%: la primera corrida de la batería de Qwen3 dio
+  0,9 tok/s con `gnatprove -j0` de Fabianus ocupando todos los núcleos.
+  `COSXAMIX_ESPERAR_CPU=<segundos>` espera a que se libere antes de medir.
+
 ## [0.11.0] - 2026-11-21
 
 - **Licencia: GPL-3.0-or-later** (`LICENSE`, `Cargo.toml`), la misma de
@@ -1757,6 +1826,7 @@ agrega una sección a uno y se olvida del otro, CI falla.
 - Verificado en esta versión: **22 tests**, 0 avisos, clippy limpio en las tres
   combinaciones (por defecto, `candle`, `zig,candle`).
 
+[0.12.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.12.0
 [0.11.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.11.0
 [0.10.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.10.0
 [0.9.0]: https://github.com/Brashkie/Cosxamix/releases/tag/v0.9.0

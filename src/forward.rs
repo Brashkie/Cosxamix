@@ -1,4 +1,13 @@
-//! El forward de Qwen2 **sobre la pila propia**, sin candle.
+//! El forward de Qwen2 y Qwen3 **sobre la pila propia**, sin candle.
+//!
+//! Las dos arquitecturas comparten casi todo. Qwen3 cambia tres cosas, y las
+//! tres se leen del archivo en vez de suponerse:
+//!
+//! - q, k y v **sin sesgo**;
+//! - una RMSNorm **por cabeza** sobre q y k antes de RoPE (`attn_q_norm`,
+//!   `attn_k_norm`), que es lo que estabiliza la atención sin el sesgo;
+//! - el ancho de cabeza **no sale de dividir**: en el 4B son 32 cabezas de 128
+//!   sobre un `dim` de 2560, no de 80. Lo dice `<arq>.attention.key_length`.
 //!
 //! Es la fase 3 del motor propio, y el momento en que las piezas de las fases
 //! anteriores dejan de ser ejercicios: lector de GGUF, descuantización,
@@ -27,6 +36,15 @@ use crate::ops;
 
 type Resultado<T> = Result<T, String>;
 
+/// De a cuántos valores se aplica SiLU en su sitio: lo que entra en L1 junto
+/// con el tramo de `gate`.
+const TRAMO_SILU: usize = 1024;
+
+/// Desde cuántos tokens por tanda la atención pasa el caché de la capa a f32
+/// una vez en vez de leerlo en f16: con muchos tokens nuevos cada clave se lee
+/// muchas veces, y convertirla cada vez costaría más que convertirla una.
+const ATENCION_F32_DESDE: usize = 16;
+
 /// Una proyección para [`Modelo::proyectar_varias`]: los pesos, el sesgo si
 /// lo hay, y dónde va el resultado.
 type Proyeccion<'a> = (&'a Peso, Option<&'a Vec<f32>>, &'a mut Vec<f32>);
@@ -42,11 +60,20 @@ pub struct Config {
     pub contexto: usize,
     pub eps: f32,
     pub rope: f32,
+    /// El ancho de cada cabeza de atención. En Qwen2 es `dim / cabezas`; en
+    /// Qwen3 lo fija el archivo y puede ser otro.
+    pub cabeza: usize,
 }
 
 impl Config {
     pub fn dim_cabeza(&self) -> usize {
-        self.dim / self.cabezas
+        self.cabeza
+    }
+
+    /// El ancho de q y de la salida de la atención: `cabezas × dim_cabeza`,
+    /// que en Qwen3 no es `dim`.
+    pub fn dim_q(&self) -> usize {
+        self.cabezas * self.cabeza
     }
 
     pub fn dim_kv(&self) -> usize {
@@ -59,9 +86,15 @@ impl Config {
 /// Crece por tokens. Es lo que hace que el segundo turno no reprocese el
 /// primero, y lo que obliga a que la máscara causal use la posición absoluta
 /// y no el índice dentro de la tanda.
+///
+/// **En f16**, la mitad que en f32: en Qwen3-4B (8 cabezas de clave y valor de
+/// 128) son 147 KB por token en vez de 294, ~600 MB menos en una charla de
+/// 4.000 tokens. Cada capa pasa su tramo a f32 antes de la atención, en un
+/// búfer que se reusa entre capas (ver [`Modelo::forward`]). Es lo que hace
+/// llama.cpp por defecto.
 pub struct Cache {
-    k: Vec<Vec<f32>>,
-    v: Vec<Vec<f32>>,
+    k: Vec<Vec<u16>>,
+    v: Vec<Vec<u16>>,
     largo: usize,
 }
 
@@ -131,7 +164,7 @@ impl Cache {
         self.k
             .iter()
             .chain(&self.v)
-            .map(|x| x.len() * 4)
+            .map(|x| x.len() * 2)
             .sum::<usize>()
     }
 }
@@ -152,11 +185,14 @@ impl Peso {
 struct Capa {
     attn_norm: Peso,
     q: Peso,
-    q_bias: Peso,
+    q_bias: Option<Peso>,
     k: Peso,
-    k_bias: Peso,
+    k_bias: Option<Peso>,
     v: Peso,
-    v_bias: Peso,
+    v_bias: Option<Peso>,
+    /// Las normas por cabeza de Qwen3; `None` en Qwen2.
+    q_norm: Option<Peso>,
+    k_norm: Option<Peso>,
     salida: Peso,
     ffn_norm: Peso,
     gate: Peso,
@@ -178,8 +214,6 @@ pub struct Modelo {
     /// archivo no trae `output.weight`, que es lo que hacen los modelos con
     /// *tied embeddings* —el 0,5B de Qwen2.5 entre ellos—.
     salida_atada: bool,
-    cos: Vec<f32>,
-    sin: Vec<f32>,
     forzar_f32: bool,
 }
 
@@ -188,24 +222,39 @@ impl Modelo {
         let gguf = Gguf::abrir(ruta)?;
         let mapa = Pesos::abrir(&gguf, ruta)?;
 
+        // Las claves llevan el nombre de la arquitectura delante: `qwen2.` o
+        // `qwen3.`. Un daiss se escribe como `qwen2`.
+        let arq = match gguf
+            .metadatos
+            .get("general.architecture")
+            .and_then(|v| v.texto())
+        {
+            Some(a @ ("qwen2" | "qwen3")) => a.to_string(),
+            Some(otra) => return Err(format!("arquitectura {otra}: se leen qwen2 y qwen3")),
+            None => "qwen2".to_string(),
+        };
         let entero = |clave: &str| -> Resultado<usize> {
-            gguf.meta_entero(clave)
+            let clave = format!("{arq}.{clave}");
+            gguf.meta_entero(&clave)
                 .map(|v| v as usize)
                 .ok_or_else(|| format!("falta el metadato {clave}"))
         };
+        let dim = entero("embedding_length")?;
+        let cabezas = entero("attention.head_count")?;
         let cfg = Config {
-            capas: entero("qwen2.block_count")?,
-            dim: entero("qwen2.embedding_length")?,
-            cabezas: entero("qwen2.attention.head_count")?,
-            cabezas_kv: entero("qwen2.attention.head_count_kv")?,
+            capas: entero("block_count")?,
+            dim,
+            cabezas,
+            cabezas_kv: entero("attention.head_count_kv")?,
             vocab: 0, // se completa con la forma de la tabla
-            contexto: entero("qwen2.context_length")?,
+            contexto: entero("context_length")?,
             eps: gguf
-                .meta_decimal("qwen2.attention.layer_norm_rms_epsilon")
+                .meta_decimal(&format!("{arq}.attention.layer_norm_rms_epsilon"))
                 .unwrap_or(1e-6) as f32,
             rope: gguf
-                .meta_decimal("qwen2.rope.freq_base")
+                .meta_decimal(&format!("{arq}.rope.freq_base"))
                 .unwrap_or(10_000.0) as f32,
+            cabeza: entero("attention.key_length").unwrap_or(dim / cabezas),
         };
 
         let buscar = |nombre: &str| -> Resultado<Peso> {
@@ -213,6 +262,8 @@ impl Modelo {
                 .map(|info| Peso { info: info.clone() })
                 .ok_or_else(|| format!("falta el tensor {nombre}"))
         };
+
+        let quizas = |nombre: &str| gguf.tensor(nombre).map(|info| Peso { info: info.clone() });
 
         let embd = buscar("token_embd.weight")?;
         let vocab = embd.info.dims[1] as usize;
@@ -234,11 +285,13 @@ impl Modelo {
             capas.push(Capa {
                 attn_norm: buscar(&format!("{p}.attn_norm.weight"))?,
                 q: buscar(&format!("{p}.attn_q.weight"))?,
-                q_bias: buscar(&format!("{p}.attn_q.bias"))?,
+                q_bias: quizas(&format!("{p}.attn_q.bias")),
                 k: buscar(&format!("{p}.attn_k.weight"))?,
-                k_bias: buscar(&format!("{p}.attn_k.bias"))?,
+                k_bias: quizas(&format!("{p}.attn_k.bias")),
                 v: buscar(&format!("{p}.attn_v.weight"))?,
-                v_bias: buscar(&format!("{p}.attn_v.bias"))?,
+                v_bias: quizas(&format!("{p}.attn_v.bias")),
+                q_norm: quizas(&format!("{p}.attn_q_norm.weight")),
+                k_norm: quizas(&format!("{p}.attn_k_norm.weight")),
                 salida: buscar(&format!("{p}.attn_output.weight"))?,
                 ffn_norm: buscar(&format!("{p}.ffn_norm.weight"))?,
                 gate: buscar(&format!("{p}.ffn_gate.weight"))?,
@@ -246,8 +299,6 @@ impl Modelo {
                 down: buscar(&format!("{p}.ffn_down.weight"))?,
             });
         }
-
-        let (cos, sin) = ops::frecuencias_rope(cfg.dim / cfg.cabezas, cfg.rope, cfg.contexto);
 
         Ok(Self {
             cfg: Config { vocab, ..cfg },
@@ -259,8 +310,6 @@ impl Modelo {
             norma_final,
             salida,
             salida_atada,
-            cos,
-            sin,
             forzar_f32: std::env::var("COSXAMIX_MATMUL").is_ok_and(|v| v == "f32"),
         })
     }
@@ -289,6 +338,37 @@ impl Modelo {
         destino.clear();
         destino.resize(n, 0.0);
         crate::quant::descuantizar(p.info.tipo, self.bytes_de(p)?, destino)
+    }
+
+    /// Como [`Self::vector`], para lo que no todas las arquitecturas traen:
+    /// sin el tensor, `destino` queda vacío y devuelve `false`.
+    fn vector_si_hay(&self, p: Option<&Peso>, destino: &mut Vec<f32>) -> Resultado<bool> {
+        match p {
+            Some(p) => self.vector(p, destino).map(|_| true),
+            None => {
+                destino.clear();
+                Ok(false)
+            }
+        }
+    }
+
+    /// La RMSNorm por cabeza de Qwen3: cada tramo de `dim_cabeza` se normaliza
+    /// por separado, con el mismo peso para todas las cabezas.
+    fn norma_por_cabeza(
+        &self,
+        x: &mut [f32],
+        p: Option<&Peso>,
+        peso: &mut Vec<f32>,
+    ) -> Resultado<()> {
+        if !self.vector_si_hay(p, peso)? {
+            return Ok(());
+        }
+        let mut tramo = vec![0f32; self.cfg.cabeza];
+        for cabeza in x.chunks_mut(self.cfg.cabeza) {
+            tramo.copy_from_slice(cabeza);
+            crate::kernels::rmsnorm(cabeza, &tramo, peso, self.cfg.eps);
+        }
+        Ok(())
     }
 
     /// `destino = x · W^T + sesgo`, con el camino que corresponda.
@@ -405,6 +485,9 @@ impl Modelo {
         }
 
         let dim_cabeza = cfg.dim_cabeza();
+        // Los senos y cosenos de RoPE de las posiciones de esta tanda, una vez
+        // para todas las capas (ver `ops::frecuencias_rope_desde`).
+        let (cos, sin) = ops::frecuencias_rope_desde(dim_cabeza, cfg.rope, cache.largo, t);
 
         // Buffers reusados por todas las capas: aca si vale la pena, porque
         // son 36 capas y no una llamada suelta.
@@ -412,10 +495,13 @@ impl Modelo {
         let mut peso = Vec::new();
         let (mut sesgo_q, mut sesgo_k, mut sesgo_v) = (Vec::new(), Vec::new(), Vec::new());
         let (mut q, mut kk, mut vv) = (Vec::new(), Vec::new(), Vec::new());
-        let mut att = vec![0f32; t * cfg.dim];
+        let mut att = vec![0f32; t * cfg.dim_q()];
         let mut proy = Vec::new();
         let mut gate = Vec::new();
         let mut up = Vec::new();
+        let mut tramo_silu = vec![0f32; TRAMO_SILU];
+        // El caché de la capa en f32, para la atención.
+        let (mut k32, mut v32) = (Vec::new(), Vec::new());
 
         for (i, capa) in self.capas.iter().enumerate() {
             // ── atencion ────────────────────────────────────────────────────
@@ -424,44 +510,40 @@ impl Modelo {
                 crate::kernels::rmsnorm(dst, src, &peso, cfg.eps);
             }
 
-            self.vector(&capa.q_bias, &mut sesgo_q)?;
-            self.vector(&capa.k_bias, &mut sesgo_k)?;
-            self.vector(&capa.v_bias, &mut sesgo_v)?;
+            let hay_q = self.vector_si_hay(capa.q_bias.as_ref(), &mut sesgo_q)?;
+            let hay_k = self.vector_si_hay(capa.k_bias.as_ref(), &mut sesgo_k)?;
+            let hay_v = self.vector_si_hay(capa.v_bias.as_ref(), &mut sesgo_v)?;
             self.proyectar_varias(
                 &xn,
                 t,
                 &mut [
-                    (&capa.q, Some(&sesgo_q), &mut q),
-                    (&capa.k, Some(&sesgo_k), &mut kk),
-                    (&capa.v, Some(&sesgo_v), &mut vv),
+                    (&capa.q, hay_q.then_some(&sesgo_q), &mut q),
+                    (&capa.k, hay_k.then_some(&sesgo_k), &mut kk),
+                    (&capa.v, hay_v.then_some(&sesgo_v), &mut vv),
                 ],
             )?;
+            self.norma_por_cabeza(&mut q, capa.q_norm.as_ref(), &mut peso)?;
+            self.norma_por_cabeza(&mut kk, capa.k_norm.as_ref(), &mut peso)?;
 
-            ops::rope(
-                &mut q,
-                (t, cfg.cabezas, dim_cabeza),
-                &self.cos,
-                &self.sin,
-                cache.largo,
-            )?;
-            ops::rope(
-                &mut kk,
-                (t, cfg.cabezas_kv, dim_cabeza),
-                &self.cos,
-                &self.sin,
-                cache.largo,
-            )?;
+            ops::rope(&mut q, (t, cfg.cabezas, dim_cabeza), &cos, &sin, 0)?;
+            ops::rope(&mut kk, (t, cfg.cabezas_kv, dim_cabeza), &cos, &sin, 0)?;
 
-            cache.k[i].extend_from_slice(&kk);
-            cache.v[i].extend_from_slice(&vv);
+            crate::kernels::sgemm::f32_a_f16_agregar(&kk, &mut cache.k[i]);
+            crate::kernels::sgemm::f32_a_f16_agregar(&vv, &mut cache.v[i]);
 
-            ops::atencion(
-                &q,
-                &cache.k[i],
-                &cache.v[i],
-                (t, total, cfg.cabezas, cfg.cabezas_kv, dim_cabeza),
-                &mut att,
-            )?;
+            let dims = (t, total, cfg.cabezas, cfg.cabezas_kv, dim_cabeza);
+            if t < ATENCION_F32_DESDE {
+                // El decode: se lee el caché en f16 directo.
+                ops::atencion_f16(&q, &cache.k[i], &cache.v[i], dims, &mut att)?;
+            } else {
+                // El prefill: cada clave se lee una vez por token nuevo, así
+                // que conviene pasar la capa a f32 una sola vez.
+                k32.resize(cache.k[i].len(), 0.0);
+                v32.resize(cache.v[i].len(), 0.0);
+                crate::kernels::sgemm::f16_a_f32(&cache.k[i], &mut k32);
+                crate::kernels::sgemm::f16_a_f32(&cache.v[i], &mut v32);
+                ops::atencion(&q, &k32, &v32, dims, &mut att)?;
+            }
 
             self.proyectar(&att, t, &capa.salida, None, &mut proy)?;
             for (a, b) in x.iter_mut().zip(&proy) {
@@ -479,13 +561,17 @@ impl Modelo {
                 t,
                 &mut [(&capa.gate, None, &mut gate), (&capa.up, None, &mut up)],
             )?;
-            // SwiGLU: silu(gate) * up, en su sitio sobre `gate`.
-            let mut activado = vec![0f32; gate.len()];
-            crate::kernels::silu(&mut activado, &gate);
-            for (a, u) in activado.iter_mut().zip(&up) {
-                *a *= u;
+            // SwiGLU: silu(gate) * up, en su sitio sobre `gate`. Antes iba a un
+            // búfer nuevo de `t × ffn` por capa: 14,7 MB con 333 tokens en el
+            // 3B, pedidos 36 veces por forward.
+            for (g, u) in gate.chunks_mut(TRAMO_SILU).zip(up.chunks(TRAMO_SILU)) {
+                tramo_silu[..g.len()].copy_from_slice(g);
+                crate::kernels::silu(g, &tramo_silu[..g.len()]);
+                for (a, b) in g.iter_mut().zip(u) {
+                    *a *= b;
+                }
             }
-            self.proyectar(&activado, t, &capa.down, None, &mut proy)?;
+            self.proyectar(&gate, t, &capa.down, None, &mut proy)?;
             for (a, b) in x.iter_mut().zip(&proy) {
                 *a += b;
             }
@@ -562,7 +648,8 @@ impl Modelo {
 /// Dimensiones del caché por token, que es lo que decide cuánto contexto
 /// entra en memoria.
 pub fn bytes_de_cache_por_token(cfg: &Config) -> usize {
-    2 * cfg.capas * cfg.dim_kv() * 4
+    // Claves y valores, en f16.
+    2 * cfg.capas * cfg.dim_kv() * 2
 }
 
 /// El tipo de los pesos del modelo, para informar.
@@ -588,14 +675,14 @@ mod tests {
     fn el_prefijo_copia_los_primeros_tokens_de_cada_capa() {
         // Dos capas, 4 tokens de 3 valores cada uno.
         let mut c = Cache {
-            k: vec![(0..12).map(|v| v as f32).collect(); 2],
-            v: vec![(100..112).map(|v| v as f32).collect(); 2],
+            k: vec![(0..12).collect(); 2],
+            v: vec![(100..112).collect(); 2],
             largo: 4,
         };
         let p = c.prefijo(2);
         assert_eq!(p.largo(), 2);
-        assert_eq!(p.k[1], [0., 1., 2., 3., 4., 5.]);
-        assert_eq!(p.v[0], [100., 101., 102., 103., 104., 105.]);
+        assert_eq!(p.k[1], [0, 1, 2, 3, 4, 5]);
+        assert_eq!(p.v[0], [100, 101, 102, 103, 104, 105]);
         assert_eq!(c.largo(), 4, "el original no se toca");
         assert_eq!(c.prefijo(10).largo(), 4, "pedir de más no rompe");
         c.truncar(2);

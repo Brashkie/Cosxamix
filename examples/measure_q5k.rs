@@ -30,6 +30,7 @@ fn medir(mut f: impl FnMut() -> f32) -> f64 {
 }
 
 fn main() {
+    cosxamix::machine_load::antes_de_medir();
     let ancho: usize = std::env::var("COSXAMIX_ancho")
         .ok()
         .and_then(|v| v.parse().ok())

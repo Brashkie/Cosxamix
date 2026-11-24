@@ -51,6 +51,7 @@ fn rss_pico_mb() -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cosxamix::machine_load::antes_de_medir();
     let prompt = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "a cat astronaut floating in space, digital art".into());

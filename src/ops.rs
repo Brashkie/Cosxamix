@@ -572,6 +572,41 @@ fn expandir_escalas(esc: &[f32], sub: usize, destino: &mut [f32]) {
     }
 }
 
+/// Las escalas por sub-bloque en el orden de carriles de
+/// [`crate::kernels::x86::tesela_u8_grupos_avx2`]: 8 por grupo de 128 valores,
+/// el carril `j` con la del sub-bloque de 16 que empieza en el valor
+/// `32 · (j % 4) + 16 · (j / 4)` del grupo.
+#[cfg(target_arch = "x86_64")]
+fn agrupar_escalas(esc: &[f32], sub: usize, destino: &mut [f32]) {
+    let (grupos, _) = destino.as_chunks_mut::<8>();
+    for (g, d) in grupos.iter_mut().enumerate() {
+        for (j, v) in d.iter_mut().enumerate() {
+            let valor = 128 * g + 32 * (j % 4) + 16 * (j / 4);
+            *v = esc[valor / sub];
+        }
+    }
+}
+
+/// Si la tesela por grupos va en C (`COSXAMIX_TESELA=c`, con la feature
+/// `c`) en vez de en Rust: el mismo algoritmo, para comparar lenguajes.
+#[cfg(all(feature = "c", target_arch = "x86_64"))]
+fn tesela_en_c() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("COSXAMIX_TESELA").is_ok_and(|v| v == "c"))
+}
+
+// La de C tiene la forma fija de 3 × 2.
+#[cfg(all(feature = "c", target_arch = "x86_64"))]
+const _: () = assert!(GRUPO_FILAS == 3 && GRUPO_COLS == 2);
+
+/// Si el prefill usa la tesela por grupos de 128. `COSXAMIX_TESELA=vieja`
+/// vuelve a la de un trozo por vez, para comparar.
+#[cfg(target_arch = "x86_64")]
+fn tesela_por_grupos() -> bool {
+    static GRUPOS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GRUPOS.get_or_init(|| std::env::var("COSXAMIX_TESELA").map_or(true, |v| v != "vieja"))
+}
+
 /// `dst[m, n] = lhs[m, k] · W[n, k]ᵀ` **por bloques**: el camino del prefill.
 ///
 /// Hace las mismas cuentas que [`matmul_i8_directo`] —las mismas columnas
@@ -605,16 +640,34 @@ fn expandir_escalas(esc: &[f32], sub: usize, destino: &mut [f32]) {
 /// Solo con AVX2; sin él, o con `k` que no sea múltiplo de 32, cae a
 /// [`matmul_i8_directo`].
 pub fn matmul_i8_bloques(
-    (m, k, n): (usize, usize, usize),
+    dims: (usize, usize, usize),
     lhs: &[f32],
     pesos: &[u8],
     tipo: TipoGgml,
     dst: &mut [f32],
 ) -> Result<(), String> {
     #[cfg(target_arch = "x86_64")]
+    let grupos = tesela_por_grupos();
+    #[cfg(not(target_arch = "x86_64"))]
+    let grupos = false;
+    matmul_i8_bloques_con(dims, lhs, pesos, tipo, dst, grupos)
+}
+
+/// [`matmul_i8_bloques`] eligiendo la tesela: por grupos de 128 o de a un
+/// trozo. Aparte para que los tests recorran las dos.
+fn matmul_i8_bloques_con(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    pesos: &[u8],
+    tipo: TipoGgml,
+    dst: &mut [f32],
+    grupos: bool,
+) -> Result<(), String> {
+    #[cfg(target_arch = "x86_64")]
     if crate::kernels::usar_avx2() && k.is_multiple_of(32) {
-        return matmul_i8_bloques_avx2((m, k, n), lhs, pesos, tipo, dst);
+        return matmul_i8_bloques_avx2((m, k, n), lhs, pesos, tipo, dst, grupos);
     }
+    let _ = grupos;
     matmul_i8_directo((m, k, n), lhs, pesos, tipo, dst)
 }
 
@@ -624,6 +677,21 @@ pub fn matmul_i8_bloques(
 const TESELA_FILAS: usize = 4;
 #[cfg(target_arch = "x86_64")]
 const TESELA_COLS: usize = 2;
+
+/// La tesela de [`crate::kernels::x86::tesela_u8_grupos_avx2`]: filas y
+/// columnas. Va aparte de la otra porque su cuenta de registros es otra: por
+/// cada par lleva, además del acumulador, las dos mitades del grupo.
+#[cfg(target_arch = "x86_64")]
+const GRUPO_FILAS: usize = 3;
+
+/// Desde cuántas filas el término del desplazamiento va con la GEMM en f32 en
+/// vez de un producto punto por fila y columna. Medido en dos capas del 3B:
+/// con 333 filas la GEMM gana un 5%; con 18 pierde un 25%, porque empaquetar
+/// los desplazamientos cuesta más de lo que ahorra con tan pocas filas.
+#[cfg(target_arch = "x86_64")]
+const DES_EN_GEMM_DESDE: usize = 64;
+#[cfg(target_arch = "x86_64")]
+const GRUPO_COLS: usize = 2;
 
 /// Bytes de `i8` de entrada por franja: lo que se deja en L2 mientras pasan
 /// las columnas del tramo.
@@ -637,8 +705,9 @@ fn matmul_i8_bloques_avx2(
     pesos: &[u8],
     tipo: TipoGgml,
     dst: &mut [f32],
+    por_grupos_pedido: bool,
 ) -> Result<(), String> {
-    use crate::kernels::x86::{tesela_i8_avx2, tesela_u8_avx2};
+    use crate::kernels::x86::{tesela_i8_avx2, tesela_u8_avx2, tesela_u8_grupos_avx2};
 
     if lhs.len() != m * k {
         return Err(format!("lhs mide {} y deberia medir {m}*{k}", lhs.len()));
@@ -660,6 +729,13 @@ fn matmul_i8_bloques_avx2(
     let n_bloques = k / sub;
     let trozos = k / 32;
     let ancho_esc = trozos * 8;
+    // Por grupos de 128 si `k` lo permite; las escalas, en su orden.
+    let grupos = if por_grupos_pedido && k.is_multiple_of(128) {
+        k / 128
+    } else {
+        0
+    };
+    let ancho_g = grupos * 8;
 
     // La entrada, igual que en `matmul_i8_directo`, más sus escalas
     // expandidas y, para el término del desplazamiento, escala por suma.
@@ -667,6 +743,7 @@ fn matmul_i8_bloques_avx2(
     let mut lhs_esc = vec![0f32; m * n_bloques];
     let mut lhs_e8 = vec![0f32; m * ancho_esc];
     let mut lhs_es = vec![0f32; m * n_bloques];
+    let mut lhs_g = vec![0f32; m * ancho_g.max(1)];
     // En paralelo, fila por fila: en un hilo eran 3 a 14 ms por llamada,
     // hasta el 20% de la multiplicación, con los demás núcleos esperando.
     lhs_q
@@ -675,9 +752,13 @@ fn matmul_i8_bloques_avx2(
         .zip(lhs_e8.par_chunks_mut(ancho_esc))
         .zip(lhs_es.par_chunks_mut(n_bloques))
         .zip(lhs.par_chunks(k))
-        .for_each(|((((q, e), e8), es), x)| {
+        .zip(lhs_g.par_chunks_mut(ancho_g.max(1)))
+        .for_each(|(((((q, e), e8), es), x), eg)| {
             cuantizar_i8_en(x, q, e, sub);
             expandir_escalas(e, sub, e8);
+            if grupos > 0 {
+                agrupar_escalas(e, sub, eg);
+            }
             for b in 0..n_bloques {
                 let r = b * sub;
                 let suma = q[r..r + sub].iter().map(|v| *v as i32).sum::<i32>() as f32;
@@ -687,20 +768,39 @@ fn matmul_i8_bloques_avx2(
 
     let franja = (FRANJA_BYTES / k).max(TESELA_FILAS) / TESELA_FILAS * TESELA_FILAS;
     let mut salida_t = vec![0f32; n * m];
+    // Los desplazamientos de todas las columnas, `n × n_bloques`: el término
+    // que los usa se hace al final, de una vez, con la GEMM en f32.
+    // Solo si se va a usar: con pocas filas cada tramo lleva los suyos, y pedir
+    // y llenar de ceros 5,6 MB (`ffn_gate` de Q3_K) en cada multiplicación se
+    // notaba en el prefill de 18 filas.
+    let des_en_gemm = m >= DES_EN_GEMM_DESDE;
+    let (largo_des, ancho_des) = if des_en_gemm {
+        (n * n_bloques, n_bloques * COLUMNAS_MINIMAS)
+    } else {
+        (n.div_ceil(COLUMNAS_MINIMAS), 1)
+    };
+    let mut des_todas = vec![0f32; largo_des];
 
     salida_t
         .par_chunks_mut(m * COLUMNAS_MINIMAS)
+        .zip(des_todas.par_chunks_mut(ancho_des))
         .enumerate()
-        .for_each(|(tramo, destino)| {
+        .for_each(|(tramo, (destino, des_global))| {
             let primera = tramo * COLUMNAS_MINIMAS;
             let ncols = destino.len() / m;
+            let mut des_local = Vec::new();
+            let cols_des: &mut [f32] = if des_en_gemm {
+                des_global
+            } else {
+                des_local.resize(ncols * n_bloques, 0.0);
+                &mut des_local
+            };
 
             // El tramo entero desempaquetado, una vez.
             let mut cols_q = vec![0i8; ncols * k];
             let mut cols_e8 = vec![0f32; ncols * ancho_esc];
-            let mut cols_des = vec![0f32; ncols * n_bloques];
+            let mut cols_g = vec![0f32; ncols * ancho_g.max(1)];
             let mut esc = vec![0f32; n_bloques];
-            let mut hay_des = vec![false; ncols];
             for j in 0..ncols {
                 let desde = (primera + j) * bytes_fila;
                 let des = &mut cols_des[j * n_bloques..(j + 1) * n_bloques];
@@ -716,6 +816,9 @@ fn matmul_i8_bloques_avx2(
                     continue;
                 }
                 expandir_escalas(&esc, sub, &mut cols_e8[j * ancho_esc..(j + 1) * ancho_esc]);
+                if grupos > 0 {
+                    agrupar_escalas(&esc, sub, &mut cols_g[j * ancho_g..(j + 1) * ancho_g]);
+                }
             }
 
             // Pesos sin signo, si el tramo lo permite: se corren todos por
@@ -743,26 +846,78 @@ fn matmul_i8_bloques_avx2(
                         *d -= corrimiento as f32 * e8[b * sub / 4];
                     }
                 }
-                hay_des[j] = des.iter().any(|v| *v != 0.0);
             }
 
-            let fila = |f: usize| (lhs_q[f * k..].as_ptr(), lhs_e8[f * ancho_esc..].as_ptr());
-            let col = |j: usize| (cols_q[j * k..].as_ptr(), cols_e8[j * ancho_esc..].as_ptr());
+            // Con signo no hay versión por grupos: `vpmaddubsw` pide un lado
+            // sin signo.
+            let por_grupos = grupos > 0 && sin_signo;
+            let fila = |f: usize| {
+                let esc = if por_grupos {
+                    lhs_g[f * ancho_g..].as_ptr()
+                } else {
+                    lhs_e8[f * ancho_esc..].as_ptr()
+                };
+                (lhs_q[f * k..].as_ptr(), esc)
+            };
+            let col = |j: usize| {
+                let esc = if por_grupos {
+                    cols_g[j * ancho_g..].as_ptr()
+                } else {
+                    cols_e8[j * ancho_esc..].as_ptr()
+                };
+                (cols_q[j * k..].as_ptr(), esc)
+            };
 
             // Partir también a lo largo de `k`, en tajadas que entraran en L2
             // con la franja, se probó con 512, 1024 y 2048 valores: ninguna le
             // ganó a no partir (1,67x, 1,93x y 2,11x contra 2,05x), y se sacó.
+            let (tf, tc) = if por_grupos {
+                (GRUPO_FILAS, GRUPO_COLS)
+            } else {
+                (TESELA_FILAS, TESELA_COLS)
+            };
             let mut f0 = 0;
             while f0 < m {
                 let f1 = (f0 + franja).min(m);
                 let mut j = 0;
                 while j < ncols {
-                    let nc = (ncols - j).min(TESELA_COLS);
+                    let nc = (ncols - j).min(tc);
                     let mut f = f0;
                     while f < f1 {
-                        let nf = (f1 - f).min(TESELA_FILAS);
+                        let nf = (f1 - f).min(tf);
                         // La tesela entera o, en los bordes, de a un producto.
-                        if nf == TESELA_FILAS && nc == TESELA_COLS {
+                        if por_grupos && nf == tf && nc == tc {
+                            let xs: [_; GRUPO_FILAS] = std::array::from_fn(|i| fila(f + i).0);
+                            let es: [_; GRUPO_FILAS] = std::array::from_fn(|i| fila(f + i).1);
+                            let cs: [_; GRUPO_COLS] = std::array::from_fn(|i| col(j + i).0);
+                            let ds: [_; GRUPO_COLS] = std::array::from_fn(|i| col(j + i).1);
+                            // SAFETY: como abajo; las escalas, agrupadas.
+                            #[cfg(all(feature = "c", target_arch = "x86_64"))]
+                            let en_c = tesela_en_c();
+                            #[cfg(not(all(feature = "c", target_arch = "x86_64")))]
+                            let en_c = false;
+                            let r = unsafe {
+                                if en_c {
+                                    #[cfg(all(feature = "c", target_arch = "x86_64"))]
+                                    {
+                                        crate::kernels::c::tesela_grupos_3x2(
+                                            &xs, &es, &cs, &ds, grupos,
+                                        )
+                                    }
+                                    #[cfg(not(all(feature = "c", target_arch = "x86_64")))]
+                                    unreachable!()
+                                } else {
+                                    tesela_u8_grupos_avx2::<GRUPO_FILAS, GRUPO_COLS>(
+                                        &xs, &es, &cs, &ds, grupos,
+                                    )
+                                }
+                            };
+                            for (df, fila_r) in r.iter().enumerate() {
+                                for (dc, v) in fila_r.iter().enumerate() {
+                                    destino[(j + dc) * m + f + df] = *v;
+                                }
+                            }
+                        } else if nf == TESELA_FILAS && nc == TESELA_COLS {
                             let (x0, e0) = fila(f);
                             let (x1, e1) = fila(f + 1);
                             let (x2, e2) = fila(f + 2);
@@ -794,7 +949,15 @@ fn matmul_i8_bloques_avx2(
                                     let (c, d) = col(j + dc);
                                     // SAFETY: lo mismo que arriba.
                                     let r = unsafe {
-                                        if sin_signo {
+                                        if por_grupos {
+                                            tesela_u8_grupos_avx2::<1, 1>(
+                                                &[x],
+                                                &[e],
+                                                &[c],
+                                                &[d],
+                                                grupos,
+                                            )
+                                        } else if sin_signo {
                                             tesela_u8_avx2::<1, 1>(&[x], &[e], &[c], &[d], trozos)
                                         } else {
                                             tesela_i8_avx2::<1, 1>(&[x], &[e], &[c], &[d], trozos)
@@ -811,20 +974,46 @@ fn matmul_i8_bloques_avx2(
                 f0 = f1;
             }
 
-            // El término del desplazamiento, en los formatos que lo tienen.
-            for j in 0..ncols {
-                if !hay_des[j] {
-                    continue;
-                }
-                let des = &cols_des[j * n_bloques..(j + 1) * n_bloques];
-                for f in 0..m {
-                    destino[j * m + f] +=
-                        crate::kernels::dot(des, &lhs_es[f * n_bloques..(f + 1) * n_bloques]);
+            // Con pocas filas, el término del desplazamiento acá mismo.
+            if !des_en_gemm {
+                for j in 0..ncols {
+                    let des = &cols_des[j * n_bloques..(j + 1) * n_bloques];
+                    if des.iter().all(|v| *v == 0.0) {
+                        continue;
+                    }
+                    for f in 0..m {
+                        destino[j * m + f] +=
+                            crate::kernels::dot(des, &lhs_es[f * n_bloques..(f + 1) * n_bloques]);
+                    }
                 }
             }
         });
 
     transponer_en_paralelo(&salida_t, m, n, dst);
+
+    // El término del desplazamiento, en los formatos que lo tienen:
+    // `dst[f, j] += Σ_b lhs_es[f, b] · des[j, b]`, una multiplicación de
+    // `m × n_bloques` por `n_bloques × n`. Hecho columna por columna eran `m · n`
+    // productos punto de `k / sub` valores sin reusar nada —en `ffn_gate` de
+    // Q3_K, ~470 millones de FMA—; con la GEMM, por bloques y en paralelo.
+    if des_en_gemm && des_todas.iter().any(|v| *v != 0.0) {
+        use crate::kernels::sgemm::{sgemm, Mat};
+        sgemm(
+            (m, n, n_bloques),
+            &Mat {
+                datos: &lhs_es,
+                fila: n_bloques,
+                col: 1,
+            },
+            &Mat {
+                datos: &des_todas,
+                fila: 1,
+                col: n_bloques,
+            },
+            dst,
+            n,
+        );
+    }
     Ok(())
 }
 
@@ -1105,13 +1294,29 @@ pub fn matmul_auto(
 /// tamaños grandes y 10.000 para el 0,5B: usar el equivocado da un modelo que
 /// responde mal sin fallar, porque las posiciones quedan mal escaladas.
 pub fn frecuencias_rope(dim_cabeza: usize, base: f32, contexto: usize) -> (Vec<f32>, Vec<f32>) {
+    frecuencias_rope_desde(dim_cabeza, base, 0, contexto)
+}
+
+/// Las mismas tablas, solo para las posiciones `desde..desde + cuantas`: la
+/// fila 0 es la posición `desde`.
+///
+/// Es lo que usa el forward: calcular las de cada tanda cuesta menos de un
+/// milisegundo con 333 tokens y se comparte entre todas las capas, mientras
+/// que la tabla de todo el contexto ocupaba 16,8 MB en el 3B (32.768
+/// posiciones) y 134 MB en Qwen3-4B, que declara 262.144.
+pub fn frecuencias_rope_desde(
+    dim_cabeza: usize,
+    base: f32,
+    desde: usize,
+    cuantas: usize,
+) -> (Vec<f32>, Vec<f32>) {
     let mitad = dim_cabeza / 2;
-    let mut cos = vec![0f32; contexto * mitad];
-    let mut sin = vec![0f32; contexto * mitad];
+    let mut cos = vec![0f32; cuantas * mitad];
+    let mut sin = vec![0f32; cuantas * mitad];
 
     for j in 0..mitad {
         let frecuencia = 1.0 / base.powf(2.0 * j as f32 / dim_cabeza as f32);
-        for p in 0..contexto {
+        for (fila, p) in (desde..desde + cuantas).enumerate() {
             // El ángulo se calcula en `f64` y se guarda en `f32`. Con
             // `contexto` de 32.768 y frecuencia 1, el ángulo llega a 32.768
             // radianes, y ahí un `f32` tiene unos 0,002 de resolución: el
@@ -1120,8 +1325,8 @@ pub fn frecuencias_rope(dim_cabeza: usize, base: f32, contexto: usize) -> (Vec<f
             // también calcula en coma flotante de 32 bits pero sobre un
             // producto exacto.
             let angulo = (p as f64) * (frecuencia as f64);
-            cos[p * mitad + j] = angulo.cos() as f32;
-            sin[p * mitad + j] = angulo.sin() as f32;
+            cos[fila * mitad + j] = angulo.cos() as f32;
+            sin[fila * mitad + j] = angulo.sin() as f32;
         }
     }
     (cos, sin)
@@ -1258,6 +1463,109 @@ pub fn atencion(
     q: &[f32],
     k: &[f32],
     v: &[f32],
+    dims: (usize, usize, usize, usize, usize),
+    salida: &mut [f32],
+) -> Result<(), String> {
+    atencion_con(q, k, v, dims, salida)
+}
+
+/// [`atencion`] con el caché **en f16**, sin pasarlo a f32: cada fila se
+/// convierte en registros al leerla (F16C), así que se leen la mitad de bytes.
+/// Es la del decode; en el prefill cada clave se lee cientos de veces y
+/// conviene pasar la capa a f32 una vez y usar [`atencion`].
+pub fn atencion_f16(
+    q: &[f32],
+    k: &[u16],
+    v: &[u16],
+    dims: (usize, usize, usize, usize, usize),
+    salida: &mut [f32],
+) -> Result<(), String> {
+    atencion_con(q, k, v, dims, salida)
+}
+
+/// Lo que la atención necesita de un valor del caché: el producto punto de
+/// una fila contra `q` y sumarla escalada.
+trait ValorKv: Copy + Sync {
+    fn punto(q: &[f32], fila: &[Self]) -> f32;
+    fn sumar(destino: &mut [f32], peso: f32, fila: &[Self]);
+}
+
+impl ValorKv for f32 {
+    fn punto(q: &[f32], fila: &[f32]) -> f32 {
+        crate::kernels::dot(q, fila)
+    }
+    fn sumar(destino: &mut [f32], peso: f32, fila: &[f32]) {
+        for (d, x) in destino.iter_mut().zip(fila) {
+            *d += peso * x;
+        }
+    }
+}
+
+impl ValorKv for u16 {
+    fn punto(q: &[f32], fila: &[u16]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::kernels::cpu_avx2() && fila.len().is_multiple_of(8) {
+            // SAFETY: AVX2, FMA y F16C (`cpu_avx2` los pide juntos); largos
+            // iguales y múltiplos de 8.
+            return unsafe { punto_f16_avx2(q, fila) };
+        }
+        q.iter()
+            .zip(fila)
+            .map(|(a, b)| a * crate::kernels::sgemm::f16_escalar(*b))
+            .sum()
+    }
+    fn sumar(destino: &mut [f32], peso: f32, fila: &[u16]) {
+        #[cfg(target_arch = "x86_64")]
+        if crate::kernels::cpu_avx2() && fila.len().is_multiple_of(8) {
+            // SAFETY: lo mismo que arriba.
+            unsafe { sumar_f16_avx2(destino, peso, fila) };
+            return;
+        }
+        for (d, x) in destino.iter_mut().zip(fila) {
+            *d += peso * crate::kernels::sgemm::f16_escalar(*x);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn punto_f16_avx2(q: &[f32], fila: &[u16]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = fila.len().min(q.len());
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let k = _mm256_cvtph_ps(_mm_loadu_si128(fila.as_ptr().add(i) as *const __m128i));
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(q.as_ptr().add(i)), k, acc);
+        i += 8;
+    }
+    crate::kernels::x86::reducir_f32(acc)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn sumar_f16_avx2(destino: &mut [f32], peso: f32, fila: &[u16]) {
+    use std::arch::x86_64::*;
+    let n = fila.len().min(destino.len());
+    let p = _mm256_set1_ps(peso);
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = _mm256_cvtph_ps(_mm_loadu_si128(fila.as_ptr().add(i) as *const __m128i));
+        let d = destino.as_mut_ptr().add(i);
+        _mm256_storeu_ps(d, _mm256_fmadd_ps(p, v, _mm256_loadu_ps(d)));
+        i += 8;
+    }
+}
+
+/// La atención, para cualquier tipo de caché.
+///
+/// Se reparte **por token y cabeza**: cada par escribe su tramo de la salida.
+/// Repartida solo por token, en el decode —un token— corría en un hilo: con
+/// 380 tokens de contexto, ~56 millones de FMA por token del 3B en un núcleo.
+fn atencion_con<T: ValorKv>(
+    q: &[f32],
+    k: &[T],
+    v: &[T],
     (tokens, total, cabezas, cabezas_kv, dim_cabeza): (usize, usize, usize, usize, usize),
     salida: &mut [f32],
 ) -> Result<(), String> {
@@ -1286,38 +1594,33 @@ pub fn atencion(
     let escala = 1.0 / (dim_cabeza as f32).sqrt();
     let desplazamiento = total - tokens;
 
-    // Se reparte por token: cada uno escribe su propia fila de la salida y
-    // lee todo el caché, asi que no hay nada compartido que mutar.
+    // Cada par (token, cabeza) escribe su propio tramo de la salida y lee
+    // todo el caché, así que no hay nada compartido que mutar.
     salida
-        .par_chunks_mut(ancho_q)
+        .par_chunks_mut(dim_cabeza)
         .enumerate()
-        .for_each(|(t, fila)| {
+        .for_each(|(i, destino)| {
+            let (t, h) = (i / cabezas, i % cabezas);
             // Hasta donde puede mirar este token, por la máscara causal.
             let visibles = desplazamiento + t + 1;
             let mut puntos = vec![0f32; visibles];
 
-            for h in 0..cabezas {
-                let qh = &q[t * ancho_q + h * dim_cabeza..][..dim_cabeza];
-                let grupo = h / por_grupo;
-                let base_kv = grupo * dim_cabeza;
+            let qh = &q[t * ancho_q + h * dim_cabeza..][..dim_cabeza];
+            let base_kv = (h / por_grupo) * dim_cabeza;
 
-                for (p, punto) in puntos.iter_mut().enumerate() {
-                    let kh = &k[p * ancho_kv + base_kv..][..dim_cabeza];
-                    *punto = crate::kernels::dot(qh, kh) * escala;
-                }
-                // La máscara causal ya está aplicada por construcción: solo se
-                // calcularon los puntos visibles, asi que no hace falta
-                // rellenar con -inf y dejar que el softmax lo anule.
-                let _ = softmax(&mut puntos, visibles);
+            for (p, punto) in puntos.iter_mut().enumerate() {
+                let kh = &k[p * ancho_kv + base_kv..][..dim_cabeza];
+                *punto = T::punto(qh, kh) * escala;
+            }
+            // La máscara causal ya está aplicada por construcción: solo se
+            // calcularon los puntos visibles, así que no hace falta rellenar
+            // con -inf y dejar que el softmax lo anule.
+            let _ = softmax(&mut puntos, visibles);
 
-                let destino = &mut fila[h * dim_cabeza..][..dim_cabeza];
-                destino.fill(0.0);
-                for (p, peso) in puntos.iter().enumerate() {
-                    let vh = &v[p * ancho_kv + base_kv..][..dim_cabeza];
-                    for (d, x) in destino.iter_mut().zip(vh) {
-                        *d += peso * x;
-                    }
-                }
+            destino.fill(0.0);
+            for (p, peso) in puntos.iter().enumerate() {
+                let vh = &v[p * ancho_kv + base_kv..][..dim_cabeza];
+                T::sumar(destino, *peso, vh);
             }
         });
     Ok(())
@@ -1538,12 +1841,21 @@ mod tests {
                         .map(|i| ((i * 97 + 29) % 251) as u8)
                         .collect()
                 };
-                for m in [4usize, 37] {
+                // Las dos teselas: por grupos de 128 y de a un trozo. Con 70
+                // filas, el término del desplazamiento va por la GEMM en f32.
+                for (m, grupos) in [
+                    (4usize, true),
+                    (37, true),
+                    (70, true),
+                    (4, false),
+                    (70, false),
+                ] {
                     let x: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.021).cos()).collect();
                     let mut con_buffer = vec![0f32; m * n];
                     let mut bloques = vec![0f32; m * n];
                     matmul_i8_directo((m, k, n), &x, &pesos, tipo, &mut con_buffer).unwrap();
-                    matmul_i8_bloques((m, k, n), &x, &pesos, tipo, &mut bloques).unwrap();
+                    matmul_i8_bloques_con((m, k, n), &x, &pesos, tipo, &mut bloques, grupos)
+                        .unwrap();
                     let escala = con_buffer.iter().fold(0f32, |a, v| a.max(v.abs()));
                     let peor = con_buffer
                         .iter()
@@ -1552,7 +1864,7 @@ mod tests {
                         .fold(0f32, f32::max);
                     assert!(
                         peor <= escala * 1e-4,
-                        "{tipo:?} {m}x{n}: diferencia {peor} sobre {escala}"
+                        "{tipo:?} {m}x{n} (grupos {grupos}): diferencia {peor} sobre {escala}"
                     );
                 }
             }
@@ -1801,6 +2113,43 @@ mod tests {
     /// Las dos propiedades se pueden comprobar sin ninguna otra
     /// implementacion, y juntas atrapan casi cualquier error de signo o de
     /// indice.
+    /// Las tablas de un tramo son las filas de la tabla entera.
+    #[test]
+    fn las_tablas_de_un_tramo_son_las_de_la_tabla_entera() {
+        let (cos, sin) = frecuencias_rope(128, 1e6, 600);
+        let (c, s) = frecuencias_rope_desde(128, 1e6, 333, 200);
+        assert_eq!(c, cos[333 * 64..533 * 64]);
+        assert_eq!(s, sin[333 * 64..533 * 64]);
+    }
+
+    /// La atención sobre el caché en f16 da lo mismo que sobre el mismo caché
+    /// pasado a f32: los valores son los mismos, solo cambia cuándo se
+    /// convierten. Con agrupamiento (4 cabezas en 2 grupos) y con tokens
+    /// nuevos sobre un caché ya lleno.
+    #[test]
+    fn la_atencion_en_f16_da_lo_que_en_f32() {
+        let (tokens, total, cabezas, cabezas_kv, d) = (3, 11, 4, 2, 64);
+        let onda =
+            |n: usize, f: f32| -> Vec<f32> { (0..n).map(|i| (i as f32 * f).sin()).collect() };
+        let q = onda(tokens * cabezas * d, 0.37);
+        let mut k16 = Vec::new();
+        let mut v16 = Vec::new();
+        crate::kernels::sgemm::f32_a_f16_agregar(&onda(total * cabezas_kv * d, 0.11), &mut k16);
+        crate::kernels::sgemm::f32_a_f16_agregar(&onda(total * cabezas_kv * d, 0.23), &mut v16);
+        let mut k32 = vec![0f32; k16.len()];
+        let mut v32 = vec![0f32; v16.len()];
+        crate::kernels::sgemm::f16_a_f32(&k16, &mut k32);
+        crate::kernels::sgemm::f16_a_f32(&v16, &mut v32);
+        let dims = (tokens, total, cabezas, cabezas_kv, d);
+        let mut a = vec![0f32; tokens * cabezas * d];
+        let mut b = vec![0f32; tokens * cabezas * d];
+        atencion(&q, &k32, &v32, dims, &mut a).unwrap();
+        atencion_f16(&q, &k16, &v16, dims, &mut b).unwrap();
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() <= 1e-5 * (1.0 + x.abs()), "{x} contra {y}");
+        }
+    }
+
     #[test]
     fn rope_rota_sin_cambiar_la_norma() {
         let (cabezas, dim) = (2usize, 8usize);

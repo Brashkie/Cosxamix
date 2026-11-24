@@ -41,6 +41,7 @@ fn rmse(a: &[f32], b: &[f32]) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cosxamix::machine_load::antes_de_medir();
     let base = Path::new("modelos/qwen2.5-3b-instruct-q4_k_m.gguf");
     let otros = [
         (

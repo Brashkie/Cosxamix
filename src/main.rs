@@ -575,12 +575,33 @@ fn configurar_hilos() {
     }
 }
 
+/// El nivel de los registros, de `RUST_LOG`: `error`, `warn`, `info` (el de
+/// siempre), `debug` o `trace`. Con la forma de `env-filter`
+/// (`cosxamix=debug,axum=warn`) se toma el nivel más detallado que aparezca:
+/// alcanza para este binario, que registra desde un solo crate, y ahorra el
+/// motor de expresiones regulares que `env-filter` arrastraba.
+fn nivel_de_registro() -> tracing::Level {
+    use tracing::Level;
+    let Ok(v) = std::env::var("RUST_LOG") else {
+        return Level::INFO;
+    };
+    v.split([',', '='])
+        .filter_map(|p| match p.trim().to_ascii_lowercase().as_str() {
+            "error" => Some(Level::ERROR),
+            "warn" => Some(Level::WARN),
+            "info" => Some(Level::INFO),
+            "debug" => Some(Level::DEBUG),
+            "trace" => Some(Level::TRACE),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(Level::INFO)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_max_level(nivel_de_registro())
         .init();
 
     // El motor real si esta compilado Y el modelo esta en su sitio; el de

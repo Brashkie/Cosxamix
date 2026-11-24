@@ -43,6 +43,7 @@ fn medir(repeticiones: usize, mut f: impl FnMut()) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cosxamix::machine_load::antes_de_medir();
     let dir = std::env::var("COSXAMIX_MODELOS").unwrap_or_else(|_| "modelos".into());
 
     println!();

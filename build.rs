@@ -16,6 +16,12 @@ fn main() {
     #[cfg(feature = "c")]
     compilar_c();
 
+    #[cfg(feature = "fortran")]
+    compilar_fortran();
+
+    #[cfg(feature = "ada")]
+    compilar_ada();
+
     comprobar_asm_q4k();
 }
 
@@ -302,6 +308,7 @@ fn compilar_c() {
             "kernels/classify_avx2.c",
             "kernels/q2k_avx2.c",
             "kernels/q5k_avx2.c",
+            "kernels/tile_groups_avx2.c",
         ],
         Ok("aarch64") => &["kernels/neon_dotprod.c", "kernels/q2k_neon.c"],
         _ => return,
@@ -347,6 +354,236 @@ fn compilar_c() {
     }
     println!("cargo:rustc-link-search=native={}", salida.display());
     println!("cargo:rustc-link-lib=static=cosxamix_c");
+}
+
+/// Compila los kernels de Fortran con gfortran, en una librería aparte.
+///
+/// Sin el runtime de Fortran: los kernels son `bind(C)`, sin E/S ni arreglos
+/// asignables, y `-fno-backtrace` y `-fno-stack-protector` sacan las dos cosas
+/// que podrían llamar a libgfortran o a libssp. El objeto enlaza igual con el
+/// linker de MSVC que con el de GNU.
+///
+/// En x86-64 se compila para **x86-64-v3** (AVX2 y FMA): el que llama comprueba
+/// la CPU antes de usarlo, igual que con los intrínsecos de Rust. En ARM64, para
+/// la base, que ya trae NEON.
+///
+/// Qué gfortran: `COSXAMIX_GFORTRAN` si está; si no, en Windows el de MSYS2
+/// (`C:\msys64\ucrt64\bin`), y si no el del PATH. Se comprueba que sea de la
+/// arquitectura del target, porque en Windows es fácil tener a mano un MinGW
+/// de 32 bits que compilaría sin quejarse algo que después no enlaza.
+#[cfg(feature = "fortran")]
+fn compilar_fortran() {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    let arq = std::env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH");
+    let marcha: &[&str] = match arq.as_str() {
+        "x86_64" => &["-march=x86-64-v3"],
+        "aarch64" => &[],
+        _ => return,
+    };
+    println!("cargo:rerun-if-env-changed=COSXAMIX_GFORTRAN");
+    let msys = Path::new(r"C:\msys64\ucrt64\bin\gfortran.exe");
+    let gfortran = std::env::var("COSXAMIX_GFORTRAN").unwrap_or_else(|_| {
+        if cfg!(windows) && msys.exists() {
+            msys.display().to_string()
+        } else {
+            "gfortran".into()
+        }
+    });
+
+    // Su carpeta va primera en el PATH de lo que se lanza: el gfortran de
+    // MSYS2 llamado desde fuera de su consola no encuentra sus DLL ni su `as`,
+    // y falla con código 1 sin decir nada.
+    let path = Path::new(&gfortran)
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| {
+            let mut v = vec![d.to_path_buf()];
+            v.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            std::env::join_paths(v).expect("PATH")
+        });
+    let comando = |programa: &str| {
+        let mut c = Command::new(programa);
+        if let Some(p) = &path {
+            c.env("PATH", p);
+        }
+        c
+    };
+
+    let maquina = comando(&gfortran)
+        .arg("-dumpmachine")
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "no pude ejecutar `{gfortran}`: {e}\n\
+                 La feature `fortran` necesita gfortran (en Windows, el de MSYS2 en\n\
+                 C:\\msys64\\ucrt64\\bin, o la ruta en COSXAMIX_GFORTRAN). Sin la feature\n\
+                 la GEMM usa los intrínsecos de Rust."
+            )
+        });
+    let maquina = String::from_utf8_lossy(&maquina.stdout).trim().to_string();
+    if !maquina.starts_with(&arq) {
+        panic!(
+            "`{gfortran}` compila para {maquina} y el target es {arq}: \
+             apuntá COSXAMIX_GFORTRAN a un gfortran de {arq}"
+        );
+    }
+
+    let salida = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let objeto = salida.join("sgemm_micro_f90.o");
+    let estado = comando(&gfortran)
+        .args([
+            "-c",
+            "-O3",
+            "-fno-backtrace",
+            "-fno-stack-protector",
+            "-fPIC",
+        ])
+        .args(marcha)
+        .arg("-J")
+        .arg(&salida)
+        .arg("kernels/sgemm_micro.f90")
+        .arg("-o")
+        .arg(&objeto)
+        .status();
+    match estado {
+        Ok(s) if s.success() => {}
+        otro => panic!("gfortran no compiló kernels/sgemm_micro.f90: {otro:?}"),
+    }
+
+    // El `ar` de la misma instalación, si está al lado del compilador.
+    let ar = Path::new(&gfortran)
+        .parent()
+        .map(|d| d.join(if cfg!(windows) { "ar.exe" } else { "ar" }))
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "ar".into());
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS");
+    let lib = salida.join(if target_os == "windows" {
+        "cosxamix_fortran.lib"
+    } else {
+        "libcosxamix_fortran.a"
+    });
+    let _ = std::fs::remove_file(&lib);
+    match comando(&ar).arg("rcs").arg(&lib).arg(&objeto).status() {
+        Ok(s) if s.success() => {}
+        otro => panic!("`{ar}` no armó la librería de Fortran: {otro:?}"),
+    }
+    println!("cargo:rustc-link-search=native={}", salida.display());
+    println!("cargo:rustc-link-lib=static=cosxamix_fortran");
+}
+
+/// Compila las comprobaciones de SPARK (`ada/src/`) con el gcc de GNAT.
+///
+/// `-gnatp` quita los chequeos en tiempo de ejecución: GNATprove ya demostró
+/// que ninguno puede fallar (desde `ada/`: `alr -n build` y `alr -n exec --
+/// gnatprove -P cosxamix_checks.gpr --level=4 -j0 --checks-as-errors=on`). Un
+/// paquete `Pure`, sin elaboración y sin divisiones de 128 bits no deja ningún
+/// símbolo sin resolver, y el objeto enlaza también con el linker de MSVC.
+///
+/// Qué gcc: `COSXAMIX_GNAT_GCC`; si no, el de `gnat_native` en la caché de
+/// Alire; si no, el del PATH, que es lo que deja `alr exec`.
+#[cfg(feature = "ada")]
+fn compilar_ada() {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    println!("cargo:rerun-if-changed=ada/src/");
+    println!("cargo:rerun-if-env-changed=COSXAMIX_GNAT_GCC");
+    let exe = if cfg!(windows) { "gcc.exe" } else { "gcc" };
+    let de_alire = || -> Option<PathBuf> {
+        let base = if cfg!(windows) {
+            PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("alire")
+        } else {
+            PathBuf::from(std::env::var_os("HOME")?).join(".local/share/alire")
+        };
+        let mut candidatos: Vec<PathBuf> = std::fs::read_dir(base.join("cache/toolchains"))
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("gnat_native"))
+            })
+            .map(|p| p.join("bin").join(exe))
+            .filter(|p| p.exists())
+            .collect();
+        candidatos.sort();
+        candidatos.pop()
+    };
+    let gcc = std::env::var("COSXAMIX_GNAT_GCC")
+        .ok()
+        .or_else(|| de_alire().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| "gcc".into());
+
+    // Como con gfortran: la carpeta del compilador primera en el PATH, para
+    // que encuentre su `as` y sus DLL.
+    let path = Path::new(&gcc)
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| {
+            let mut v = vec![d.to_path_buf()];
+            v.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            std::env::join_paths(v).expect("PATH")
+        });
+    let comando = |programa: &str| {
+        let mut c = Command::new(programa);
+        if let Some(p) = &path {
+            c.env("PATH", p);
+        }
+        c
+    };
+
+    let salida = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let mut objetos = Vec::new();
+    // Las unidades de `ada/src/`; una nueva se agrega acá.
+    const UNIDADES: &[&str] = &["gguf_bounds"];
+    for unidad in UNIDADES {
+        let objeto = salida.join(format!("{unidad}.o"));
+        let estado = comando(&gcc)
+            .args(["-c", "-O2", "-gnatp", "-gnatn", "-gnat2022", "-fPIC"])
+            .arg("-Iada/src")
+            .arg(format!("ada/src/{unidad}.adb"))
+            .arg("-o")
+            .arg(&objeto)
+            .current_dir(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
+            .status();
+        match estado {
+            Ok(s) if s.success() => {}
+            Ok(s) => panic!("GNAT no compiló ada/src/{unidad}.adb ({s:?})"),
+            Err(e) => panic!(
+                "no pude ejecutar `{gcc}`: {e}\n\
+                 La feature `ada` necesita el gcc de GNAT: con Alire instalado se\n\
+                 busca solo; si no, la ruta en COSXAMIX_GNAT_GCC. Sin la feature rige\n\
+                 la misma regla escrita en Rust."
+            ),
+        }
+        objetos.push(objeto);
+    }
+
+    let ar = Path::new(&gcc)
+        .parent()
+        .map(|d| d.join(if cfg!(windows) { "ar.exe" } else { "ar" }))
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "ar".into());
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS");
+    let lib = salida.join(if target_os == "windows" {
+        "cosxamix_ada.lib"
+    } else {
+        "libcosxamix_ada.a"
+    });
+    let _ = std::fs::remove_file(&lib);
+    match comando(&ar).arg("rcs").arg(&lib).args(&objetos).status() {
+        Ok(s) if s.success() => {}
+        otro => panic!("`{ar}` no armó la librería de Ada: {otro:?}"),
+    }
+    println!("cargo:rustc-link-search=native={}", salida.display());
+    println!("cargo:rustc-link-lib=static=cosxamix_ada");
 }
 
 /// Cada plataforma nombra sus librerías estáticas a su manera, y `zig

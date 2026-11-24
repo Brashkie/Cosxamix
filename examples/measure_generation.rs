@@ -16,6 +16,7 @@ use cosxamix::engine::{Mensaje, Motor, Peticion};
 use cosxamix::engine_own::MotorPropio;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cosxamix::machine_load::antes_de_medir();
     let a: Vec<String> = std::env::args().skip(1).collect();
     if a.len() < 2 {
         println!("  uso: measure_generation modelo.gguf tokenizer.json [tokens]");

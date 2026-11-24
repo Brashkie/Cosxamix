@@ -56,5 +56,11 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Lo que generan Alire y GNATprove en ada/: la toolchain, los objetos y la
+# configuracion que escribe `alr build`.
+ada/alire/
+ada/obj/
+ada/config/
+
 # La salida de examples/measure_image.rs.
 imagen.ppm

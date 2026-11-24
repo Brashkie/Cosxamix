@@ -235,6 +235,7 @@ fn cargar(ruta: &std::path::Path, nombre: &str) -> Result<Matriz, Box<dyn std::e
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cosxamix::machine_load::antes_de_medir();
     let dir = std::env::var("COSXAMIX_MODELOS").unwrap_or_else(|_| "modelos".into());
     let dir = std::path::Path::new(&dir);
     let entrenado = dir.join("qwen2.5-0.5b-instruct-q4_k_m.gguf");

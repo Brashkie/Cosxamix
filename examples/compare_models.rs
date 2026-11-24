@@ -7,8 +7,11 @@
 //!
 //!   cargo run --release --example compare_models
 //!   cargo run --release --example compare_models -- --cuant
+//!   cargo run --release --example compare_models -- --qwen3
+//!   cargo run --release --example compare_models -- --e8
 //!
-//! `--cuantizador` compara el Q3_K_M oficial con el recuantizado por nosotros.
+//! `--cuantizador` compara el Q3_K_M oficial con el recuantizado por nosotros, y
+//! `--qwen3` el Qwen2.5-3B de por defecto con el Qwen3-4B-Instruct-2507.
 //!
 //! Con esta batería el motor propio reemplazó al de candle en la 0.6.0 (11 de
 //! 15 contra 10, DECISIONES §23); el de candle salió en la 0.11.0.
@@ -185,6 +188,7 @@ fn medir_con(nombre: &str, gguf: &str, tok: &str) {
 }
 
 fn main() {
+    cosxamix::machine_load::antes_de_medir();
     // Por defecto compara los tres tamaños; con `--cuant` compara las
     // cuantizaciones del 3B, que es otra pregunta: ahí el modelo es el mismo y
     // lo único que cambia es cuántos bytes pesa cada peso.
@@ -202,6 +206,33 @@ fn main() {
                 "3b-q3_k_m nuestro",
                 "modelos/qwen2.5-3b-q3_k_m-cosxamix.gguf",
             ),
+        ] {
+            medir_con(nombre, gguf, "modelos/tokenizer-3b.json");
+        }
+        return;
+    }
+
+    // Pesos como fórmulas (ROADMAP 12): el 0,5B en F16 contra sus copias con
+    // las matrices por Q3_K, Q2_K y E8 girado y de vuelta (`measure_lattice
+    // simular`). Mide la inteligencia que deja cada esquema, sin kernel.
+    if std::env::args().any(|a| a == "--e8") {
+        for (nombre, gguf) in [
+            ("0.5b f16", "modelos/qwen2.5-0.5b-instruct-fp16.gguf"),
+            ("0.5b q3k (3,44 bits)", "modelos/sim-0.5b-q3k.gguf"),
+            ("0.5b q2k (2,63 bits)", "modelos/sim-0.5b-q2k.gguf"),
+            ("0.5b e8 girado (2,06 bits)", "modelos/sim-0.5b-e8.gguf"),
+        ] {
+            medir_con(nombre, gguf, "modelos/tokenizer.json");
+        }
+        return;
+    }
+
+    // La generación siguiente contra la de por defecto, en el mismo formato:
+    // lo que se gana en acierto y lo que se paga en velocidad y memoria.
+    if std::env::args().any(|a| a == "--qwen3") {
+        for (nombre, gguf) in [
+            ("qwen2.5-3b", "modelos/qwen2.5-3b-instruct-q3_k_m.gguf"),
+            ("qwen3-4b", "modelos/qwen3-4b-instruct-2507-q3_k_m.gguf"),
         ] {
             medir_con(nombre, gguf, "modelos/tokenizer-3b.json");
         }

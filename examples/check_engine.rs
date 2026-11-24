@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Instant;
 
 fn main() {
+    cosxamix::machine_load::antes_de_medir();
     let gguf = Path::new("modelos/qwen2.5-0.5b-instruct-q4_k_m.gguf");
     let tok = Path::new("modelos/tokenizer.json");
 

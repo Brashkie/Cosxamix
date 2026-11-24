@@ -320,6 +320,7 @@ mod medir {
 
 #[cfg(target_arch = "x86_64")]
 fn main() {
+    cosxamix::machine_load::antes_de_medir();
     use cosxamix::gguf::TipoGgml;
     use cosxamix::quant::cuantizar_bloques;
     use medir::*;
