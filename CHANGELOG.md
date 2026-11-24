@@ -56,6 +56,9 @@ acá va qué cambió, no por qué.
   todo el contexto (134 MB menos en Qwen3-4B, 16,8 en el 3B) y SwiGLU va en su
   sitio en vez de a un búfer nuevo por capa. Memoria privada en el pico del
   primer mensaje: 189 → 159 MB en el 3B y 381 → 237 MB en Qwen3-4B.
+  `daiss::Config::bytes_de_cache_por_token` cuenta el caché en f16, como lo
+  guarda el motor: las tablas de daiss de los README y del ROADMAP pasan a la
+  mitad (daiss-3b, 36 KB por token en vez de 72).
   `machine_load::memoria()` lee la privada y la residente, y `measure_response`
   las muestra (DECISIONES §39).
 - **`measure_lattice`**, el primer experimento de «pesos como fórmulas»

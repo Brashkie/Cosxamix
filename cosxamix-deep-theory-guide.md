@@ -7,8 +7,8 @@
 >
 > | | |
 > | :--- | :--- |
-> | **Implementado** | §2.1, §2.2 · §3 · §5.1, §5.2 · §6 completo |
-> | **Diseño previsto** | §2.3 (RoPE) · §2.4 (PagedAttention) · §4 (memoria) · §5.3 (tabla de punteros) |
+> | **Implementado** | §2.1, §2.2 · §2.3 (RoPE, en la variante de mitades) · §3 · §4.1 (`mmap`) · §5.1, §5.2 · §6 completo |
+> | **Diseño previsto** | §2.4 (PagedAttention) · §4.2 (páginas grandes) · §4.3 (arena) · §5.3 (tabla de punteros) |
 >
 > Las cifras del §6 salen de `cargo bench` sobre el código de este
 > repositorio, no de estimaciones.
@@ -89,8 +89,12 @@ Un aspecto crítico documentado en las pruebas de referencia de Cosxamix es la p
 
 ### 2.3 Embebidos de Posición Rotacional (RoPE)
 
-> **Diseño previsto, todavía no implementado.** Lo que sigue describe la
-> dirección decidida, no código que exista hoy en el repositorio.
+> **Implementado**, en `ops::rope`, con una diferencia con lo que sigue: Qwen2 y
+> Qwen3 usan la variante de **mitades partidas** —el valor `i` de cada cabeza
+> rota contra el `i + d/2`—, no la de pares contiguos `(2i, 2i+1)` que se
+> escribe abajo. La matemática es la misma rotación; cambia qué par se rota.
+> Las tablas de senos y cosenos se calculan por tanda de tokens desde la
+> 0.12.0, con el ángulo en f64 (`ops::frecuencias_rope_desde`).
 
 RoPE codifica la información posicional relativa aplicando una matriz de rotación ortogonal a los vectores de consulta y clave en el espacio complejo bidimensional.
 
@@ -106,8 +110,11 @@ Donde $\tilde{\mathbf{x}}_{[2i:2i+1]} = (-x_{2i+1}, x_{2i})$. La vectorización 
 
 ### 2.4 PagedAttention y Estructura del Caché KV
 
-> **Diseño previsto, todavía no implementado.** Lo que sigue describe la
-> dirección decidida, no código que exista hoy en el repositorio.
+> **Diseño previsto, todavía no implementado.** Lo que hay hoy es más simple:
+> un caché contiguo por capa y por conversación, **en f16** desde la 0.12.0, y
+> el prefijo común entre conversaciones copiado de una a otra
+> (`forward::Cache::prefijo`). Lo que sigue describe la dirección, no código
+> que exista.
 
 Para erradicar la fragmentación externa de la memoria RAM provocada por la asignación de tensores contiguos masivos para el caché KV, Cosxamix implementa el concepto de PagedAttention.
 
@@ -162,8 +169,12 @@ Al especificar la bandera `-mcpu=x86_64_v3` (que habilita el conjunto de instruc
 
 ## 4. Sistemas de Memoria de Altísimo Rendimiento: `mmap`, Jerarquía de Caché y Zero-Allocation
 
-> **Diseño previsto, todavía no implementado.** Lo que sigue describe la
-> dirección decidida, no código que exista hoy en el repositorio.
+> **Mitad implementado.** El §4.1 sí: los pesos se mapean de solo lectura con
+> `memmap2` (`gguf::Pesos`) y no se copian, y el sistema los suelta si necesita
+> la RAM ([DECISIONES §18](DECISIONES.md)). **El §4.2 (páginas grandes con
+> `MAP_HUGETLB`) y el §4.3 (arena sin asignaciones) no existen**: el forward
+> reusa sus búferes dentro de una llamada, y la memoria privada del proceso se
+> mide con `machine_load::memoria` ([DECISIONES §39](DECISIONES.md)).
 
 El diseño de la capa de gestión de memoria determina la capacidad de un runtime para operar en entornos con restricciones severas de RAM, como teléfonos móviles ejecutando Termux o sistemas incrustados.
 
@@ -284,6 +295,8 @@ Cosxamix asigna a cada lenguaje una responsabilidad técnica concreta dentro de 
 | **C++** | Interoperabilidad con motores maduros (llama.cpp/ONNX). | Reutilización de implementaciones complejas de cuantización. | Unicamente si aporta un backend de ejecución maduro no reescrito. |
 | **D** | Experimentos de kernels numéricos de alto rendimiento. | Expresividad matemática avanzada y metaprogramación con metaplantillas. | Debe demostrar un rendimiento superior en prototipos específicos. |
 | **ASM** | Microkernels de máxima optimización (AVX-512 / NEON). | Control total sobre la asignación de registros y la tubería de instrucciones. | Reservado exclusivamente para rutas críticas donde los compiladores fallan. |
+| **Fortran** | El microkernel de la GEMM en f32 (`kernels/sgemm_micro.f90`, feature `fortran`). | Arreglos sin aliasing: de un bucle de cuatro líneas gfortran saca las mismas FMA que los intrínsecos. | Empata en x86-64; se queda por ARM64, donde Rust solo tiene el escalar. |
+| **Ada / SPARK** | La validación de los límites de cada tensor de un GGUF (`ada/src/gguf_bounds`, feature `ada`). | Demostración formal: sin desbordes y la regla exacta, 110 obligaciones. | Lo que entra por archivo y no por cuenta: verificación, no velocidad. |
 
 ### 5.3 Selección Dinámica de Backend en Tiempo de Ejecución (*Dynamic Dispatch*)
 

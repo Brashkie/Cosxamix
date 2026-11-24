@@ -21,7 +21,7 @@ dialecto que Ollama para poder reemplazarlo sin tocar a quien lo llama.
 | [CHANGELOG.md](CHANGELOG.md) | qué cambió en cada versión |
 | [ROADMAP.md](ROADMAP.md) | qué falta, en qué orden, y qué quedó cerrado |
 | [cosxamix-deep-theory-guide.md](cosxamix-deep-theory-guide.md) | la teoría de fondo; cada sección marca si está implementada o es diseño previsto |
-| [THIRD-PARTY.md](THIRD-PARTY.md) | el único archivo copiado de otro proyecto, de dónde sale y por qué |
+| [THIRD-PARTY.md](THIRD-PARTY.md) | las licencias de los modelos que usa y de las dependencias; desde la 0.11.0 no hay código copiado de otro proyecto |
 
 ---
 
@@ -151,6 +151,17 @@ Variables de entorno:
 | `COSXAMIX_PRECARGA` | `2` | Cuántas filas por delante pide el decode a la caché mientras calcula una; `0` la apaga ([DECISIONES §33](DECISIONES.md)) |
 | `COSXAMIX_SIN_Q5K_FUSIONADO` | sin definir | Apaga el kernel fusionado de Q5_K, para medir con y sin él ([DECISIONES §34](DECISIONES.md)) |
 | `COSXAMIX_IMAGEN_LIBERAR_MIN` | `10` | Minutos sin pedidos de imagen antes de liberar el modelo (2,6 GB de pico) |
+| `COSXAMIX_TESELA` | sin definir | `vieja` vuelve a la tesela del prefill de antes de la 0.12.0 y `c` usa la de C, para comparar ([DECISIONES §38](DECISIONES.md)) |
+| `COSXAMIX_SGEMM_MICRO` | `rust` | `fortran` usa el microkernel de Fortran en la GEMM en f32, con la feature `fortran` ([DECISIONES §37](DECISIONES.md)) |
+| `RUST_LOG` | `info` | El nivel del registro: `error`, `warn`, `info`, `debug` o `trace` |
+
+Y para compilar y medir:
+
+| | |
+|---|---|
+| `COSXAMIX_ESPERAR_CPU` | Segundos que un ejemplo de medición espera a que la CPU baje del 15% antes de medir; sin ella, solo avisa ([DECISIONES §37](DECISIONES.md)) |
+| `COSXAMIX_GFORTRAN` | El gfortran de la feature `fortran`; sin ella se busca el de MSYS2 en Windows y el del PATH |
+| `COSXAMIX_GNAT_GCC` | El gcc de GNAT de la feature `ada`; sin ella se busca en la caché de Alire y en el PATH |
 
 **Todos los `.gguf` del directorio se registran**, no solo el de
 `COSXAMIX_GGUF`: esa variable dice cuál se precalienta, no cuál es el único
@@ -177,14 +188,28 @@ equivocado no da error: da texto sin sentido.
 cargo run --release --features zig,c                # texto e imágenes, con los kernels de Zig y C: 72 crates
 ```
 
+Las features: `zig` y `c` (kernels, piden Zig), `training` (entrenar),
+`asm_q4k` y `asm_q3k` (los kernels en ensamblador), `fortran` (pide gfortran) y
+`ada` (pide GNAT; con Alire instalado se encuentra sola). Ninguna está por
+defecto, y sin ninguna Cosxamix compila y anda con Rust y AVX2.
+
 Lo que comprueba cada cosa, y se corre igual en local que en CI:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --features zig,c,training --all-targets -- -D warnings
 cargo test --features zig,c,training                 # ninguno necesita un modelo
+cargo test --features fortran,ada                    # si están gfortran y GNAT
 python scripts/check_docs.py                         # tablas, enlaces y nombres viejos
 python scripts/check_kernel_arch.py "" x86_64        # que el kernel sea del target
+cargo run --release --example check_models           # que todo GGUF de modelos/ pase la regla de límites
+```
+
+Y la demostración de SPARK, desde `ada/`:
+
+```bash
+alr -n build
+alr -n exec -- gnatprove -P cosxamix_checks.gpr --level=4 -j0 --checks-as-errors=on
 ```
 
 **`RUSTFLAGS` no se usa para nada acá, y es a propósito.** Esa variable de
@@ -196,9 +221,12 @@ avisos se deniegan pasándoselos a clippy como argumento suyo.
 
 ### Los dos workflows
 
-`ci.yml` corre en cada push: la matriz de Linux, Windows y macOS por las dos
-combinaciones de features, los kernels de Zig con sus tests de equivalencia,
-**el cruce a `aarch64`**, y la documentación.
+`ci.yml` corre en cada push: la matriz de Linux, Windows y macOS por las
+combinaciones de features, los kernels de Zig y C con sus tests de
+equivalencia (y el de Fortran, con gfortran), **el cruce a `aarch64`**, la
+ejecución en un runner ARM64 nativo —que además mide la GEMM en f32 sin y con
+Fortran—, la demostración de SPARK con GNATprove y los tests con la feature
+`ada`, y la documentación.
 
 El job del cruce no está por completitud. Zig está en el proyecto porque es la
 única ruta vectorizada en ARM y Android; si cruzar dejara de funcionar, los
@@ -211,7 +239,7 @@ argumento y Zig lo quiere en dos.
 | plataforma | kernels | por qué |
 |---|---|---|
 | Linux x86-64 · Windows x86-64 · macOS Intel | AVX2 de Rust | Zig pierde 3-8% ahí, [medido](#lo-que-midió-el-primer-kernel) |
-| Linux ARM64 · Android ARM64 · macOS Apple Silicon | NEON por Zig | es la única ruta vectorizada que existe |
+| Linux ARM64 · Android ARM64 · macOS Apple Silicon | NEON por Zig, y `sdot` por C (`zig,c`) | sin ellos la multiplicación cuantizada cae al escalar |
 
 Un archivo por plataforma, sin DLL ni `.so` al lado, cada uno con su
 `.sha256`. macOS Intel se cruza desde el runner ARM en vez de pedir un runner
@@ -226,8 +254,9 @@ otro baja bien y falla al ejecutarse.
 Está en **[ROADMAP.md](ROADMAP.md)**, con el estado medido arriba y el orden
 puesto por cuánto mueve la latencia, no por cuán interesante es de programar.
 
-En resumen: **leer el prompt** ya va 1,7x más rápido que en la 0.6.0, y el
-comienzo del *system* se lee una sola vez para todos los chats (0.7.0).
+En resumen: **leer el prompt** va a ~57 tok/s en el 3B desde la 0.12.0
+(~47 antes, y 1,7x lo de la 0.6.0), y el comienzo del *system* se lee una sola
+vez para todos los chats (0.7.0).
 **Generar** está al **~81-87% del techo de memoria** medido (~30 GB/s,
 DDR4-2133), con la precarga de la 0.9.0 ([DECISIONES §33](DECISIONES.md)); el
 51% que se decía antes se calculaba contra un techo que esta RAM no puede dar. Lo
@@ -235,6 +264,12 @@ que queda es poco y está en los kernels. Que de 6 núcleos salgan 2,6x en vez d
 6x **ya tiene explicación**: un hilo solo lee 19 GB/s y con 4 la RAM se satura.
 La decodificación especulativa sigue fuera: con el motor cerca del techo, la
 cuenta todavía no da (ROADMAP §5).
+
+Lo que más puede mover el techo ahora es **pesos como fórmulas** (ROADMAP §12):
+cuantizar de a 8 pesos con la red E8 dio, en el 0,5B entero, los aciertos de
+Q3_K con 2,06 bits por peso en vez de 3,44 ([DECISIONES §40](DECISIONES.md)).
+Si se sostiene en el 3B, el modelo pesaría la mitad, y el decode, que va al
+ritmo de la RAM, iría cerca del doble.
 
 Más adelante, en un proyecto aparte, va a nacer **QCML** (`.qcml`, *Quantum
 Compression for Machine Learning*): un formato propio que quiere **superar a GGUF
@@ -252,11 +287,13 @@ tamaños que el proyecto define, inicializa y escribe como GGUF:
 
 | modelo | parámetros | Q8_0 | caché/token |
 |---|---:|---:|---:|
-| daiss-mini | 0,08 B | 0,08 GB | 6,0 KB |
-| daiss-0.5b | 0,63 B | 0,62 GB | 24,0 KB |
-| daiss-3b | 3,40 B | 3,36 GB | 72,0 KB |
-| daiss-7b | 7,61 B | 7,54 GB | 112,0 KB |
-| daiss-14b | 14,77 B | 14,62 GB | 384,0 KB |
+| daiss-mini | 0,08 B | 0,08 GB | 3,0 KB |
+| daiss-0.5b | 0,63 B | 0,62 GB | 12,0 KB |
+| daiss-3b | 3,40 B | 3,36 GB | 36,0 KB |
+| daiss-7b | 7,61 B | 7,54 GB | 56,0 KB |
+| daiss-14b | 14,77 B | 14,62 GB | 192,0 KB |
+
+El caché de atención va en f16 desde la 0.12.0; en f32 era el doble.
 
 ```
 cargo run --release --example create_daiss
@@ -265,7 +302,8 @@ COSXAMIX_DAISS=daiss-7b cargo run --release --example create_daiss
 
 Se generan en flujo y en paralelo, con el pico de memoria acotado a 16 MB sea
 cual sea el tamaño, y con semilla: la misma semilla da el mismo archivo byte
-por byte. El daiss-7b está creado y candle lo lee con cero diferencias.
+por byte. El daiss-7b está creado, y lo leyó candle con cero diferencias
+cuando todavía estaba en el proyecto; hoy lo lee el motor propio.
 
 Y con el tokenizador propio —`src/tokenizer.rs`, un BPE a nivel de bytes
 entrenado por el proyecto— el vocabulario baja de 151.936 piezas a 8.192 a
@@ -365,7 +403,7 @@ El 3B en Q3_K_M, medido con las mismas 15 preguntas de respuesta verificable
 | 0,5B Q4_K_M | 504 MB | 7/15 |
 | 1,5B Q4_K_M | 1108 MB | 8/15 |
 | 3B Q2_K | 1313 MB | 6/15, se rompe |
-| **3B Q3_K_M** | **1644 MB** | **10/15** |
+| **3B Q3_K_M** | **1644 MB** | **10/15** (11/15 con el motor propio) |
 | 3B Q4_K_M | 2007 MB | 10/15 |
 | **Qwen3-4B-Instruct-2507 Q3_K_M** | **1979 MB** | **14/15** |
 
@@ -389,7 +427,15 @@ se puede usar con fines comerciales. `compare_models -- --qwen3` lo repite.
 - **Caché de atención por sesión**: cada conversación guarda el suyo, y el
   delta de un mensaje nuevo entra sin recalcular lo anterior.
 - **Memoria ≈ el archivo**: los pesos se mapean y la tabla de embeddings se lee
-  fila por fila; un modelo ocupa en RAM 1,02-1,08x lo que pesa en disco.
+  fila por fila; un modelo ocupa en RAM 1,02-1,08x lo que pesa en disco. Lo
+  que el motor pide aparte —activaciones, búferes, caché— es ~150 MB de pico
+  en el primer mensaje del 3B, y 192 MB en Qwen3-4B ([DECISIONES §39](DECISIONES.md)).
+- **El caché de atención va en f16**, la mitad que en f32, y la atención se
+  reparte por token y cabeza: en el decode corría en un solo hilo. Desde la
+  0.12.0, +9% de decode en el 3B y +27% en Qwen3-4B.
+- **Cada tensor de un GGUF se valida al abrirlo**: cuántos valores, cuántos
+  bytes y que caigan dentro del archivo, sin desbordes. Con la feature `ada`
+  lo decide una regla demostrada con SPARK ([DECISIONES §41](DECISIONES.md)).
 - **La decodificación especulativa** se implementó, se midió y se borró en la
   época de candle; cuándo vuelve a tener sentido está en el
   [ROADMAP](ROADMAP.md) §5.
@@ -434,6 +480,8 @@ cargo bench --features zig      # la regla 3, ejecutable
 cargo test  --features asm_q4k  # los kernels escritos en ensamblador
 cargo test  --features asm_q3k  # el Q3_K en ensamblador
 cargo test  --features c        # los kernels en C (pide Zig, por `zig cc`)
+cargo test  --features fortran  # el de Fortran (pide gfortran)
+cargo test  --features ada      # la regla de límites demostrada con SPARK (pide GNAT)
 ```
 
 ### Lo que midió el primer kernel

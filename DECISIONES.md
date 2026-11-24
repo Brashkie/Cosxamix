@@ -17,7 +17,7 @@ lo que había, o por habilitar una plataforma donde no había nada.
 | 2 | candle como motor, no llama.cpp | adoptado |
 | 3 | Frontera de kernels con Zig | adoptado, por cobertura |
 | 4 | D en el camino crítico | descartado |
-| 5 | ASM, Fortran y Ada en la frontera | qué falta para que entren |
+| 5 | ASM, Fortran y Ada en la frontera | ASM dentro; Fortran y Ada, desde la 0.12.0 (§37, §41) |
 | 6 | Embeddings sin descuantizar | adoptado, −431 MB |
 | 7 | Caché de atención por sesión | adoptado, −76% al intercalar |
 | 8 | Qwen2.5-3B en vez de 0,5B o 1,5B | adoptado |
@@ -27,6 +27,33 @@ lo que había, o por habilitar una plataforma donde no había nada.
 | 12 | Redes de tensores (MPS) | aplazado, ataca el lado equivocado |
 | 13 | QNLP / DisCoCat | fuera de alcance |
 | 14 | El nombre: Cosxamix | adoptado, verificado en 9 fuentes |
+| 15 | La comprobación de límites costaba más que todos los kernels | arreglado |
+| 16 | daiss: qué es nuestro y por qué dice `qwen2` | adoptado |
+| 17 | El disco hace 41 MB/s | medido, cambia cuentas |
+| 18 | `mmap` para los pesos | adoptado, 1,25x en la carga |
+| 19 | El tokenizador propio | adoptado, 3,4% más tokens, modelo 9x más chico |
+| 20 | Zig se compila para lo mismo que Rust | adoptado |
+| 21 | Q3_K en tres lenguajes | el algoritmo dio 1,65x, el lenguaje nada |
+| 22 | `sdot` desde C | adoptado en ARM |
+| 23 | El motor propio, por defecto | adoptado, 11/15 contra 10 |
+| 24 | La matmul por bloques del prefill | adoptado |
+| 25 | El decode, medido dentro del forward | medido |
+| 26 | El prefijo entre conversaciones | adoptado |
+| 27 | `tokenizers` fuera del motor | adoptado |
+| 28 | Escribir k-quants | adoptado |
+| 29 | Chavín, el modelo grande | escrito, 2,38 tok/s |
+| 30 | El kernel de Q2_K | adoptado |
+| 31 | JSON: dónde está y dónde no | decidido |
+| 32 | Entrenar desde cero | adoptado, por debajo de `xz` |
+| 33 | El techo de verdad | ~81-87% del techo de memoria |
+| 34 | El kernel de Q5_K | adoptado |
+| 35 | Q3_K por hilo | cerrado: no queda más sin perder precisión |
+| 36 | Sin candle | adoptado: imágenes 2,3x, LoRA 1,9x |
+| 37 | Qwen3 y el primer kernel en Fortran | adoptados; Fortran empata en x86 |
+| 38 | El prefill de 47 a 57 tok/s, binario −22% | adoptado |
+| 39 | La memoria del motor; caché en f16, atención por cabeza | adoptado |
+| 40 | Pesos como fórmulas: E8 | primer filtro pasado, falta el kernel |
+| 41 | Ada/SPARK: los límites de cada tensor | adoptado, 110 obligaciones |
 | A-D | [las cuatro investigaciones recibidas](#apéndice-las-investigaciones-recibidas-una-por-una) | qué se tomó de cada una |
 
 ---
@@ -569,6 +596,12 @@ inercia. Sus arreglos no admiten aliasing por defecto, y eso le deja al
 compilador vectorizar sin las comprobaciones que un `*mut f32` de C obliga a
 hacer. `gfortran` y `flang` generan código numérico excelente.
 
+> **Actualización, 0.12.0: entró.** Con el gfortran 16.1 de 64 bits de MSYS2
+> (`C:\msys64\ucrt64`), `kernels/sgemm_micro.f90` es el microkernel de la GEMM
+> en f32: empata con los intrínsecos de Rust en x86-64, igual bit a bit, y en
+> ARM64 va por defecto ([§37](#37-qwen3-y-el-primer-kernel-en-fortran)). Lo
+> que sigue es como estaba antes, que es lo que explica por qué tardó.
+
 **Se intentó medirlo y está bloqueado por el toolchain, no por el argumento.**
 El `gfortran` de esta máquina es MinGW de 32 bits —`-dumpmachine` dice
 `mingw32` y el objeto que produce es COFF i386— mientras que Rust compila para
@@ -597,6 +630,13 @@ más fuerte que uno probado con casos.
 **No hay compilador instalado en esta máquina** —ni `gnat` ni `gnatmake`—, así
 que tampoco se pudo probar. Es lo primero que haría falta para pasar de la idea
 al dato.
+
+> **Actualización, 0.12.0: entró, y por la verificación, como decía arriba.**
+> Con Alire (GNAT y GNATprove 16.1), `ada/src/gguf_bounds` decide los límites
+> de cada tensor de un GGUF, con 110 obligaciones demostradas: sin desbordes, y
+> la regla exacta ([§41](#41-adaspark-los-límites-de-cada-tensor-demostrados)).
+> No es un kernel de cómputo sino la validación de lo que viene del archivo,
+> que es donde un error no da un número peor sino una lectura fuera de lugar.
 
 ### La regla sigue siendo la misma
 
@@ -2066,7 +2106,7 @@ Las medidas de `chavin-30b` salen del hardware y no de un modelo ajeno:
 |---|---:|
 | parámetros | 29,50 B (72 capas, ancho 6144, FFN 16384) |
 | Q2_K / Q3_K / Q8_0 | 9,02 / 11,81 / 29,20 GB |
-| caché por token | 288 KB |
+| caché por token | 288 KB en f32; 144 KB en f16 desde la 0.12.0 |
 | escribirlo, en Q2_K | 870 s, 16 MB de memoria de trabajo |
 | cargarlo, desde este disco | 240 s, y 124 s más la primera respuesta |
 | **generar** | **2,38 tok/s** |

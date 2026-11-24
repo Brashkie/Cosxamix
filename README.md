@@ -22,7 +22,7 @@ it.
 | [CHANGELOG.md](CHANGELOG.md) | what changed in each version |
 | [ROADMAP.md](ROADMAP.md) | what's left, in what order, and what is settled |
 | [cosxamix-deep-theory-guide.md](cosxamix-deep-theory-guide.md) | the underlying theory; each section states whether it is implemented or planned |
-| [THIRD-PARTY.md](THIRD-PARTY.md) | the one file copied from another project, where it comes from and why |
+| [THIRD-PARTY.md](THIRD-PARTY.md) | the licenses of the models it uses and of the dependencies; since 0.11.0 no code is copied from another project |
 
 The four documents above are **written in Spanish**, and deliberately so: they
 carry every measurement with its context, and keeping two copies of a number is
@@ -157,6 +157,17 @@ Environment variables:
 | `COSXAMIX_PRECARGA` | `2` | Rows ahead that the decode asks the cache for while it computes one; `0` turns it off ([DECISIONES §33](DECISIONES.md)) |
 | `COSXAMIX_SIN_Q5K_FUSIONADO` | unset | Turns off the Q5_K fused kernel, to measure with and without it ([DECISIONES §34](DECISIONES.md)) |
 | `COSXAMIX_IMAGEN_LIBERAR_MIN` | `10` | Minutes without image requests before the model (2.6 GB peak) is released |
+| `COSXAMIX_TESELA` | unset | `vieja` goes back to the pre-0.12.0 prefill tile and `c` uses the C one, to compare ([DECISIONES §38](DECISIONES.md)) |
+| `COSXAMIX_SGEMM_MICRO` | `rust` | `fortran` uses the Fortran microkernel in the f32 GEMM, with the `fortran` feature ([DECISIONES §37](DECISIONES.md)) |
+| `RUST_LOG` | `info` | The log level: `error`, `warn`, `info`, `debug` or `trace` |
+
+And for building and measuring:
+
+| | |
+|---|---|
+| `COSXAMIX_ESPERAR_CPU` | Seconds a measuring example waits for the CPU to drop below 15% before measuring; without it, it only warns ([DECISIONES §37](DECISIONES.md)) |
+| `COSXAMIX_GFORTRAN` | The gfortran for the `fortran` feature; otherwise MSYS2's on Windows, or the one in PATH |
+| `COSXAMIX_GNAT_GCC` | GNAT's gcc for the `ada` feature; otherwise it is looked up in the Alire cache and in PATH |
 
 **Every `.gguf` in the directory is registered**, not only the one in
 `COSXAMIX_GGUF`: that variable says which one is pre-warmed, not which one
@@ -183,14 +194,28 @@ tokenizer doesn't raise an error: it produces nonsense.
 cargo run --release --features zig,c                # text and images, with the Zig and C kernels: 72 crates
 ```
 
+The features: `zig` and `c` (kernels, they need Zig), `training` (training),
+`asm_q4k` and `asm_q3k` (the assembly kernels), `fortran` (needs gfortran) and
+`ada` (needs GNAT; with Alire installed it is found on its own). None is on by
+default, and without any Cosxamix builds and runs on Rust and AVX2.
+
 What each thing checks, and it all runs the same locally as in CI:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --features zig,c,training --all-targets -- -D warnings
 cargo test --features zig,c,training                 # none needs a model
+cargo test --features fortran,ada                    # if gfortran and GNAT are there
 python scripts/check_docs.py                         # tables, links and old names
 python scripts/check_kernel_arch.py "" x86_64        # that the kernel matches the target
+cargo run --release --example check_models           # that every GGUF in modelos/ passes the bounds rule
+```
+
+And the SPARK proof, from `ada/`:
+
+```bash
+alr -n build
+alr -n exec -- gnatprove -P cosxamix_checks.gpr --level=4 -j0 --checks-as-errors=on
 ```
 
 **`RUSTFLAGS` is used nowhere here, on purpose.** That environment variable
@@ -202,9 +227,12 @@ are denied by passing the flag to clippy as its own argument.
 
 ### The two workflows
 
-`ci.yml` runs on every push: the Linux, Windows and macOS matrix across both
-feature combinations, the Zig kernels with their equivalence tests, **the cross
-to `aarch64`**, and the documentation.
+`ci.yml` runs on every push: the Linux, Windows and macOS matrix across the
+feature combinations, the Zig and C kernels with their equivalence tests (and
+the Fortran one, with gfortran), **the cross to `aarch64`**, a run on a native
+ARM64 runner —which also measures the f32 GEMM without and with Fortran—, the
+SPARK proof with GNATprove and the tests with the `ada` feature, and the
+documentation.
 
 The cross job isn't there for completeness. Zig is in this project because it's
 the only vectorized path on ARM and Android; if cross-compiling broke, the ARM
@@ -217,7 +245,7 @@ one argument and Zig wants it as two.
 | platform | kernels | why |
 |---|---|---|
 | Linux x86-64 · Windows x86-64 · macOS Intel | Rust AVX2 | Zig loses 3-8% there, [measured](#what-the-first-kernel-measured) |
-| Linux ARM64 · Android ARM64 · macOS Apple Silicon | NEON via Zig | it's the only vectorized path that exists |
+| Linux ARM64 · Android ARM64 · macOS Apple Silicon | NEON via Zig, and `sdot` via C (`zig,c`) | without them the quantized matrix product falls back to scalar |
 
 One file per platform, no DLL or `.so` alongside, each with its `.sha256`.
 macOS Intel is cross-compiled from the ARM runner instead of asking for an
@@ -232,8 +260,9 @@ binary of the latter downloads fine and fails to run.
 It's in **[ROADMAP.md](ROADMAP.md)**, with the measured state up top and the
 order set by how much it moves latency, not by how interesting it is to write.
 
-In short: **reading the prompt** is now 1.7x faster than in 0.6.0, and the
-start of the *system* prompt is read once for every chat (0.7.0).
+In short: **reading the prompt** runs at ~57 tok/s on the 3B since 0.12.0
+(~47 before, and 1.7x that of 0.6.0), and the start of the *system* prompt is
+read once for every chat (0.7.0).
 **Generation** runs at **~81-87% of the measured memory ceiling** (~30 GB/s,
 DDR4-2133), with the row prefetch of 0.9.0 ([DECISIONES §33](DECISIONES.md));
 the 51% quoted before was computed against a ceiling this RAM cannot deliver.
@@ -241,6 +270,13 @@ What's left is small and lives in the kernels. Why 6 cores yield 2.6x instead
 of 6x **is now explained**: a single thread already reads 19 GB/s and 4 saturate
 the RAM. Speculative decoding stays out: with the engine near the ceiling, the
 numbers still don't add up (ROADMAP §5).
+
+What can move the ceiling most now is **weights as formulas** (ROADMAP §12):
+quantizing 8 weights at a time on the E8 lattice gave, on the whole 0.5B, the
+score of Q3_K at 2.06 bits per weight instead of 3.44
+([DECISIONES §40](DECISIONES.md)). If it holds on the 3B, the model would weigh
+half, and the decode, which runs at the pace of RAM, would go close to twice as
+fast.
 
 Later on, as a separate project, **QCML** will be born (`.qcml`, *Quantum
 Compression for Machine Learning*): an in-house format that aims to **beat GGUF
@@ -258,11 +294,13 @@ family: five sizes the project defines, initialises and writes as GGUF.
 
 | model | parameters | Q8_0 | cache/token |
 |---|---:|---:|---:|
-| daiss-mini | 0.08 B | 0.08 GB | 6.0 KB |
-| daiss-0.5b | 0.63 B | 0.62 GB | 24.0 KB |
-| daiss-3b | 3.40 B | 3.36 GB | 72.0 KB |
-| daiss-7b | 7.61 B | 7.54 GB | 112.0 KB |
-| daiss-14b | 14.77 B | 14.62 GB | 384.0 KB |
+| daiss-mini | 0.08 B | 0.08 GB | 3.0 KB |
+| daiss-0.5b | 0.63 B | 0.62 GB | 12.0 KB |
+| daiss-3b | 3.40 B | 3.36 GB | 36.0 KB |
+| daiss-7b | 7.61 B | 7.54 GB | 56.0 KB |
+| daiss-14b | 14.77 B | 14.62 GB | 192.0 KB |
+
+The attention cache is f16 since 0.12.0; in f32 it was twice as much.
 
 ```
 cargo run --release --example create_daiss
@@ -271,7 +309,8 @@ COSXAMIX_DAISS=daiss-7b cargo run --release --example create_daiss
 
 They are generated streaming and in parallel, with peak memory capped at 16 MB
 whatever the size, and seeded: the same seed yields the same file byte for
-byte. daiss-7b has been created and candle reads it with zero differences.
+byte. daiss-7b has been created, and candle read it with zero differences
+while it was still in the project; today the own engine reads it.
 
 And with the project's own tokenizer — `src/tokenizer.rs`, a byte-level BPE it
 trains itself — the vocabulary drops from 151,936 pieces to 8,192 for a
@@ -370,7 +409,7 @@ The 3B in Q3_K_M, measured with the same 15 questions with checkable answers
 | 0.5B Q4_K_M | 504 MB | 7/15 |
 | 1.5B Q4_K_M | 1108 MB | 8/15 |
 | 3B Q2_K | 1313 MB | 6/15, it breaks |
-| **3B Q3_K_M** | **1644 MB** | **10/15** |
+| **3B Q3_K_M** | **1644 MB** | **10/15** (11/15 with the own engine) |
 | 3B Q4_K_M | 2007 MB | 10/15 |
 | **Qwen3-4B-Instruct-2507 Q3_K_M** | **1979 MB** | **14/15** |
 
@@ -394,7 +433,16 @@ also be used commercially. `compare_models -- --qwen3` repeats it.
 - **Attention cache per session**: every conversation keeps its own, and the
   delta of a new message goes in without recomputing what came before.
 - **Memory ≈ the file**: weights are mapped and the embeddings table is read
-  row by row; a model takes 1.02-1.08x its disk size in RAM.
+  row by row; a model takes 1.02-1.08x its disk size in RAM. What the engine
+  asks for on top —activations, buffers, cache— peaks at ~150 MB on the 3B's
+  first message, and 192 MB on Qwen3-4B ([DECISIONES §39](DECISIONES.md)).
+- **The attention cache is f16**, half of f32, and attention is split by token
+  and head: in the decode it ran on a single thread. Since 0.12.0, +9% decode
+  on the 3B and +27% on Qwen3-4B.
+- **Every tensor of a GGUF is validated when it is opened**: how many values,
+  how many bytes, and that they fall inside the file, with no overflow. With
+  the `ada` feature a rule proven with SPARK decides it
+  ([DECISIONES §41](DECISIONES.md)).
 - **Speculative decoding** was implemented, measured and deleted in the candle
   era; when it makes sense again is in the [ROADMAP](ROADMAP.md) §5.
 
@@ -440,6 +488,8 @@ cargo bench --features zig      # rule 3, executable
 cargo test  --features asm_q4k  # the hand-written assembly kernels
 cargo test  --features asm_q3k  # the Q3_K kernel in assembly
 cargo test  --features c        # the C kernels (needs Zig, for `zig cc`)
+cargo test  --features fortran  # the Fortran one (needs gfortran)
+cargo test  --features ada      # the bounds rule proven with SPARK (needs GNAT)
 ```
 
 ### What the first kernel measured

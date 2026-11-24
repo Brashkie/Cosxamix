@@ -99,10 +99,15 @@ Lo que falta es **medirlo en un teléfono de verdad**. Las cifras de ARM hoy son
 una expectativa, no un dato, y este proyecto no acepta expectativas:
 
 - `dot` y `rmsnorm` en ARM NEON vía Zig, contra la referencia escalar.
-- Si candle no tiene kernels fusionados para NEON —hay que confirmarlo— la ruta
-  de la multiplicación cuantizada cae a escalar en ARM, y ahí sí habría un
-  kernel propio que escribir con razón: sería *habilitar una plataforma*, el
-  segundo brazo de la regla 3.
+- Desde la 0.11.0 no está el `neon.rs` de candle: en ARM la multiplicación
+  cuantizada la hacen los kernels de Zig y de C (`sdot`), y un ARM compilado
+  sin `zig` ni `c` cae al escalar. Por eso los binarios de ARM salen con
+  `zig,c`.
+- La GEMM en f32 de las imágenes y el entrenamiento tiene en ARM el
+  microkernel de Fortran, vectorizado con NEON por gfortran (feature
+  `fortran`, 0.12.0); en Rust solo había el escalar. El job ARM64 de CI la mide
+  sin y con la feature; falta la cifra en un teléfono, y un gfortran para
+  Android.
 - Los fusionados propios de Q4_K y Q3_K con `sdot` ya están, en C
   (`kernels/neon_dotprod.c`), y desde la 0.5.1 en el despachador: 2,4x y 5,4x
   en el runner ARM de CI. `cargo bench --features zig,c --bench kernels --
@@ -251,11 +256,13 @@ Lo que falta:
 
 | modelo | params | capas | dim | cab/kv | Q8_0 | F16 | caché/token | k-quants |
 |---|---:|---:|---:|---:|---:|---:|---:|:---:|
-| daiss-mini | 0,08 B | 6 | 256 | 4/2 | 0,08 GB | 0,15 GB | 6,0 KB | sí |
-| daiss-0.5b | 0,63 B | 24 | 896 | 14/2 | 0,62 GB | 1,17 GB | 24,0 KB | **no** |
-| daiss-3b | 3,40 B | 36 | 2048 | 16/2 | 3,36 GB | 6,33 GB | 72,0 KB | sí |
-| daiss-7b | 7,61 B | 28 | 3584 | 28/4 | 7,54 GB | 14,18 GB | 112,0 KB | sí |
-| daiss-14b | 14,77 B | 48 | 5120 | 40/8 | 14,62 GB | 27,51 GB | 384,0 KB | sí |
+| daiss-mini | 0,08 B | 6 | 256 | 4/2 | 0,08 GB | 0,15 GB | 3,0 KB | sí |
+| daiss-0.5b | 0,63 B | 24 | 896 | 14/2 | 0,62 GB | 1,17 GB | 12,0 KB | **no** |
+| daiss-3b | 3,40 B | 36 | 2048 | 16/2 | 3,36 GB | 6,33 GB | 36,0 KB | sí |
+| daiss-7b | 7,61 B | 28 | 3584 | 28/4 | 7,54 GB | 14,18 GB | 56,0 KB | sí |
+| daiss-14b | 14,77 B | 48 | 5120 | 40/8 | 14,62 GB | 27,51 GB | 192,0 KB | sí |
+
+(El caché por token, en f16 como lo guarda el motor desde la 0.12.0.)
 
 El daiss-7b está escrito y comprobado: 339 tensores, 7,54 GB, y **candle lo
 lee con cero diferencias** sobre los 544.538.624 valores de `output.weight`,
@@ -744,15 +751,16 @@ en privado) viaja desde `ai_chat.rs` y selecciona el caché. Tres turnos reales
 medidos: 25.256 ms el primero —con las páginas frías—, después 4905 y 3891 ms,
 con `cacheados=131` a partir del segundo.
 
-Falta en el lado de WinsiBot:
+Lo que en su momento faltaba ya está: WinsiBot **arranca Cosxamix solo** y baja
+el binario del release fijado en su `package.json` (`config.cosxamix`) con
+`npm install`, así que instalar sigue siendo eso y nada más. `#imagine` y
+`#gpt` usan su `/api/image` y su Qwen local desde la 9.5.0 del bot.
 
-```
-OLLAMA_URL=http://127.0.0.1:11435
-OLLAMA_MODEL=qwen2.5-3b-instruct-q3_k_m
-OLLAMA_TIMEOUT=60000
-```
+Lo que falta, del lado del bot:
 
-El *timeout* de 40 s no alcanza para el primer turno en frío. Y queda por
-decidir si Cosxamix se arranca solo desde `index.ts`, como la Session API, o si se
-deja aparte — con el sesgo puesto en que instalar siga siendo `npm install` y
-nada más.
+- pasar a la 0.12.0 cuando el release esté publicado: hoy fija la 0.10.0, y
+  desde la 0.11.0 no existe `COSXAMIX_MOTOR=candle`, que sus README y su
+  `.env.example` todavía mencionan;
+- decidir si el modelo por defecto pasa a ser **Qwen3-4B-Instruct-2507**
+  (14/15 contra 11/15, Apache-2.0, ~1 s más por respuesta y 2 GB de descarga;
+  DECISIONES §37).

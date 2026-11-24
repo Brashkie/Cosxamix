@@ -151,7 +151,8 @@ pub const FAMILIA: &[Config] = &[
 /// - **Anchos múltiplos de 256**, para que admita k-quants en toda la red. Sin
 ///   eso no se podría escribir en ningún formato que entre.
 /// - **4 cabezas de clave y valor de 48**: el caché por token crece con ellas:
-///   288 KB por token, 590 MB para 2048 tokens. Con 8 sería el doble.
+///   144 KB por token en f16, 295 MB para 2048 tokens. Con 8 sería el doble.
+///   (Hasta la 0.11.0 el caché iba en f32 y eran 288 KB y 590 MB.)
 ///
 /// Igual que un daiss recién escrito, **son pesos al azar y genera ruido**.
 /// Preentrenar 30B desde cero son miles de horas de GPU, y en esta máquina no
@@ -222,9 +223,10 @@ impl Config {
     /// Bytes del caché de atención por token, que es lo que decide cuánto
     /// contexto entra en memoria.
     ///
-    /// Dos tensores —clave y valor— por capa, en `f32`.
+    /// Dos tensores —clave y valor— por capa, en `f16`, que es como los
+    /// guarda el motor desde la 0.12.0 (`forward::Cache`).
     pub fn bytes_de_cache_por_token(&self) -> u64 {
-        2 * self.capas as u64 * self.dim_kv() as u64 * 4
+        2 * self.capas as u64 * self.dim_kv() as u64 * 2
     }
 
     /// Las declaraciones de todos los tensores, en el orden en que se
@@ -679,8 +681,8 @@ mod tests {
         let gb = |t| c.bytes_en(t) as f64 / 1_073_741_824.0;
         assert!(gb(TipoGgml::Q2K) < 10.0, "Q2_K: {}", gb(TipoGgml::Q2K));
         assert!(gb(TipoGgml::Q3K) < 13.0, "Q3_K: {}", gb(TipoGgml::Q3K));
-        // 2048 tokens de contexto no pueden pasar de los ~600 MB.
-        assert!(c.bytes_de_cache_por_token() * 2048 < 650 << 20);
+        // 2048 tokens de contexto no pueden pasar de los ~300 MB.
+        assert!(c.bytes_de_cache_por_token() * 2048 < 325 << 20);
     }
 
     /// Escribir con k-quants: el archivo se lee, mide lo que dice y los pesos
