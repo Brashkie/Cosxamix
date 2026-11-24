@@ -2743,7 +2743,7 @@ ningún producto pase de 126 bits. `Gguf::abrir` la aplica a cada tensor apenas
 lo lee, así que un `Gguf` en memoria ya no puede tener tamaños desbordados.
 
 **SPARK** (`ada/src/gguf_bounds.ads`): la misma regla como procedimiento
-exportado a C. GNATprove demuestra las **54 obligaciones**: ausencia de
+exportado a C. GNATprove demuestra las **110 obligaciones**: ausencia de
 errores de ejecución, y el contrato `(Ok = 1) = Valido (...)` con los
 elementos y bytes exactos, donde `Valido` hace las cuentas en aritmética de
 127 bits, sin vuelta. Lo que costó:
@@ -2754,7 +2754,12 @@ elementos y bytes exactos, donde `Valido` hace las cuentas en aritmética de
   no lineales (`X ≤ Tope / Y ⇒ X · Y ≤ Tope`) que los probadores no cerraban;
 - con los topes, cada producto entra en 127 bits sin condiciones y el
   contrato es lineal; la última obligación —que el cociente de 64 bits es el
-  de 127— la cerraron dos afirmaciones intermedias.
+  de 127— la cerraron dos afirmaciones intermedias;
+- en el CI, el índice de Alire solo tenía **gnatprove 14.1.1** para Linux, y
+  sus probadores no cerraban la equivalencia `(Ok = 1) = Valido (...)` de una
+  vez. Se cerró partiéndola en dos implicaciones y afirmando, antes de cada
+  salida, `not V` o cada condición de `Valido` por separado. Con eso son **110
+  obligaciones**, demostradas con gnatprove 14.1.1 y con 16.1.
 
 La implementación multiplica en 128 bits, que se compila en línea; no hay
 divisiones de 128 bits, que pedirían la libgcc. Paquete `Pure`, sin

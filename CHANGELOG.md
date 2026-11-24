@@ -15,7 +15,7 @@ acá va qué cambió, no por qué.
   se validan al abrir el archivo. Antes `InfoTensor::elementos()` multiplicaba
   las dimensiones sin comprobar y, con dimensiones absurdas, el producto daba
   la vuelta y pasaba el chequeo de límites. Con la feature `ada` decide
-  `ada/src/gguf_bounds.adb`, donde GNATprove demuestra las 54 obligaciones (sin
+  `ada/src/gguf_bounds.adb`, donde GNATprove demuestra las 110 obligaciones (sin
   desbordes, y la regla exacta); sin ella, la misma regla en Rust, y un test
   compara las dos. `examples/check_models.rs` abre todos los GGUF de una
   carpeta con la regla; los 24 locales pasan. Job de CI con Alire y GNATprove

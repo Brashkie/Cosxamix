@@ -75,10 +75,19 @@ package Gguf_Bounds with SPARK_Mode, Pure is
       Ok                           : out Unsigned_8)
    with
      Export, Convention => C, External_Name => "cosxamix_ada_tensor_span",
+     --  La equivalencia va en dos implicaciones y no como `(Ok = 1) =
+     --  Valido (...)`: dicen lo mismo, y asi la cierran tambien los
+     --  probadores de gnatprove 14, que con la igualdad de booleanos no
+     --  podian.
      Post =>
-       (Ok = 1) = Valido (D0, D1, D2, D3, Valores_Bloque, Bytes_Bloque,
-                          Inicio, Desde, Largo, Alineacion)
-       and then Ok in 0 | 1
+       Ok in 0 | 1
+       and then
+         (if Ok = 1 then Valido (D0, D1, D2, D3, Valores_Bloque, Bytes_Bloque,
+                                 Inicio, Desde, Largo, Alineacion))
+       and then
+         (if Valido (D0, D1, D2, D3, Valores_Bloque, Bytes_Bloque,
+                     Inicio, Desde, Largo, Alineacion)
+          then Ok = 1)
        and then
          (if Ok = 1 then
             A (Elementos) = E2 (D0, D1) * A (D2) * A (D3)
